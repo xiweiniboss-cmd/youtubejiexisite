@@ -368,17 +368,37 @@ var deviceId = (function(){
     });
   }
 
+  // 直链里带 itag，能准确知道清晰度（RedFox 的 type 字段不一定写分辨率）
+  var ITAG_H = {18:360,22:720,37:1080,59:480,133:240,134:360,135:480,136:720,137:1080,160:144,242:240,243:360,244:480,247:720,248:1080,
+    264:1440,266:2160,271:1440,272:2160,278:144,298:720,299:1080,302:720,303:1080,308:1440,313:2160,315:2160,
+    394:144,395:240,396:360,397:480,398:720,399:1080,400:1440,401:2160,694:144,695:240,696:360,697:480,698:720,699:1080};
+  var ITAG_AUDIO = {139:1,140:1,141:1,171:1,249:1,250:1,251:1,599:1,600:1};
+  function urlParam(u, k){ var m = String(u || '').match(new RegExp('[?&]' + k + '=([^&]*)')); return m ? decodeURIComponent(m[1]) : ''; }
+  function itagOf(r){ return +urlParam(r.url, 'itag') || 0; }
+  function isAudio(r){
+    var it = itagOf(r), mime = urlParam(r.url, 'mime');
+    if (it) return !!ITAG_AUDIO[it];
+    if (mime) return /^audio/i.test(mime);
+    return /audio|m4a|mp3/i.test(String(r.type || ''));
+  }
+  function isMp4(r){ var mime = urlParam(r.url, 'mime'); return !mime || /mp4/i.test(mime); }
   function resHeight(r){
+    var it = itagOf(r); if (ITAG_H[it]) return ITAG_H[it];
     var t = String(r.type || ''), m = t.match(/(\d{3,4})\s*[pP]/) || t.match(/(\d{3,4})/);
     if (/4k|2160/i.test(t)) return 2160;
     if (/2k|1440/i.test(t)) return 1440;
     return m ? +m[1] : 0;
   }
-  // 选画质最高、但不超过 1080P 的视频（4K 文件太大，手机内存吃不消）
+  // 选不超过 1080P 的最高画质；同清晰度优先 MP4(H.264)，iPhone 相册才认
   function pickBestVideo(vids){
     var c = vids.filter(function(r){ var h = resHeight(r); return h && h <= 1080; });
     if (!c.length) c = vids.slice();
-    c.sort(function(a, b){ return resHeight(b) - resHeight(a); });
+    c.sort(function(a, b){ return (resHeight(b) - resHeight(a)) || ((isMp4(b) ? 1 : 0) - (isMp4(a) ? 1 : 0)); });
+    return c[0] || null;
+  }
+  function pickBestAudio(auds){
+    var c = auds.slice();
+    c.sort(function(a, b){ return (isMp4(b) ? 1 : 0) - (isMp4(a) ? 1 : 0); });   // m4a 优先，MP4 容器兼容
     return c[0] || null;
   }
   var _merging = false;
@@ -414,7 +434,9 @@ var deviceId = (function(){
 
   function resLabel(r, i){
     var label = String(r.type || '');
-    if (/audio|m4a|mp3/i.test(label)) return '🎵 纯音频';
+    if (isAudio(r)) return '🎵 纯音频';
+    var hh = ITAG_H[itagOf(r)];
+    if (hh) return '🎬 ' + hh + 'P' + (!/^(18|22|37|59)$/.test(String(itagOf(r))) ? ' 无声' : '');
     if (/2160|4k/i.test(label)) return '🎬 4K 超清';
     if (/1440|2k/i.test(label)) return '🎬 2K 超清';
     if (/1080/.test(label)) return '🎬 1080P 高清';
@@ -441,15 +463,15 @@ var deviceId = (function(){
 
     var resources = d.resources || [];
     if (resources.length) {
-      var vids = resources.filter(function(r){ return !/audio|m4a|mp3/i.test(String(r.type || '')); });
-      var auds = resources.filter(function(r){ return /audio|m4a|mp3/i.test(String(r.type || '')); });
+      var vids = resources.filter(function(r){ return !isAudio(r); });
+      var auds = resources.filter(function(r){ return isAudio(r); });
       var ordered = vids.concat(auds);
-      var best = pickBestVideo(vids), bestA = auds[0];
+      var best = pickBestVideo(vids), bestA = pickBestAudio(auds);
       if (best && bestA && window.YTMerge) {
         var mb = document.createElement('button');
         mb.className = 'btn';
         mb.style.cssText = 'margin-top:10px;font-size:15px;font-weight:700';
-        mb.textContent = '⭐ 一键下载 ' + resLabel(best, 0).replace(/^🎬\s*/, '') + '（含声音）';
+        mb.textContent = '⭐ 一键下载 ' + (resHeight(best) ? resHeight(best) + 'P' : '最高画质') + '（含声音）';
         mb.onclick = function(){ mergeDownload(best, bestA, d.title || 'youtube', mb); };
         resList.appendChild(mb);
         var mt = document.createElement('div');
