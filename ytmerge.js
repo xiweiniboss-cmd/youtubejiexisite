@@ -51,7 +51,8 @@ window.YTMerge = (function(){
 // 分段下载（经 /api/ytdl 代理 + Range）：googlevideo 对无声 1080P 整段下载会限速，分段并发快很多
 window.YTFetch = (function(){
   var CH = 8 * 1024 * 1024, PAR = 3;
-  function proxy(u){ return '/api/ytdl?url=' + encodeURIComponent(u) + '&filename=part.bin'; }
+  var UA = '';
+  function proxy(u){ return '/api/ytdl?url=' + encodeURIComponent(u) + '&filename=part.bin' + (UA ? '&ua=' + UA : ''); }
   async function getRange(u, s, e){
     var res = await fetch(proxy(u), { headers: { Range: 'bytes=' + s + '-' + e } });
     if (!(res.status === 206 || res.status === 200)) throw new Error('HTTP ' + res.status);
@@ -63,7 +64,8 @@ window.YTFetch = (function(){
     return parts;
   }
   // 返回 Blob；onProg(本文件已收字节, 本文件总字节)
-  async function get(u, type, onProg){
+  async function get(u, type, onProg, ua){
+    UA = ua || '';
     var got = 0, total = 0;
     var first = await getRange(u, 0, CH - 1);
     var cr = first.headers.get('Content-Range') || '';
