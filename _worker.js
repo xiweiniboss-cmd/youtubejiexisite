@@ -310,7 +310,7 @@ async function handleYtDl(request) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 120000);
   try {
-    const upHeaders = { 'User-Agent': UA_PC, Accept: '*/*' };
+    const upHeaders = { 'User-Agent': YT_UA[u.searchParams.get('ua') || ''] || UA_PC, Accept: '*/*' };
     const range = request.headers.get('Range');   // 浏览器合并时分段下载
     if (range && /^bytes=\d+-\d*$/.test(range)) upHeaders['Range'] = range;
     const resp = await fetch(mediaUrl, {
@@ -862,6 +862,78 @@ async function handleStatsAll(request, env) {
   return json({ ok: true, sites: result });
 }
 
+/* ================= 1080P 直连 InnerTube（多客户端轮换，拿高清无声流 + 音频，给浏览器合并用） ================= */
+const YT_CLIENTS = [
+  { key: 'vr', name: 'ANDROID_VR', id: 28, version: '1.62.27',
+    ua: 'com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+    extra: { deviceMake: 'Oculus', deviceModel: 'Quest 3', androidSdkVersion: 32, osName: 'Android', osVersion: '12L' } },
+  { key: 'ios', name: 'IOS', id: 5, version: '20.10.4',
+    ua: 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
+    extra: { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.3.2.22D82' } },
+  { key: 'android', name: 'ANDROID', id: 3, version: '20.10.38',
+    ua: 'com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip',
+    extra: { androidSdkVersion: 34, osName: 'Android', osVersion: '14' } },
+];
+const YT_UA = Object.fromEntries(YT_CLIENTS.map((c) => [c.key, c.ua]));
+
+async function ytVisitorData() {
+  try {
+    const r = await fetch('https://www.youtube.com/sw.js_data', { headers: { 'User-Agent': UA_PC } });
+    const t = await r.text();
+    const m = t.match(/"(Cg[A-Za-z0-9_%-]{20,})"/);
+    return m ? decodeURIComponent(m[1]) : '';
+  } catch { return ''; }
+}
+
+async function ytPlayer(vid, c, visitorData) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'User-Agent': c.ua,
+    'X-YouTube-Client-Name': String(c.id),
+    'X-YouTube-Client-Version': c.version,
+    Origin: 'https://www.youtube.com',
+  };
+  if (visitorData) headers['X-Goog-Visitor-Id'] = visitorData;
+  const body = {
+    context: { client: { clientName: c.name, clientVersion: c.version, hl: 'en', gl: 'US', ...(visitorData ? { visitorData } : {}), ...c.extra } },
+    videoId: vid, contentCheckOk: true, racyCheckOk: true,
+  };
+  const r = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', { method: 'POST', headers, body: JSON.stringify(body) });
+  return r.json();
+}
+
+async function handleYtHd(request) {
+  const u = new URL(request.url);
+  const src = u.searchParams.get('url') || '';
+  const m = src.match(/(?:[?&]v=|youtu\.be\/|shorts\/|embed\/|live\/)([A-Za-z0-9_-]{11})/) || src.match(/^([A-Za-z0-9_-]{11})$/);
+  if (!m) return json({ ok: false, error: '没找到视频 ID' }, 400);
+  const vid = m[1];
+  const tried = [];
+  for (const round of [0, 1]) {
+    const vd = round ? await ytVisitorData() : '';
+    for (const c of YT_CLIENTS) {
+      let j;
+      try { j = await ytPlayer(vid, c, vd); } catch (e) { tried.push(c.key + ':err'); continue; }
+      const st = j?.playabilityStatus?.status || '';
+      const fmts = (j?.streamingData?.adaptiveFormats || []).filter((f) => f.url);
+      tried.push(c.key + (round ? '+vd' : '') + ':' + (st || 'none') + ':' + fmts.length);
+      if (st !== 'OK' || !fmts.length) continue;
+      const vids = fmts.filter((f) => /^video\/mp4/.test(f.mimeType) && /avc1/.test(f.mimeType) && (f.height || 0) <= 1080)
+        .sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0));
+      const auds = fmts.filter((f) => /^audio\/mp4/.test(f.mimeType)).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+      if (!vids.length || !auds.length) continue;
+      const v = vids[0], a = auds[0];
+      return json({
+        ok: true, videoId: vid, client: c.key,
+        title: j?.videoDetails?.title || '',
+        video: { url: v.url, height: v.height, width: v.width, size: +v.contentLength || 0, itag: v.itag },
+        audio: { url: a.url, size: +a.contentLength || 0, itag: a.itag },
+      });
+    }
+  }
+  return json({ ok: false, error: 'YouTube 暂时把服务器当成了机器人，没拿到高清流，过一会再试', tried }, 503);
+}
+
 /* ================= 1080P 服务器合并（EC2 yt-dlp + ffmpeg） ================= */
 // 前端不直接调 EC2（token 不能进前端），一律经 Pages Worker 中转，
 // Worker 用环境变量 YT_MERGE_TOKEN（与 EC2 ~/yt-merge/token.txt 一致）向 EC2 鉴权。
@@ -1007,6 +1079,7 @@ export default {
     if (url.pathname === '/api/yt1080-status') return handleYt1080Status(request, env);
     if (url.pathname === '/api/yt1080-file') return handleYt1080File(request, env);
     if (url.pathname === '/api/yt-direct') return handleYtDirect(request, env);
+    if (url.pathname === '/api/yt-hd') return handleYtHd(request);
 
     if (url.pathname === '/api/diag')
       return json({
