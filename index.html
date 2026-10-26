@@ -146,7 +146,7 @@ body{ background:transparent; }
       </div>
     </div>
     <button class="btn" id="parseBtn">开始解析</button>
-    <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+    <div style="margin-top:10px;display:none;gap:8px;align-items:center">
       <select id="mergeQuality" style="flex:1;padding:10px;border-radius:10px;border:1px solid #ddd;font-size:15px">
         <option value="1080|merged" selected>🎬 1080P 带声音</option>
         <option value="720|merged">🎬 720P 带声音</option>
@@ -157,7 +157,7 @@ body{ background:transparent; }
       <button class="btn ghost" id="merge1080Btn" style="margin-top:0">服务器合并</button>
     </div>
     <div class="hint" id="merge1080Status" style="display:none"></div>
-    <button class="btn ghost" id="mergeHistoryBtn" style="margin-top:10px">📥 合并历史（服务器保留 1 小时）</button>
+    <button class="btn ghost" id="mergeHistoryBtn" style="margin-top:10px;display:none">📥 合并历史（服务器保留 1 小时）</button>
     <div id="mergeHistoryPanel" style="display:none;margin-top:10px;text-align:left"></div>
     <div id="tsParseWidget" style="margin-top:10px"></div>
     <div class="hint">📋 在 YouTube App 点「分享」→「复制链接」，粘贴到这里即可<br>🌐 下载需要开 VPN（YouTube 直链走境外）<br>🔒 仅解析公开视频，请勿用于侵权用途</div>
@@ -368,6 +368,50 @@ var deviceId = (function(){
     });
   }
 
+  function resHeight(r){
+    var t = String(r.type || ''), m = t.match(/(\d{3,4})\s*[pP]/) || t.match(/(\d{3,4})/);
+    if (/4k|2160/i.test(t)) return 2160;
+    if (/2k|1440/i.test(t)) return 1440;
+    return m ? +m[1] : 0;
+  }
+  // 选画质最高、但不超过 1080P 的视频（4K 文件太大，手机内存吃不消）
+  function pickBestVideo(vids){
+    var c = vids.filter(function(r){ var h = resHeight(r); return h && h <= 1080; });
+    if (!c.length) c = vids.slice();
+    c.sort(function(a, b){ return resHeight(b) - resHeight(a); });
+    return c[0] || null;
+  }
+  var _merging = false;
+  function mergeDownload(v, a, title, btn){
+    if (_merging) return; _merging = true;
+    var old = btn.textContent; btn.disabled = true; __hkHideBtn(); hideError();
+    var bar = document.getElementById('dlProgBar'), txt = document.getElementById('dlProgTxt');
+    document.getElementById('dlProg').style.display = 'block';
+    function stage(t, pct){ txt.textContent = t; if (pct != null) { bar.style.width = pct + '%'; bar.style.opacity = ''; } }
+    var vg = 0, vt = 0, ag = 0, at = 0;
+    function prog(){
+      var tot = vt + at, g = vg + ag;
+      stage('下载画面和声音 ' + (tot ? Math.round(g / tot * 100) + '%（' + fmtMB(g) + ' / ' + fmtMB(tot) + '）' : fmtMB(g)), tot ? Math.round(g / tot * 90) : 5);
+    }
+    stage('准备下载…', 0);
+    var pre = window.YTMerge.preload(function(t){ if (!vt) stage(t, 2); }).catch(function(e){ return e; });
+    Promise.all([
+      window.YTFetch.get(v.url, 'video/mp4', function(g, t){ vg = g; vt = t; prog(); }),
+      window.YTFetch.get(a.url, 'audio/mp4', function(g, t){ ag = g; at = t; prog(); })
+    ]).then(function(r){
+      return pre.then(function(){
+        return window.YTMerge.merge(r[0], r[1], function(t){ stage(t, 95); });
+      });
+    }).then(function(out){
+      stage('完成 ' + fmtMB(out.size), 100);
+      setTimeout(hideDlProg, 1500);
+      __hkSave(out, fileName(title + '_' + (resHeight(v) || 'HD') + 'P', 'mp4'));
+    }).catch(function(e){
+      hideDlProg();
+      showError('合并下载失败：' + (e && e.message || e) + '<br><br>💡 可以先分别下载下面的「无声视频」和「纯音频」，或重新解析再试。');
+    }).then(function(){ _merging = false; btn.disabled = false; btn.textContent = old; });
+  }
+
   function resLabel(r, i){
     var label = String(r.type || '');
     if (/audio|m4a|mp3/i.test(label)) return '🎵 纯音频';
@@ -400,6 +444,19 @@ var deviceId = (function(){
       var vids = resources.filter(function(r){ return !/audio|m4a|mp3/i.test(String(r.type || '')); });
       var auds = resources.filter(function(r){ return /audio|m4a|mp3/i.test(String(r.type || '')); });
       var ordered = vids.concat(auds);
+      var best = pickBestVideo(vids), bestA = auds[0];
+      if (best && bestA && window.YTMerge) {
+        var mb = document.createElement('button');
+        mb.className = 'btn';
+        mb.style.cssText = 'margin-top:10px;font-size:15px;font-weight:700';
+        mb.textContent = '⭐ 一键下载 ' + resLabel(best, 0).replace(/^🎬\s*/, '') + '（含声音）';
+        mb.onclick = function(){ mergeDownload(best, bestA, d.title || 'youtube', mb); };
+        resList.appendChild(mb);
+        var mt = document.createElement('div');
+        mt.className = 'hint';
+        mt.textContent = '高清画面和声音是分开的两条流，会在你手机里自动合成一个带声音的 MP4，不经过服务器';
+        resList.appendChild(mt);
+      }
       ordered.forEach(function(r, i){
         var wrap = document.createElement('div');
         wrap.style.cssText = 'display:flex;gap:8px;margin-top:10px';
@@ -799,5 +856,6 @@ refreshQuota();
 })();
 </script>
 
+<script src="/ytmerge.js"></script>
 </body>
 </html>
