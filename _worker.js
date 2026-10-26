@@ -860,7 +860,9 @@ async function handleStatsAll(request, env) {
 // Worker 用环境变量 YT_MERGE_TOKEN（与 EC2 ~/yt-merge/token.txt 一致）向 EC2 鉴权。
 // EC2 任务是异步的：start 立即返回 job_id，前端轮询 status，done 后再拉 file。
 // 未配 YT_MERGE_TOKEN 时明确报错，不让请求静默失败。
-const MERGE_BASE_DEFAULT = 'http://3.129.45.49:30002';
+/* 注意：Cloudflare Worker 不能直接按 IP 调后端（会被 1003 拦截），
+   所以这里用 sslip.io 主机名（解析到同一 EC2 IP），不要改回裸 IP。 */
+const MERGE_BASE_DEFAULT = 'http://3-129-45-49.sslip.io:30002';
 function mergeBase(env) {
   return (env.YT_MERGE_BASE || MERGE_BASE_DEFAULT).replace(/\/$/, '');
 }
@@ -869,6 +871,13 @@ function mergeToken(env) {
 }
 async function mergePassthrough(resp) {
   const text = await resp.text();
+  // EC2 正常时返回 JSON；若上游返回非 JSON（如 Cloudflare 1003），
+  // 不能原样透传（前端 r.json() 会抛晦涩的英文错），要转成中文 JSON 错误。
+  try {
+    JSON.parse(text);
+  } catch {
+    return json({ ok: false, error: '合并服务返回异常（HTTP ' + resp.status + '）：' + text.slice(0, 200) }, resp.status >= 400 ? resp.status : 502);
+  }
   return new Response(text, {
     status: resp.status,
     headers: {

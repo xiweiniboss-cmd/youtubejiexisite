@@ -620,7 +620,7 @@ var deviceId = (function(){
     setMergeBtn('正在提交合并任务…', true);
     setMergeStatus('已提交，服务器正在解析 1080P…请不要关闭页面，约几分钟。');
     fetch('/api/yt1080-start?url=' + encodeURIComponent(text), { method: 'POST' })
-      .then(function(r){ return r.json().then(function(j){ return { status: r.status, body: j }; }); })
+      .then(function(r){ return r.text().then(function(t){ var j; try { j = JSON.parse(t); } catch(e){ throw new Error('服务器返回异常（HTTP ' + r.status + '），请稍后重试'); } return { status: r.status, body: j }; }); })
       .then(function(res){
         var j = res.body || {};
         if(!j.ok){
@@ -639,7 +639,7 @@ var deviceId = (function(){
             return;
           }
           fetch('/api/yt1080-status?id=' + encodeURIComponent(jobId))
-            .then(function(r){ return r.json(); })
+            .then(function(r){ return r.text().then(function(t){ try { return JSON.parse(t); } catch(e){ throw new Error('服务器返回异常，请稍后重试'); } }); })
             .then(function(s){
               if(!s.ok){
                 clearInterval(mergeTimer); mergeTimer = null;
