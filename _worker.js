@@ -901,7 +901,7 @@ async function handleYt1080Start(request, env) {
   try {
     const resp = await fetch(mergeBase(env) + '/yt1080-jobs', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Merge-Token': token },
+      headers: { 'Content-Type': 'application/json', 'X-Merge-Token': token, 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', 'Accept': 'application/json' },
       body: JSON.stringify({ url: ytUrl, quality: quality, mode: mode }),
     });
     return mergePassthrough(resp);
@@ -916,7 +916,7 @@ async function handleYt1080Status(request, env) {
   if (!id) return json({ ok: false, error: '缺少任务 id' }, 400);
   try {
     const resp = await fetch(mergeBase(env) + '/yt1080-jobs/' + encodeURIComponent(id), {
-      headers: { 'X-Merge-Token': token },
+      headers: { 'X-Merge-Token': token, 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', 'Accept': 'application/json' },
     });
     return mergePassthrough(resp);
   } catch (e) {
@@ -930,7 +930,7 @@ async function handleYt1080File(request, env) {
   if (!id) return json({ ok: false, error: '缺少任务 id' }, 400);
   try {
     const resp = await fetch(mergeBase(env) + '/yt1080-jobs/' + encodeURIComponent(id) + '/file', {
-      headers: { 'X-Merge-Token': token },
+      headers: { 'X-Merge-Token': token, 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', 'Accept': 'application/json' },
     });
     if (!resp.ok) return mergePassthrough(resp);
     const headers = new Headers(resp.headers);
