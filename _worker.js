@@ -942,6 +942,53 @@ async function handleYt1080File(request, env) {
   }
 }
 
+/* Experimental direct parse (no RedFox): Worker fetches YouTube InnerTube
+   player API, returns only format metadata (no stream URLs) for testing. */
+async function handleYtDirect(request, env) {
+  const reqUrl = new URL(request.url);
+  const ytUrl = reqUrl.searchParams.get('url') || '';
+  const m = ytUrl.match(/[?&]v=([A-Za-z0-9_-]{6,20})/) || ytUrl.match(/youtu\.be\/([A-Za-z0-9_-]{6,20})/);
+  if (!m) return json({ ok: false, error: '请先粘贴 YouTube 分享链接' }, 400);
+  const vid = m[1];
+  const results = [];
+  // Method 1: InnerTube WEB client
+  try {
+    const resp = await fetch('https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36', 'Accept': 'application/json' },
+      body: JSON.stringify({ context: { client: { clientName: 'WEB', clientVersion: '2.20240111.09.00', hl: 'zh-CN' } }, videoId: vid, racyCheckOk: true, contentCheckOk: true }),
+    });
+    const d = await resp.json().catch(() => ({}));
+    const sd = d.streamingData || {};
+    const fmts = [...(sd.formats || []), ...(sd.adaptiveFormats || [])];
+    results.push({ method: 'innertube-web', http: resp.status, playability: (d.playabilityStatus || {}).status || '', reason: ((d.playabilityStatus || {}).reason || '').slice(0, 120), count: fmts.length, formats: fmts.map(f => ({ itag: f.itag, mime: (f.mimeType || '').split(';')[0], height: f.height || 0, quality: f.qualityLabel || '', hasUrl: !!f.url, hasCipher: !!f.signatureCipher })) });
+  } catch (e) {
+    results.push({ method: 'innertube-web', error: String(e).slice(0, 200) });
+  }
+  // Method 2: watch page HTML, extract ytInitialPlayerResponse
+  try {
+    const resp = await fetch('https://www.youtube.com/watch?v=' + vid, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36', 'Accept-Language': 'zh-CN,zh;q=0.9' },
+    });
+    const html = await resp.text();
+    const mm = html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});\s*var meta/) || html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});<\/script>/);
+    let count = 0, playability = '', fmts = [];
+    if (mm) {
+      try {
+        const d = JSON.parse(mm[1]);
+        playability = (d.playabilityStatus || {}).status || '';
+        const sd = d.streamingData || {};
+        fmts = [...(sd.formats || []), ...(sd.adaptiveFormats || [])];
+        count = fmts.length;
+      } catch (e) { playability = 'parse-error'; }
+    }
+    results.push({ method: 'watch-html', http: resp.status, htmlLen: html.length, hasPlayerResponse: !!mm, playability: playability, count: count, formats: fmts.map(f => ({ itag: f.itag, mime: (f.mimeType || '').split(';')[0], height: f.height || 0, quality: f.qualityLabel || '', hasUrl: !!f.url, hasCipher: !!f.signatureCipher })) });
+  } catch (e) {
+    results.push({ method: 'watch-html', error: String(e).slice(0, 200) });
+  }
+  return json({ ok: true, videoId: vid, results: results });
+}
+
 /* ================= 路由 ================= */
 export default {
   async fetch(request, env) {
@@ -952,6 +999,7 @@ export default {
     if (url.pathname === '/api/yt1080-start') return handleYt1080Start(request, env);
     if (url.pathname === '/api/yt1080-status') return handleYt1080Status(request, env);
     if (url.pathname === '/api/yt1080-file') return handleYt1080File(request, env);
+    if (url.pathname === '/api/yt-direct') return handleYtDirect(request, env);
 
     if (url.pathname === '/api/diag')
       return json({
