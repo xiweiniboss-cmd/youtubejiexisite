@@ -146,8 +146,19 @@ body{ background:transparent; }
       </div>
     </div>
     <button class="btn" id="parseBtn">开始解析</button>
-    <button class="btn ghost" id="merge1080Btn" style="margin-top:10px">🎬 1080P 带声音（服务器合并，约几分钟）</button>
+    <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+      <select id="mergeQuality" style="flex:1;padding:10px;border-radius:10px;border:1px solid #ddd;font-size:15px">
+        <option value="1080|merged" selected>🎬 1080P 带声音</option>
+        <option value="720|merged">🎬 720P 带声音</option>
+        <option value="1080|silent">🔇 1080P 无声</option>
+        <option value="720|silent">🔇 720P 无声</option>
+        <option value="360|merged">🎬 360P 带声音</option>
+      </select>
+      <button class="btn ghost" id="merge1080Btn" style="margin-top:0">服务器合并</button>
+    </div>
     <div class="hint" id="merge1080Status" style="display:none"></div>
+    <button class="btn ghost" id="mergeHistoryBtn" style="margin-top:10px">📥 合并历史（服务器保留 1 小时）</button>
+    <div id="mergeHistoryPanel" style="display:none;margin-top:10px;text-align:left"></div>
     <div id="tsParseWidget" style="margin-top:10px"></div>
     <div class="hint">📋 在 YouTube App 点「分享」→「复制链接」，粘贴到这里即可<br>🌐 下载需要开 VPN（YouTube 直链走境外）<br>🔒 仅解析公开视频，请勿用于侵权用途</div>
   </div>
@@ -592,7 +603,55 @@ var deviceId = (function(){
     mergeBtn.textContent = t;
     mergeBtn.disabled = !!disabled;
   }
-  function resetMergeBtn(){ setMergeBtn('🎬 1080P 带声音（服务器合并，约几分钟）', false); }
+  function resetMergeBtn(){ setMergeBtn('服务器合并', false); }
+  function mergeChoice(){
+    var v = ($('mergeQuality') && $('mergeQuality').value) || '1080|merged';
+    var parts = v.split('|');
+    return { quality: parts[0], mode: parts[1], label: ($('mergeQuality') && $('mergeQuality').options[$('mergeQuality').selectedIndex].text) || v };
+  }
+  function loadHistory(){
+    try { return JSON.parse(localStorage.getItem('yt_merge_history') || '[]'); } catch(e){ return []; }
+  }
+  function saveHistory(entry){
+    var h = loadHistory();
+    h.unshift(entry);
+    h = h.slice(0, 20);
+    try { localStorage.setItem('yt_merge_history', JSON.stringify(h)); } catch(e){}
+  }
+  function renderHistory(){
+    var panel = $('mergeHistoryPanel'), h = loadHistory();
+    if(!h.length){
+      panel.innerHTML = '<div class="hint">暂无合并记录。合并完成后会自动记在这里，服务器上的成品保留 1 小时，过期后需重新提交。</div>';
+    } else {
+      var html = '<div class="hint">成品在服务器上保留 1 小时，过期后点下载会提示任务不存在，需重新提交。点 🗑 可删记录。</div>';
+      h.forEach(function(item, idx){
+        html += '<div style="display:flex;gap:8px;align-items:center;padding:8px 0;border-bottom:1px solid #eee;font-size:14px">'
+          + '<span style="flex:1">' + (item.label || '') + ' · ' + (item.filename || '') + ' · ' + fmtMB(item.size || 0) + '<br><span style="color:#888;font-size:12px">' + (item.time || '') + '</span></span>'
+          + '<button class="btn ghost" data-hist-dl="' + idx + '" style="padding:6px 10px">⬇ 下载</button>'
+          + '<button class="btn ghost" data-hist-del="' + idx + '" style="padding:6px 10px">🗑</button></div>';
+      });
+      panel.innerHTML = html;
+      panel.querySelectorAll('[data-hist-dl]').forEach(function(b){
+        b.onclick = function(){
+          var item = loadHistory()[parseInt(b.getAttribute('data-hist-dl'), 10)];
+          if(item) downloadMerged(item.jobId, item.filename, true);
+        };
+      });
+      panel.querySelectorAll('[data-hist-del]').forEach(function(b){
+        b.onclick = function(){
+          var hh = loadHistory(); hh.splice(parseInt(b.getAttribute('data-hist-del'), 10), 1);
+          try { localStorage.setItem('yt_merge_history', JSON.stringify(hh)); } catch(e){}
+          renderHistory();
+        };
+      });
+    }
+    panel.style.display = 'block';
+  }
+  $('mergeHistoryBtn').onclick = function(){
+    var panel = $('mergeHistoryPanel');
+    if(panel.style.display === 'block'){ panel.style.display = 'none'; return; }
+    renderHistory();
+  };
   function fmtElapsed(s){
     var m = Math.floor(s / 60), sec = s % 60;
     return m > 0 ? m + '分' + sec + '秒' : sec + '秒';
@@ -617,9 +676,10 @@ var deviceId = (function(){
     if(!/youtu\.?be/i.test(text)){ showError('这不是 YouTube 链接，请检查后重试'); return; }
     hideError();
     if(mergeTimer){ clearInterval(mergeTimer); mergeTimer = null; }
+    var choice = mergeChoice();
     setMergeBtn('正在提交合并任务…', true);
-    setMergeStatus('已提交，服务器正在解析 1080P…请不要关闭页面，约几分钟。');
-    fetch('/api/yt1080-start?url=' + encodeURIComponent(text), { method: 'POST' })
+    setMergeStatus('已提交，服务器正在解析 ' + choice.label + '…请不要关闭页面，约几分钟。');
+    fetch('/api/yt1080-start?url=' + encodeURIComponent(text) + '&quality=' + encodeURIComponent(choice.quality) + '&mode=' + encodeURIComponent(choice.mode), { method: 'POST' })
       .then(function(r){ return r.text().then(function(t){ var j; try { j = JSON.parse(t); } catch(e){ throw new Error('服务器返回异常（HTTP ' + r.status + '），请稍后重试'); } return { status: r.status, body: j }; }); })
       .then(function(res){
         var j = res.body || {};
@@ -629,7 +689,7 @@ var deviceId = (function(){
           return;
         }
         var jobId = j.job_id, started = Date.now(), filename = '';
-        setMergeStatus('合并中…已等 0 秒（服务器正在下载 1080P 视频流 + 音频流并合并）。');
+        setMergeStatus('合并中…已等 0 秒（服务器正在下载 ' + choice.label + '并合并）。');
         mergeTimer = setInterval(function(){
           var elapsed = Math.floor((Date.now() - started) / 1000);
           if(elapsed > 900){
@@ -650,7 +710,8 @@ var deviceId = (function(){
               if(s.status === 'done'){
                 clearInterval(mergeTimer); mergeTimer = null;
                 filename = s.filename || 'youtube_1080p.mp4';
-                setMergeStatus('✅ 合并完成（' + fmtMB(s.size || 0) + '），正在下载…');
+                saveHistory({ jobId: jobId, filename: filename, size: s.size || 0, label: choice.label, time: new Date().toLocaleString() });
+                setMergeStatus('✅ 合并完成（' + fmtMB(s.size || 0) + '），正在下载…已记入合并历史，1 小时内可从历史重下。');
                 downloadMerged(jobId, filename);
               } else if(s.status === 'error'){
                 clearInterval(mergeTimer); mergeTimer = null;

@@ -894,11 +894,15 @@ async function handleYt1080Start(request, env) {
   const reqUrl = new URL(request.url);
   const ytUrl = reqUrl.searchParams.get('url') || '';
   if (!ytUrl.trim()) return json({ ok: false, error: '请先粘贴 YouTube 分享链接' }, 400);
+  const qualityRaw = parseInt(reqUrl.searchParams.get('quality') || '1080', 10);
+  const quality = [360, 720, 1080].includes(qualityRaw) ? qualityRaw : 1080;
+  const modeRaw = reqUrl.searchParams.get('mode') || 'merged';
+  const mode = modeRaw === 'silent' ? 'silent' : 'merged';
   try {
     const resp = await fetch(mergeBase(env) + '/yt1080-jobs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Merge-Token': token },
-      body: JSON.stringify({ url: ytUrl }),
+      body: JSON.stringify({ url: ytUrl, quality: quality, mode: mode }),
     });
     return mergePassthrough(resp);
   } catch (e) {
