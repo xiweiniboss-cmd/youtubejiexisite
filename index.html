@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>YouTube 无水印解析下载</title>
+<style>
+:root{ --pink:#FF0000; --cyan:#25F4EE; --bg:#08080e; --card:rgba(255,255,255,.055); --line:rgba(255,255,255,.11); --text:#f5f3ef; --muted:rgba(245,243,239,.62); --faint:rgba(245,243,239,.38); }
+*{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+body{ margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; min-height:100vh; }
+
+html{ background:#08080e; }
+.bg{ position:fixed; inset:0; z-index:-2; overflow:hidden; pointer-events:none; background:radial-gradient(120% 90% at 50% 0%, #17121f 0%, #08080e 55%); }
+.orb{ position:absolute; border-radius:50%; filter:blur(70px); opacity:.5; }
+.orb-a{ width:340px; height:340px; left:-90px; top:-70px; background:radial-gradient(circle at 35% 35%, #ff5a1f, #FF0000 70%); animation:drift 16s ease-in-out infinite alternate; }
+.orb-b{ width:280px; height:280px; right:-80px; top:180px; background:radial-gradient(circle at 60% 40%, #ffb25e, #2b1055 75%); opacity:.32; animation:drift 21s ease-in-out infinite alternate-reverse; }
+.orb-c{ width:220px; height:220px; left:32%; bottom:-110px; background:radial-gradient(circle at 50% 50%, #ff5a1f, #571f00 75%); opacity:.26; animation:drift 19s ease-in-out infinite alternate; }
+@keyframes drift{ from{ transform:translate(0,0) scale(1); } to{ transform:translate(38px,26px) scale(1.08); } }
+.grain{ position:fixed; inset:0; z-index:-1; pointer-events:none; opacity:.5; background-image:radial-gradient(rgba(255,255,255,.05) 1px, transparent 1px); background-size:22px 22px; }
+
+.wrap{ max-width:640px; margin:0 auto; padding:20px 16px 60px; }
+header{ text-align:center; margin:30px 0 22px; }
+header h1{ font-size:29px; margin:0 0 10px; font-weight:900; letter-spacing:1px; }
+header h1 .dy{ color:var(--text); text-shadow:none; }
+header h1 .dl{ background:linear-gradient(92deg,#ff7a45,#FF0000 55%,#c81e1e); -webkit-background-clip:text; background-clip:text; color:transparent; }
+header p{ color:var(--muted); font-size:13px; margin:4px 0 0; }
+.card{ background:var(--card); border:1px solid var(--line); border-radius:20px; padding:18px 16px; margin-top:16px; box-shadow:0 24px 50px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.07); backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px); }
+textarea{ width:100%; min-height:88px; background:rgba(0,0,0,.32); border:1px solid rgba(255,255,255,.09); border-radius:14px; color:var(--text); font-size:14px; padding:12px; resize:vertical; outline:none; font-family:inherit; transition:border-color .2s, box-shadow .2s; }
+textarea:focus{ border-color:#FF0000; box-shadow:0 0 0 4px rgba(255,255,255,.06); }
+textarea::placeholder{ color:var(--faint); }
+.btn{ display:block; width:100%; margin-top:12px; padding:14px; border:none; border-radius:14px; font-size:16px; font-weight:700; color:#fff; background:linear-gradient(92deg,#ff7a45,#FF0000 55%,#c81e1e); cursor:pointer; box-shadow:0 12px 26px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.3); transition:transform .12s, opacity .2s; }
+.btn:active{ transform:scale(.985); }
+.btn:disabled{ opacity:.55; }
+.btn.ghost{ background:rgba(255,255,255,.07); border:1px solid var(--line); color:var(--muted); box-shadow:none; font-weight:500; }
+.btn.ghost::after{ display:none; }
+.hint{ font-size:12px; color:var(--muted); margin-top:10px; line-height:1.8; }
+#result{ display:none; }
+video#preview{ width:100%; max-height:60vh; border-radius:14px; background:#000; }
+.title{ font-size:14px; line-height:1.6; margin:10px 0 12px; word-break:break-word; }
+.grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:12px; }
+.grid img{ width:100%; aspect-ratio:3/4; object-fit:cover; border-radius:10px; background:rgba(0,0,0,.3); }
+.err{ display:none; background:rgba(254,44,85,.12); border:1px solid rgba(254,44,85,.4); color:#ff9db0; font-size:13px; border-radius:14px; padding:12px; margin-top:14px; line-height:1.7; word-break:break-word; }
+.loading{ display:none; text-align:center; color:var(--muted); font-size:13px; margin-top:14px; }
+.dlprog{ display:none; margin-top:12px; }
+.dlprog .track{ height:10px; border-radius:6px; background:rgba(255,255,255,.1); overflow:hidden; }
+.dlprog .bar{ height:100%; width:0%; border-radius:6px; background:linear-gradient(90deg,#ff7a45,#FF0000); transition:width .15s; }
+.dlprog .txt{ margin-top:6px; font-size:12px; color:var(--muted); text-align:center; }
+#resList{ margin-top:12px; display:grid; gap:8px; }
+#resList .btn{ margin-top:0; }
+#fbBtn{ position:fixed; right:18px; bottom:calc(22px + env(safe-area-inset-bottom)); width:52px; height:52px; border-radius:50%; border:1px solid rgba(255,255,255,.25); font-size:23px; background:linear-gradient(135deg,#ff7a45,#FF0000 60%,#c81e1e); box-shadow:0 12px 28px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.35); cursor:pointer; z-index:60; touch-action:none; user-select:none; -webkit-user-select:none; }
+#fbWrap{ display:none; position:fixed; inset:0; z-index:70; }
+#fbWrap.show{ display:block; }
+#fbWrap .backdrop{ position:absolute; inset:0; background:rgba(4,4,8,.62); backdrop-filter:blur(3px); }
+#fbWrap .sheet{ position:absolute; left:0; right:0; bottom:0; background:linear-gradient(180deg,#1b1b26,#12121c); border:1px solid rgba(255,255,255,.1); border-bottom:none; border-radius:24px 24px 0 0; padding:18px 18px calc(20px + env(safe-area-inset-bottom)); max-width:520px; margin:0 auto; max-height:88vh; overflow-y:auto; }
+#fbWrap .sheet h3{ font-size:17px; margin:0 0 6px; }
+#fbWrap .sheet p{ font-size:13px; color:var(--muted); line-height:1.7; margin:0 0 12px; }
+#fbWrap input[type=text]{ width:100%; background:rgba(0,0,0,.32); border:1px solid rgba(255,255,255,.1); border-radius:12px; color:var(--text); font-size:14px; padding:12px; outline:none; margin-top:10px; }
+#fbWrap input[type=text]:focus{ border-color:#FF0000; }
+#fbWrap input[type=file]{ margin-top:8px; font-size:13px; color:var(--muted); }
+#fbWrap .flabel{ display:block; margin-top:10px; font-size:13px; color:var(--muted); }
+#fbWrap .row{ display:flex; gap:10px; margin-top:14px; }
+#fbWrap .btn-ghost{ flex:1; background:rgba(255,255,255,.07); border:1px solid var(--line); border-radius:12px; font-size:15px; padding:13px 0; color:var(--text); cursor:pointer; }
+#fbWrap .btn-ok{ flex:2; border:none; border-radius:12px; font-size:15px; font-weight:600; padding:13px 0; color:#fff; cursor:pointer; background:linear-gradient(92deg,#ff7a45,#FF0000 55%,#c81e1e); }
+#fbWrap .btn-ok:disabled{ opacity:.5; }
+#fbDone{ display:none; text-align:center; padding:20px 0 6px; }
+#fbDone .big{ font-size:40px; }
+#fbDone p{ margin-top:10px; }
+footer{ text-align:center; color:var(--faint); font-size:11px; margin-top:30px; line-height:1.8; }
+
+.btn{ position:relative; overflow:hidden; }
+.btn::after{ content:""; position:absolute; top:0; left:-70%; width:45%; height:100%; background:linear-gradient(100deg,transparent,rgba(255,255,255,.32),transparent); transform:skewX(-18deg); animation:shine 3.4s ease-in-out infinite; pointer-events:none; }
+@keyframes shine{ 0%,55%{ left:-70%; } 85%,100%{ left:130%; } }
+
+</style>
+<style>
+/* ===== 顶部结构对齐快手站：品牌栏 + Hero + 三步卡 + 输入壳（第二轮） ===== */
+.bg{ background:radial-gradient(90% 55% at 85% 0%, rgba(255,0,0,.18) 0%, transparent 55%), radial-gradient(120% 90% at 50% 0%, #17121f 0%, #08080e 55%); }
+.orb{ opacity:.62; filter:blur(58px); }
+.orb-a{ width:400px; height:400px; }
+header.topbar{ display:flex; align-items:center; gap:12px; text-align:left; margin:4px 0 0; padding:0; }
+.logo{ width:46px; height:46px; border-radius:14px; flex:none; display:grid; place-items:center; background:linear-gradient(135deg,#ff7a45,#FF0000 55%,#c81e1e); box-shadow:0 10px 26px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.35); }
+.logo svg{ width:24px; height:24px; }
+.brand-name{ font-size:19px; font-weight:800; letter-spacing:.5px; }
+.brand-sub{ font-size:11px; color:var(--muted); margin-top:2px; letter-spacing:1.5px; }
+.quota-chip{ margin-left:auto; font-size:12px; color:var(--muted); border:1px solid var(--line); background:rgba(255,255,255,.055); padding:6px 11px; border-radius:999px; white-space:nowrap; }
+.quota-chip b{ color:var(--pink); font-weight:700; }
+.hero{ margin-top:34px; }
+.hero h1{ font-size:31px; line-height:1.28; font-weight:900; letter-spacing:.5px; margin:0; }
+.hero h1 .grad{ background:linear-gradient(92deg,#ff7a45,#FF0000 55%,#c81e1e); -webkit-background-clip:text; background-clip:text; color:transparent; }
+.hero p{ margin-top:12px; font-size:14.5px; line-height:1.75; color:var(--muted); }
+.hero .hero-count{ margin-top:8px; font-size:12.5px; color:var(--faint); }
+.hero .hero-count b{ color:var(--pink); }
+.input-shell{ background:rgba(0,0,0,.32); border:1px solid rgba(255,255,255,.09); border-radius:16px; padding:12px 13px; transition:border-color .2s, box-shadow .2s; }
+.input-shell:focus-within{ border-color:var(--pink); box-shadow:0 0 0 4px rgba(255,255,255,.06); }
+.input-shell textarea{ background:transparent; border:none; min-height:58px; padding:2px; }
+.input-shell textarea:focus{ border-color:transparent; box-shadow:none; }
+.input-tools{ display:flex; gap:9px; margin-top:10px; }
+.input-tools .btn{ width:auto; flex:none; margin-top:0; padding:8px 14px; border-radius:999px; font-size:13px; font-weight:500; }
+.steps{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:20px; }
+.step{ background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.07); border-radius:16px; padding:13px 10px; text-align:center; }
+.step .ic{ font-size:19px; }
+.step .t{ font-size:12.5px; font-weight:700; margin-top:6px; }
+.step .d{ font-size:11px; color:var(--faint); margin-top:3px; line-height:1.5; }
+</style>
+<style>
+/* ===== 全屏品牌渐变背景（第三轮） ===== */
+html, body{ background:#991b1b; }
+.bg{ background:linear-gradient(155deg, #FF1E1E 0%, #C81E1E 55%, #7F1D1D 105%); }
+.orb{ background:radial-gradient(circle at 40% 40%, rgba(255,255,255,.55), rgba(255,255,255,0) 70%); opacity:.16; }
+.card{ background:rgba(13,13,20,.45); }
+.step{ background:rgba(13,13,20,.30); }
+.quota-chip{ background:rgba(13,13,20,.30); }
+header.topbar, .hero h1{ text-shadow:0 2px 18px rgba(0,0,0,.30); }
+.hero p, .brand-sub{ text-shadow:0 1px 10px rgba(0,0,0,.28); }
+footer{ text-shadow:0 1px 8px rgba(0,0,0,.30); }
+</style>
+
+<style>
+/* ===== 背景层级修正（第四轮）：body 改透明，品牌渐变层真正显示 ===== */
+body{ background:transparent; }
+</style>
+</head>
+<body>
+<div class="bg"><div class="orb orb-a"></div><div class="orb orb-b"></div><div class="orb orb-c"></div></div><div class="grain"></div>
+<div class="wrap">
+  <header class="topbar">
+    <div class="logo"><svg viewBox="0 0 24 24" fill="none"><path d="M8.2 5.4v13.2c0 .9 1 1.5 1.8 1L19 13a1.2 1.2 0 0 0 0-2L10 4.4c-.8-.5-1.8.1-1.8 1Z" fill="#fff"/></svg></div>
+    <div>
+      <div class="brand-name">YouTube 解析</div>
+      <div class="brand-sub">YOUTUBE · 高清下载</div>
+    </div>
+    <div class="quota-chip">今日剩余 <b id="quotaCount">-</b> 次</div>
+  </header>
+
+  <section class="hero">
+    <h1>粘贴链接<br>一键保存 <span class="grad">高清视频</span></h1>
+    <p>在 YouTube 里点「分享 → 复制链接」，把链接粘到下面，剩下的交给我们。多种清晰度可选，也能只下音频。</p>
+    <p class="hero-count">本站已解析 <b id="parseCount">-</b> 次</p>
+  </section>
+
+  <div class="card">
+    <div class="input-shell">
+      <textarea id="urlInput" placeholder="在此粘贴 YouTube 分享链接&#10;例如：https://www.youtube.com/watch?v=xxxx&#10;或 https://youtu.be/xxxx"></textarea>
+      <div class="input-tools">
+        <button class="btn ghost" id="pasteBtn">📋 一键粘贴</button>
+      </div>
+    </div>
+    <button class="btn" id="parseBtn">开始解析</button>
+    <div id="tsParseWidget" style="margin-top:10px"></div>
+    <div class="hint">📋 在 YouTube App 点「分享」→「复制链接」，粘贴到这里即可<br>🌐 下载需要开 VPN（YouTube 直链走境外）<br>🔒 仅解析公开视频，请勿用于侵权用途</div>
+  </div>
+
+
+  <section class="steps">
+    <div class="step"><div class="ic">📤</div><div class="t">复制链接</div><div class="d">YouTube 里分享<br>选择「复制链接」</div></div>
+    <div class="step"><div class="ic">✨</div><div class="t">粘贴解析</div><div class="d">贴到上方输入框<br>点「开始解析」</div></div>
+    <div class="step"><div class="ic">⬇️</div><div class="t">保存视频</div><div class="d">点「一键下载」<br>存到本地慢慢看</div></div>
+  </section>
+
+  <div class="loading" id="loading">解析中，请稍候…</div>
+  <div class="err" id="err"></div>
+
+  <div class="card" id="result">
+    <div class="title" id="resTitle"></div>
+    <div id="mediaBox"></div>
+    <div id="resList"></div>
+    <div class="dlprog" id="dlProg">
+      <div class="track"><div class="bar" id="dlProgBar"></div></div>
+      <div class="txt" id="dlProgTxt">准备下载…</div>
+    </div>
+    <button class="btn" id="saveBtn" style="display:none" onclick="window.__saveFile()">✅ 下载完成，点这里保存</button>
+    <div class="hint" id="dlHint" style="display:none">iPhone 会弹出分享菜单，点「存储视频」即可保存到相册；没弹出就点「点这里保存」<br>💡 直链有时效，解析完尽快下载</div>
+  </div>
+
+  <footer>解析仅供个人学习交流<br>请勿传播他人原创作品</footer>
+</div>
+
+<!-- 反馈 -->
+<button id="fbBtn" title="问题反馈">💬</button>
+<div id="fbWrap">
+  <div class="backdrop" id="fbBackdrop"></div>
+  <div class="sheet" id="fbSheet">
+    <h3>问题反馈</h3>
+    <p>遇到解析失败、下载不了等问题？描述一下，可以附截图或录屏。</p>
+    <textarea id="fbMsg" placeholder="请描述你遇到的问题（比如：哪条链接解析失败、报了什么错）"></textarea>
+    <input type="text" id="fbContact" placeholder="联系方式（可选）" maxlength="120">
+    <label class="flabel" for="fbFiles">📎 截图/录屏（可选，最多3个，单个≤20MB）</label>
+    <input type="file" id="fbFiles" accept="image/*,video/*" multiple>
+    <div id="tsWidget" style="margin-top:10px"></div>
+    <div id="fbErr" style="display:none;color:#ff8ba0;font-size:13px;margin-top:10px;line-height:1.6"></div>
+    <div class="row">
+      <button class="btn-ghost" id="fbCancel">取消</button>
+      <button class="btn-ok" id="fbSubmit">提交反馈</button>
+    </div>
+    <div id="fbDone"><div class="big">✅</div><p>反馈已提交，谢谢！</p></div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+// 设备ID（防换IP刷次数）：首次访问生成，存 localStorage
+var deviceId = (function(){
+  try {
+    var id = localStorage.getItem('device_id');
+    if (!id) {
+      id = 'd' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+      localStorage.setItem('device_id', id);
+    }
+    return id;
+  } catch(e){ return ''; }
+})();
+
+  var urlInput = $('urlInput'), parseBtn = $('parseBtn'), loading = $('loading'),
+      errBox = $('err'), resultBox = $('result'), mediaBox = $('mediaBox'),
+      resList = $('resList'), dlHint = $('dlHint');
+
+  // 一键粘贴：从剪贴板读取分享链接
+  $('pasteBtn').onclick = function(){
+    hideError();
+    if(navigator.clipboard && navigator.clipboard.readText){
+      navigator.clipboard.readText().then(function(t){
+        if(t && t.trim()){ urlInput.value = t.trim(); }
+        else showError('剪贴板是空的，请先去 YouTube App 复制分享链接');
+      }).catch(function(){
+        showError('无法读取剪贴板，请手动长按输入框粘贴（iPhone 请允许 Safari 访问剪贴板）');
+      });
+    } else {
+      showError('当前浏览器不支持一键粘贴，请手动长按输入框粘贴');
+    }
+  };
+
+  // YouTube 直链手机直接下载（需开 VPN），不走代理
+  function fileName(base, ext){
+    return 'youtube_' + String(base).replace(/[^\w\-]+/g, '_').slice(0, 40) + '.' + ext;
+  }
+  function showError(html){
+    errBox.style.display = 'block';
+    errBox.innerHTML = html;
+  }
+  function hideError(){ errBox.style.display = 'none'; errBox.innerHTML = ''; }
+  function setParseBtn(t, disabled){
+    parseBtn.textContent = t;
+    parseBtn.disabled = !!disabled;
+  }
+  function resetParseBtn(){ setParseBtn('开始解析', false); }
+
+  // 下载单个资源：经 /api/ytdl 代理中转（googlevideo 无 CORS 头，手机直接 fetch 会被拦），成功则经系统分享保存
+  function fetchBlobProgress(url, onProgress){
+    return fetch(url).then(function(res){
+      if(!res.ok) throw new Error('HTTP ' + res.status);
+      var total = parseInt(res.headers.get('Content-Length') || '0', 10) || 0;
+      var ctype = res.headers.get('Content-Type') || 'video/mp4';
+      if(!res.body || !res.body.getReader) return res.blob();
+      var reader = res.body.getReader();
+      var chunks = [];
+      var received = 0;
+      onProgress(0, total);
+      function pump(){
+        return reader.read().then(function(r){
+          if(r.done){
+            try{ reader.releaseLock(); }catch(e){}
+            return new Blob(chunks, { type: ctype });
+          }
+          chunks.push(r.value);
+          received += r.value.byteLength || r.value.length || 0;
+          onProgress(received, total);
+          return pump();
+        });
+      }
+      return pump();
+    });
+  }
+  // 下载完成后保存：iPhone 的分享菜单必须由“点击”直接触发，下载几十秒后再自动调用会被系统静默拒绝，
+  // 所以自动尝试一次，失败就亮出「点这里保存」按钮让用户再点一下（新的点击一定能弹出）。
+  var _pendingFile = null;
+  function __hkMime(name, t){
+    if (/\.m4a$/i.test(name)) return 'audio/mp4';
+    if (/\.mp4$/i.test(name)) return 'video/mp4';
+    return (t && t !== 'application/octet-stream') ? t : 'video/mp4';
+  }
+  function __hkLink(file){
+    var objUrl = URL.createObjectURL(file);
+    var a = document.createElement('a');
+    a.href = objUrl; a.download = file.name;
+    document.body.appendChild(a); a.click();
+    setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(objUrl); }, 60000);
+  }
+  function __hkCanShare(file){
+    try { return !!(navigator.share && navigator.canShare && navigator.canShare({ files: [file] })); } catch(e){ return false; }
+  }
+  function __hkShowBtn(file){
+    _pendingFile = file;
+    var btn = document.getElementById('saveBtn');
+    btn.textContent = '✅ 下载完成，点这里保存（' + fmtMB(file.size) + '）';
+    btn.style.display = 'block';
+    btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+  function __hkHideBtn(){ _pendingFile = null; var b = document.getElementById('saveBtn'); if (b) b.style.display = 'none'; }
+  function __hkSaveFile(file, fromTap){
+    if (__hkCanShare(file)) {
+      return navigator.share({ files: [file], title: file.name }).then(__hkHideBtn).catch(function(e){
+        if (e && e.name === 'AbortError') { if (!fromTap) __hkShowBtn(file); return; }
+        if (fromTap) { __hkLink(file); __hkHideBtn(); }
+        else __hkShowBtn(file);
+      });
+    }
+    __hkLink(file);
+    if (fromTap) __hkHideBtn(); else __hkShowBtn(file);
+  }
+  function __hkSave(blob, filename){
+    if (!blob || blob.size < 1024) throw new Error('文件为空或已失效，请重新解析');
+    if (/json|html/i.test(blob.type || '')) throw new Error('服务器返回的不是视频，请重新解析');
+    __hkSaveFile(new File([blob], filename, { type: __hkMime(filename, blob.type) }), false);
+  }
+  window.__saveFile = function(){ if (_pendingFile) __hkSaveFile(_pendingFile, true); };
+  function fmtMB(b){ return (b/1048576).toFixed(1) + ' MB'; }
+  function setDlProg(received, total){
+    var wrap = document.getElementById('dlProg');
+    var bar = document.getElementById('dlProgBar');
+    var txt = document.getElementById('dlProgTxt');
+    wrap.style.display = 'block';
+    if(total > 0){
+      var pct = Math.min(100, Math.round(received / total * 100));
+      bar.style.width = pct + '%';
+      bar.style.opacity = '';
+      txt.textContent = '下载中 ' + pct + '%（' + fmtMB(received) + ' / ' + fmtMB(total) + '）';
+    }else{
+      bar.style.width = '100%';
+      bar.style.opacity = '.4';
+      txt.textContent = '下载中，已接收 ' + fmtMB(received) + '…';
+    }
+  }
+  function resetDlProg(){
+    var bar = document.getElementById('dlProgBar');
+    bar.style.width = '0%'; bar.style.opacity = '';
+    document.getElementById('dlProgTxt').textContent = '准备下载…';
+    document.getElementById('dlProg').style.display = 'block';
+  }
+  function hideDlProg(){ document.getElementById('dlProg').style.display = 'none'; }
+
+  function downloadResource(url, filename){
+    setParseBtn('正在准备下载…', true); __hkHideBtn();
+    resetDlProg();
+    var proxyUrl = '/api/ytdl?url=' + encodeURIComponent(url) + '&filename=' + encodeURIComponent(filename);
+    fetchBlobProgress(proxyUrl, setDlProg).then(function(blob){
+      hideDlProg();
+      resetParseBtn();
+      __hkSave(blob, filename);
+    }).catch(function(e){
+      resetParseBtn();
+      hideDlProg();
+      showError('下载失败：' + (e.message || '网络错误') +
+        '<br><br>💡 可点右侧「🔗 复制直链」粘贴到 Safari 直接打开播放。<br>💡 直链有时效，超时请重新解析。');
+    });
+  }
+
+  function resLabel(r, i){
+    var label = String(r.type || '');
+    if (/audio|m4a|mp3/i.test(label)) return '🎵 纯音频';
+    if (/2160|4k/i.test(label)) return '🎬 4K 超清';
+    if (/1440|2k/i.test(label)) return '🎬 2K 超清';
+    if (/1080/.test(label)) return '🎬 1080P 高清';
+    if (/720/.test(label)) return '🎬 720P 高清';
+    if (/480/.test(label)) return '🎬 480P';
+    if (/360/.test(label)) return '🎬 360P 流畅';
+    return '🎬 ' + (label || '视频') + ' #' + (i + 1);
+  }
+
+  function renderResult(d){
+    resultBox.style.display = 'block';
+    $('resTitle').textContent = d.title || '（无标题）';
+    mediaBox.innerHTML = '';
+    resList.innerHTML = '';
+    dlHint.style.display = 'none';
+
+    if (d.cover) {
+      var img = document.createElement('img');
+      img.src = d.cover;
+      img.style.cssText = 'width:100%;border-radius:12px;margin-bottom:4px;background:#000';
+      img.loading = 'lazy';
+      mediaBox.appendChild(img);
+    }
+
+    var resources = d.resources || [];
+    if (resources.length) {
+      var vids = resources.filter(function(r){ return !/audio|m4a|mp3/i.test(String(r.type || '')); });
+      var auds = resources.filter(function(r){ return /audio|m4a|mp3/i.test(String(r.type || '')); });
+      var ordered = vids.concat(auds);
+      ordered.forEach(function(r, i){
+        var wrap = document.createElement('div');
+        wrap.style.cssText = 'display:flex;gap:8px;margin-top:10px';
+        var btn = document.createElement('button');
+        btn.className = 'btn ghost';
+        btn.style.cssText = 'margin-top:0;flex:3;font-size:14px;font-weight:600';
+        var dur = r.duration ? ' · ' + Math.floor(r.duration / 60) + ':' + String(Math.floor(r.duration % 60)).padStart(2, '0') : '';
+        btn.textContent = '⬇ ' + resLabel(r, i) + dur;
+        btn.onclick = function(){
+          var ext = /audio|m4a/i.test(String(r.type || '')) ? 'm4a' : 'mp4';
+          downloadResource(r.url, fileName((d.title || 'youtube') + '_' + i, ext));
+        };
+        var copyBtn = document.createElement('button');
+        copyBtn.className = 'btn ghost';
+        copyBtn.style.cssText = 'margin-top:0;flex:1;font-size:13px';
+        copyBtn.textContent = '🔗 复制直链';
+        copyBtn.onclick = function(){
+          var done = function(){ copyBtn.textContent = '✅ 已复制'; setTimeout(function(){ copyBtn.textContent = '🔗 复制直链'; }, 1500); };
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(r.url).then(done).catch(function(){ alert('复制失败'); });
+          } else { alert('当前浏览器不支持复制'); }
+        };
+        wrap.appendChild(btn);
+        wrap.appendChild(copyBtn);
+        resList.appendChild(wrap);
+      });
+      var tip = document.createElement('div');
+      tip.className = 'hint';
+      tip.textContent = '共 ' + ordered.length + ' 个版本，选择清晰度下载';
+      resList.appendChild(tip);
+      dlHint.style.display = 'block';
+    } else {
+      showError('解析成功但未找到可下载的媒体文件。');
+    }
+    resultBox.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  /* 解析区人机验证（与反馈共用一次脚本加载，重复引入会卡死组件） */
+  var _tsScriptPromise = null;
+  function ensureTurnstileScript(){
+    if (_tsScriptPromise) return _tsScriptPromise;
+    _tsScriptPromise = fetch('/api/turnstile-key').then(function(r){ return r.json(); }).then(function(j){
+      if (!j.ok || !j.siteKey) throw new Error('no site key');
+      return new Promise(function(resolve, reject){
+        if (window.turnstile) { resolve(j.siteKey); return; }
+        var s = document.createElement('script');
+        s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+        s.async = true; s.defer = true;
+        s.onload = function(){ resolve(j.siteKey); };
+        s.onerror = function(){ reject(new Error('script load failed')); };
+        document.head.appendChild(s);
+      });
+    });
+    return _tsScriptPromise;
+  }
+  var tsParseWidgetId = null;
+  ensureTurnstileScript().then(function(siteKey){
+    try {
+      tsParseWidgetId = turnstile.render('#tsParseWidget', { sitekey: siteKey, theme: 'dark', language: 'zh-cn' });
+    } catch(e){}
+  }).catch(function(){});
+
+    /* 反馈表单 */
+  var tsWidgetId = null;
+  function showFbError(html){
+    var e = $('fbErr');
+    e.style.display = 'block';
+    e.innerHTML = html;
+  }
+  function hideFbError(){
+    var e = $('fbErr');
+    e.style.display = 'none';
+    e.innerHTML = '';
+  }
+  function loadTurnstile(){
+    if (tsWidgetId !== null) return;
+    ensureTurnstileScript().then(function(siteKey){
+      // 等浏览器完成布局后再渲染：在 display:none 容器里渲染组件会直接卡死
+      requestAnimationFrame(function(){
+        setTimeout(function(){
+          try {
+            var el = document.getElementById('tsWidget');
+            if (el && el.offsetParent !== null) {
+              tsWidgetId = turnstile.render(el, { sitekey: siteKey, theme: 'dark', language: 'zh-cn' });
+            } else {
+              showFbError('验证组件加载失败，请关闭重试。');
+            }
+          } catch(e){
+            showFbError('验证组件加载失败，请关闭重试。');
+          }
+        }, 80);
+      });
+    }).catch(function(){
+      showFbError('验证组件加载失败，请检查网络后重试。');
+    });
+  }
+  $('fbBtn').onclick = function(){ $('fbWrap').classList.add('show'); $('fbDone').style.display = 'none'; hideFbError(); loadTurnstile(); };
+  $('fbBackdrop').onclick = function(){ $('fbWrap').classList.remove('show'); };
+  $('fbCancel').onclick = function(){ $('fbWrap').classList.remove('show'); };
+  $('fbSubmit').onclick = async function(){
+    hideFbError();
+    var msg = $('fbMsg').value.trim();
+    if(!msg){ showFbError('请先填写反馈内容。'); return; }
+    var files = Array.prototype.slice.call($('fbFiles').files || []);
+    if(files.length > 3){ showFbError('最多上传 3 个附件。'); return; }
+    for(var i = 0; i < files.length; i++){
+      var f = files[i];
+      if(!/^(image|video)\//.test(f.type || '')){ showFbError('只支持图片和视频附件。'); return; }
+      if(f.size > 20 * 1024 * 1024){ showFbError('单个附件不能超过 20MB。'); return; }
+    }
+    var tsToken = '';
+    if (tsWidgetId !== null) {
+      try { tsToken = turnstile.getResponse(tsWidgetId) || ''; } catch(e){}
+      if (!tsToken) { showFbError('请先完成人机验证。'); return; }
+    } else {
+      showFbError('验证组件未加载完成，请稍等几秒再试。');
+      return;
+    }
+    var btn = $('fbSubmit');
+    btn.disabled = true; btn.textContent = '提交中…';
+    try{
+      var fd = new FormData();
+      fd.append('message', msg);
+      fd.append('contact', $('fbContact').value.trim());
+      fd.append('page', location.href);
+      if (tsToken) fd.append('cf-turnstile-response', tsToken);
+      files.forEach(function(ff){ fd.append('files', ff, ff.name); });
+      const r = await fetch('/api/feedback', { method: 'POST', body: fd });
+      const j = await r.json();
+      if(j.ok){
+        $('fbMsg').value = ''; $('fbContact').value = ''; $('fbFiles').value = '';
+        $('fbDone').style.display = 'block';
+        setTimeout(function(){ $('fbWrap').classList.remove('show'); }, 1600);
+      } else {
+        showFbError('反馈提交失败：' + (j.error || '请稍后重试'));
+      }
+    }catch(e){ showFbError('网络错误，请稍后重试。'); }
+    if (tsWidgetId !== null) { try { turnstile.reset(tsWidgetId); } catch(e){} }
+    btn.disabled = false; btn.textContent = '提交反馈';
+  };
+
+  /* 本站解析次数 */
+  fetch('/api/stats').then(function(r){ return r.json(); }).then(function(j){
+    if (j.ok && typeof j.parseCount === 'number') $('parseCount').textContent = j.parseCount;
+  }).catch(function(){});
+
+  parseBtn.onclick = function(){
+    var text = urlInput.value.trim();
+    hideError();
+    resultBox.style.display = 'none';
+    if(!text){ showError('请先粘贴 YouTube 分享链接'); return; }
+    var tsToken = '';
+    if (tsParseWidgetId !== null) {
+      try { tsToken = turnstile.getResponse(tsParseWidgetId) || ''; } catch(e){}
+      if (!tsToken) { showError('请先完成人机验证'); return; }
+    }
+    setParseBtn('解析中…', true);
+    loading.style.display = 'block';
+    var apiUrl = '/api/parse?url=' + encodeURIComponent(text);
+    if (deviceId) apiUrl += '&deviceId=' + encodeURIComponent(deviceId);
+    if (tsToken) apiUrl += '&turnstile=' + encodeURIComponent(tsToken);
+    fetch(apiUrl)
+      .then(function(r){ return r.text().then(function(t){
+        var ct = r.headers.get('content-type') || '';
+        if(!/json/i.test(ct)) throw new Error('服务异常（HTTP ' + r.status + '），请稍后重试');
+        return JSON.parse(t);
+      });})
+      .then(function(data){
+        loading.style.display = 'none';
+        resetParseBtn();
+        if (tsParseWidgetId !== null) { try { turnstile.reset(tsParseWidgetId); } catch(e){} }
+        if(!data.ok) throw new Error(data.error || '解析失败');
+        renderResult(data);
+        try {
+          var el = $('parseCount');
+          var n = parseInt(el.textContent, 10);
+          if (!isNaN(n)) el.textContent = n + 1;
+        } catch(e){}
+        try { refreshQuota(); } catch(e){}
+      })
+      .catch(function(e){
+        loading.style.display = 'none';
+        resetParseBtn();
+        if (tsParseWidgetId !== null) { try { turnstile.reset(tsParseWidgetId); } catch(e){} }
+        var msg = String(e.message || '解析失败');
+        if(/did not match the expected pattern|Unexpected token/i.test(msg))
+          msg = '服务暂时不可用，请稍后重试';
+        showError('解析失败：' + msg);
+      });
+  };
+})();
+
+// 每日解析配额显示
+function refreshQuota(){
+  var el = document.getElementById('quotaCount');
+  if (!el) return;
+  var qurl = '/api/parse-quota';
+  try {
+    var did = localStorage.getItem('device_id');
+    if (did) qurl += '?deviceId=' + encodeURIComponent(did);
+  } catch(e){}
+  fetch(qurl).then(function(r){ return r.json(); }).then(function(j){
+    if (j && j.ok && typeof j.remaining === 'number') el.textContent = j.remaining;
+  }).catch(function(){});
+}
+refreshQuota();
+</script>
+
+<script>
+/* 可拖动反馈按钮（与快手站同款）：点按打开反馈（原有逻辑不变），按住拖动换位，松手自动贴边，位置会记住 */
+(function(){
+  var btn = document.getElementById('fbBtn');
+  if(!btn) return;
+  var KEY = 'fab_pos_youtube';
+  function clamp(x, y){ return { x: Math.min(Math.max(4, x), window.innerWidth - 56), y: Math.min(Math.max(4, y), window.innerHeight - 56) }; }
+  try {
+    var saved = JSON.parse(localStorage.getItem(KEY) || 'null');
+    if(saved && typeof saved.x === 'number' && typeof saved.y === 'number'){
+      var p = clamp(saved.x, saved.y);
+      btn.style.left = p.x + 'px'; btn.style.top = p.y + 'px'; btn.style.right = 'auto'; btn.style.bottom = 'auto';
+    }
+  } catch(e){}
+  var sx=0, sy=0, ox=0, oy=0, moved=false, dragging=false, dragEndAt=0;
+  document.addEventListener('click', function(e){
+    if(e.target === btn && moved && Date.now() - dragEndAt < 300){ e.stopPropagation(); e.preventDefault(); }
+  }, true);
+  btn.addEventListener('pointerdown', function(e){
+    dragging = true; moved = false;
+    var r = btn.getBoundingClientRect();
+    ox = r.left; oy = r.top; sx = e.clientX; sy = e.clientY;
+    try{ btn.setPointerCapture(e.pointerId); }catch(err){}
+  });
+  btn.addEventListener('pointermove', function(e){
+    if(!dragging) return;
+    var dx = e.clientX - sx, dy = e.clientY - sy;
+    if(Math.abs(dx) + Math.abs(dy) > 6) moved = true;
+    if(!moved) return;
+    var p = clamp(ox + dx, oy + dy);
+    btn.style.left = p.x + 'px'; btn.style.top = p.y + 'px'; btn.style.right = 'auto'; btn.style.bottom = 'auto';
+  });
+  function end(){
+    if(!dragging) return;
+    dragging = false;
+    if(!moved) return;
+    dragEndAt = Date.now();
+    var r = btn.getBoundingClientRect();
+    var x = (r.left + r.width/2 < window.innerWidth/2) ? 10 : window.innerWidth - r.width - 10;
+    btn.style.transition = 'left .25s ease';
+    btn.style.left = x + 'px';
+    setTimeout(function(){ btn.style.transition = ''; }, 280);
+    try{ localStorage.setItem(KEY, JSON.stringify({ x: x, y: r.top })); }catch(e){}
+  }
+  btn.addEventListener('pointerup', end);
+  btn.addEventListener('pointercancel', end);
+})();
+</script>
+
+</body>
+</html>
