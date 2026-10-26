@@ -855,6 +855,80 @@ async function handleStatsAll(request, env) {
   return json({ ok: true, sites: result });
 }
 
+/* ================= 1080P 服务器合并（EC2 yt-dlp + ffmpeg） ================= */
+// 前端不直接调 EC2（token 不能进前端），一律经 Pages Worker 中转，
+// Worker 用环境变量 YT_MERGE_TOKEN（与 EC2 ~/yt-merge/token.txt 一致）向 EC2 鉴权。
+// EC2 任务是异步的：start 立即返回 job_id，前端轮询 status，done 后再拉 file。
+// 未配 YT_MERGE_TOKEN 时明确报错，不让请求静默失败。
+const MERGE_BASE_DEFAULT = 'http://3.129.45.49:30002';
+function mergeBase(env) {
+  return (env.YT_MERGE_BASE || MERGE_BASE_DEFAULT).replace(/\/$/, '');
+}
+function mergeToken(env) {
+  return (env.YT_MERGE_TOKEN || '').trim();
+}
+async function mergePassthrough(resp) {
+  const text = await resp.text();
+  return new Response(text, {
+    status: resp.status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-store',
+    },
+  });
+}
+async function handleYt1080Start(request, env) {
+  const token = mergeToken(env);
+  if (!token)
+    return json({ ok: false, error: '未配置合并服务口令：请在 Pages 环境变量里设置 YT_MERGE_TOKEN（与 EC2 合并服务的口令一致），设置后重新部署生效' }, 500);
+  const reqUrl = new URL(request.url);
+  const ytUrl = reqUrl.searchParams.get('url') || '';
+  if (!ytUrl.trim()) return json({ ok: false, error: '请先粘贴 YouTube 分享链接' }, 400);
+  try {
+    const resp = await fetch(mergeBase(env) + '/yt1080-jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Merge-Token': token },
+      body: JSON.stringify({ url: ytUrl }),
+    });
+    return mergePassthrough(resp);
+  } catch (e) {
+    return json({ ok: false, error: '合并服务暂时连不上，请稍后再试' }, 502);
+  }
+}
+async function handleYt1080Status(request, env) {
+  const token = mergeToken(env);
+  if (!token) return json({ ok: false, error: '未配置合并服务口令' }, 500);
+  const id = new URL(request.url).searchParams.get('id') || '';
+  if (!id) return json({ ok: false, error: '缺少任务 id' }, 400);
+  try {
+    const resp = await fetch(mergeBase(env) + '/yt1080-jobs/' + encodeURIComponent(id), {
+      headers: { 'X-Merge-Token': token },
+    });
+    return mergePassthrough(resp);
+  } catch (e) {
+    return json({ ok: false, error: '合并服务暂时连不上，请稍后再试' }, 502);
+  }
+}
+async function handleYt1080File(request, env) {
+  const token = mergeToken(env);
+  if (!token) return json({ ok: false, error: '未配置合并服务口令' }, 500);
+  const id = new URL(request.url).searchParams.get('id') || '';
+  if (!id) return json({ ok: false, error: '缺少任务 id' }, 400);
+  try {
+    const resp = await fetch(mergeBase(env) + '/yt1080-jobs/' + encodeURIComponent(id) + '/file', {
+      headers: { 'X-Merge-Token': token },
+    });
+    if (!resp.ok) return mergePassthrough(resp);
+    const headers = new Headers(resp.headers);
+    headers.set('Cache-Control', 'no-store');
+    headers.set('Access-Control-Allow-Origin', '*');
+    return new Response(resp.body, { status: 200, headers });
+  } catch (e) {
+    return json({ ok: false, error: '合并服务暂时连不上，请稍后再试' }, 502);
+  }
+}
+
 /* ================= 路由 ================= */
 export default {
   async fetch(request, env) {
@@ -862,12 +936,16 @@ export default {
 
     if (url.pathname === '/api/parse') return handleParse(request, env);
     if (url.pathname === '/api/ytdl') return handleYtDl(request);
+    if (url.pathname === '/api/yt1080-start') return handleYt1080Start(request, env);
+    if (url.pathname === '/api/yt1080-status') return handleYt1080Status(request, env);
+    if (url.pathname === '/api/yt1080-file') return handleYt1080File(request, env);
 
     if (url.pathname === '/api/diag')
       return json({
         ok: true,
         hasApiKey: !!(env.REDFOX_API_KEY || '').trim(),
         hasAssets: typeof env.ASSETS?.fetch === 'function',
+        hasMergeToken: !!(env.YT_MERGE_TOKEN || '').trim(),
       });
 
     // Turnstile 公开 site key 下发

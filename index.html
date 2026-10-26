@@ -146,6 +146,8 @@ body{ background:transparent; }
       </div>
     </div>
     <button class="btn" id="parseBtn">开始解析</button>
+    <button class="btn ghost" id="merge1080Btn" style="margin-top:10px">🎬 1080P 带声音（服务器合并，约几分钟）</button>
+    <div class="hint" id="merge1080Status" style="display:none"></div>
     <div id="tsParseWidget" style="margin-top:10px"></div>
     <div class="hint">📋 在 YouTube App 点「分享」→「复制链接」，粘贴到这里即可<br>🌐 下载需要开 VPN（YouTube 直链走境外）<br>🔒 仅解析公开视频，请勿用于侵权用途</div>
   </div>
@@ -575,6 +577,98 @@ var deviceId = (function(){
         if(/did not match the expected pattern|Unexpected token/i.test(msg))
           msg = '服务暂时不可用，请稍后重试';
         showError('解析失败：' + msg);
+      });
+  };
+
+  // 1080P 带声音：经 Pages Worker 中转到 EC2，EC2 用 yt-dlp 取流 + ffmpeg 合并。
+  // EC2 任务是异步的：提交后每 10 秒轮询一次状态，done 后再下载成品。
+  // 下载复用同一套进度条 + iPhone 分享兜底（自动试一次，失败亮「点这里保存」）。
+  var mergeBtn = $('merge1080Btn'), mergeStatus = $('merge1080Status'), mergeTimer = null;
+  function setMergeStatus(html){
+    mergeStatus.style.display = 'block';
+    mergeStatus.innerHTML = html;
+  }
+  function setMergeBtn(t, disabled){
+    mergeBtn.textContent = t;
+    mergeBtn.disabled = !!disabled;
+  }
+  function resetMergeBtn(){ setMergeBtn('🎬 1080P 带声音（服务器合并，约几分钟）', false); }
+  function fmtElapsed(s){
+    var m = Math.floor(s / 60), sec = s % 60;
+    return m > 0 ? m + '分' + sec + '秒' : sec + '秒';
+  }
+  function downloadMerged(jobId, filename){
+    setMergeBtn('正在下载成品…', true);
+    resetDlProg();
+    fetchBlobProgress('/api/yt1080-file?id=' + encodeURIComponent(jobId), setDlProg).then(function(blob){
+      hideDlProg();
+      resetMergeBtn();
+      setMergeStatus('✅ 合并完成，文件 ' + fmtMB(blob.size) + '，正在弹出保存…');
+      __hkSave(blob, filename || 'youtube_1080p.mp4');
+    }).catch(function(e){
+      resetMergeBtn();
+      hideDlProg();
+      setMergeStatus('下载失败：' + (e.message || '网络错误') + '，成品在服务器上保留 1 小时，稍后可重新提交（若服务器空闲会重新合一份）。');
+    });
+  }
+  mergeBtn.onclick = function(){
+    var text = (urlInput.value || '').trim();
+    if(!text){ showError('请先粘贴 YouTube 分享链接'); return; }
+    if(!/youtu\.?be/i.test(text)){ showError('这不是 YouTube 链接，请检查后重试'); return; }
+    hideError();
+    if(mergeTimer){ clearInterval(mergeTimer); mergeTimer = null; }
+    setMergeBtn('正在提交合并任务…', true);
+    setMergeStatus('已提交，服务器正在解析 1080P…请不要关闭页面，约几分钟。');
+    fetch('/api/yt1080-start?url=' + encodeURIComponent(text), { method: 'POST' })
+      .then(function(r){ return r.json().then(function(j){ return { status: r.status, body: j }; }); })
+      .then(function(res){
+        var j = res.body || {};
+        if(!j.ok){
+          resetMergeBtn();
+          setMergeStatus('提交失败：' + (j.error || '服务器异常') + (res.status === 429 ? '（服务器一次只能合一个）' : ''));
+          return;
+        }
+        var jobId = j.job_id, started = Date.now(), filename = '';
+        setMergeStatus('合并中…已等 0 秒（服务器正在下载 1080P 视频流 + 音频流并合并）。');
+        mergeTimer = setInterval(function(){
+          var elapsed = Math.floor((Date.now() - started) / 1000);
+          if(elapsed > 900){
+            clearInterval(mergeTimer); mergeTimer = null;
+            resetMergeBtn();
+            setMergeStatus('超时（超过 15 分钟）：服务器任务可能仍在跑，请稍后再重新提交。');
+            return;
+          }
+          fetch('/api/yt1080-status?id=' + encodeURIComponent(jobId))
+            .then(function(r){ return r.json(); })
+            .then(function(s){
+              if(!s.ok){
+                clearInterval(mergeTimer); mergeTimer = null;
+                resetMergeBtn();
+                setMergeStatus('查询失败：' + (s.error || '服务器异常') + '，请重新提交。');
+                return;
+              }
+              if(s.status === 'done'){
+                clearInterval(mergeTimer); mergeTimer = null;
+                filename = s.filename || 'youtube_1080p.mp4';
+                setMergeStatus('✅ 合并完成（' + fmtMB(s.size || 0) + '），正在下载…');
+                downloadMerged(jobId, filename);
+              } else if(s.status === 'error'){
+                clearInterval(mergeTimer); mergeTimer = null;
+                resetMergeBtn();
+                setMergeStatus('合并失败：' + (s.error || '服务器异常') + '，请重新提交。');
+              } else {
+                setMergeStatus('合并中…已等 ' + fmtElapsed(elapsed) + '（服务器正在下载并合并，页面不要关）。');
+              }
+            })
+            .catch(function(){
+              // 轮询偶尔断网不直接判死，下一次继续轮询
+              setMergeStatus('合并中…已等 ' + fmtElapsed(elapsed) + '（刚才查询断了一下，继续等）。');
+            });
+        }, 10000);
+      })
+      .catch(function(e){
+        resetMergeBtn();
+        setMergeStatus('提交失败：' + (e.message || '网络错误'));
       });
   };
 })();
