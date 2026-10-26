@@ -310,8 +310,11 @@ async function handleYtDl(request) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 120000);
   try {
+    const upHeaders = { 'User-Agent': UA_PC, Accept: '*/*' };
+    const range = request.headers.get('Range');   // 浏览器合并时分段下载
+    if (range && /^bytes=\d+-\d*$/.test(range)) upHeaders['Range'] = range;
     const resp = await fetch(mediaUrl, {
-      headers: { 'User-Agent': UA_PC, Accept: '*/*' },
+      headers: upHeaders,
       signal: ctrl.signal,
     });
     if (!resp.ok || !resp.body)
@@ -320,10 +323,14 @@ async function handleYtDl(request) {
     h.set('Content-Type', resp.headers.get('content-type') || 'application/octet-stream');
     const len = resp.headers.get('content-length');
     if (len) h.set('Content-Length', len);
+    const cr = resp.headers.get('content-range');
+    if (cr) h.set('Content-Range', cr);
+    h.set('Accept-Ranges', 'bytes');
+    h.set('Access-Control-Expose-Headers', 'Content-Range, Content-Length');
     h.set('Content-Disposition', 'attachment; filename="' + filename + '"');
     h.set('Cache-Control', 'no-store');
     h.set('Access-Control-Allow-Origin', '*');
-    return new Response(resp.body, { status: 200, headers: h });
+    return new Response(resp.body, { status: resp.status === 206 ? 206 : 200, headers: h });
   } catch (e) {
     return json({ ok: false, error: '下载失败：' + (e.message || '网络错误') }, 502);
   } finally {
