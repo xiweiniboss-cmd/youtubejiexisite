@@ -146,18 +146,19 @@ body{ background:transparent; }
       </div>
     </div>
     <button class="btn" id="parseBtn">开始解析</button>
-    <div style="margin-top:10px;display:none;gap:8px;align-items:center">
-      <select id="mergeQuality" style="flex:1;padding:10px;border-radius:10px;border:1px solid #ddd;font-size:15px">
+    <!-- 服务器合并：清晰度 + 提交。地址和口令只在 Pages 环境变量 YT_MERGE_BASE / YT_MERGE_TOKEN，不进前端 -->
+    <div id="mergeRow" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+      <select id="mergeQuality" style="flex:1 1 180px;min-width:0;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,.15);background:rgba(0,0,0,.32);color:#f5f3ef;font-size:15px">
         <option value="1080|merged" selected>🎬 1080P 带声音</option>
         <option value="720|merged">🎬 720P 带声音</option>
         <option value="1080|silent">🔇 1080P 无声</option>
         <option value="720|silent">🔇 720P 无声</option>
         <option value="360|merged">🎬 360P 带声音</option>
       </select>
-      <button class="btn ghost" id="merge1080Btn" style="margin-top:0">服务器合并</button>
+      <button class="btn ghost" id="merge1080Btn" style="margin-top:0;width:auto;flex:none;white-space:nowrap;padding:10px 14px">服务器合并</button>
     </div>
     <div class="hint" id="merge1080Status" style="display:none"></div>
-    <button class="btn ghost" id="mergeHistoryBtn" style="margin-top:10px;display:none">📥 合并历史（服务器保留 1 小时）</button>
+    <button class="btn ghost" id="mergeHistoryBtn" style="margin-top:10px">📥 合并历史（服务器保留 1 小时）</button>
     <div id="mergeHistoryPanel" style="display:none;margin-top:10px;text-align:left"></div>
     <div id="tsParseWidget" style="margin-top:10px"></div>
     <div class="hint">📋 在 YouTube App 点「分享」→「复制链接」，粘贴到这里即可<br>🌐 下载需要开 VPN（YouTube 直链走境外）<br>🔒 仅解析公开视频，请勿用于侵权用途</div>
@@ -473,7 +474,11 @@ var deviceId = (function(){
       if (window.YTMerge && (d.videoId || '')) {
         hdSlot.innerHTML = '<div class="hint">⏳ 正在获取 1080P 高清流…</div>';
         fetch('/api/yt-hd?url=' + encodeURIComponent('https://youtu.be/' + d.videoId)).then(function(r){ return r.json(); }).then(function(h){
-          if (!h || !h.ok || !h.video || !h.audio) throw new Error((h && h.error) || '没拿到高清流');
+          if (!h || !h.ok || !h.video || !h.audio) {
+            var hdErr = new Error((h && h.error) || '没拿到高清流');
+            hdErr.code = h && h.code;
+            throw hdErr;
+          }
           if (best && resHeight(best) >= h.video.height && bestA) { hdSlot.innerHTML = ''; return; }
           hdSlot.innerHTML = '';
           var hb = document.createElement('button');
@@ -489,7 +494,9 @@ var deviceId = (function(){
           hdSlot.appendChild(ht);
           var mbOld = document.getElementById('redfoxMergeBtn'); if (mbOld) { mbOld.style.display = 'none'; if (mbOld.nextSibling) mbOld.nextSibling.style.display = 'none'; }
         }).catch(function(e){
-          hdSlot.innerHTML = '<div class="hint">⚠️ 暂时没拿到 1080P（' + String(e.message || e).replace(/[<>]/g, '') + '），可以稍后重新解析</div>';
+          var msg = String(e.message || e).replace(/[<>]/g, '');
+          if (e.code === 'LOGIN_REQUIRED') hdSlot.innerHTML = '<div class="hint">⚠️ ' + msg + '</div>';
+          else hdSlot.innerHTML = '<div class="hint">⚠️ 暂时没拿到 1080P（' + msg + '），可以稍后重新解析</div>';
         });
       }
       if (best && bestA && window.YTMerge) {
