@@ -306,43 +306,149 @@ async function handleParse(request, env) {
 }
 
 // ---------- YouTube 直链下载代理 ----------
-// googlevideo 不发送 CORS 头，手机端 fetch 会被拦；由 Worker 中转后加 CORS 头返回
-async function handleYtDl(request) {
-  const u = new URL(request.url);
-  const mediaUrl = u.searchParams.get('url') || '';
-  const filename = (u.searchParams.get('filename') || 'youtube_video.mp4').replace(/["\r\n]/g, '').slice(0, 80) || 'youtube_video.mp4';
+// googlevideo 不发送 CORS 头，手机端 fetch 会被拦；由 Worker 中转后加 CORS 头返回。
+// /api/yt-hd 返回的 media URL 带 ip=<当时的 Worker 出口>。另一次 /api/ytdl 可能从别的边缘出口出去，
+// googlevideo 直接 403（进度条一闪就关）。带 v+itag（+client）时，在同一次请求里重新向 player 要直链再拉流，
+// 让签发和下载共用这次出口。RedFox 等只带 url= 的下载仍走原来的透传。
+function ytdlFilename(raw) {
+  return String(raw || 'youtube_video.mp4').replace(/["\r\n]/g, '').slice(0, 80) || 'youtube_video.mp4';
+}
+
+function isAllowedMediaUrl(mediaUrl) {
   let target = null;
-  try { target = new URL(mediaUrl); } catch {
+  try { target = new URL(mediaUrl); } catch { return false; }
+  const allowed = /(^|\.)googlevideo\.com$|(^|\.)youtube\.com$|(^|\.)youtu\.be$|(^|\.)ytimg\.com$/i;
+  return /^https:$/.test(target.protocol) && allowed.test(target.hostname);
+}
+
+function ytdlFail(status) {
+  const code = status || 0;
+  if (code === 401 || code === 403 || code === 410)
+    return json({ ok: false, error: '直链失效（HTTP ' + code + '），请重新解析后再试' }, 502);
+  return json({ ok: false, error: '下载失败（HTTP ' + code + '）' }, 502);
+}
+
+function ytdlMediaResponse(resp, filename) {
+  const h = new Headers();
+  h.set('Content-Type', resp.headers.get('content-type') || 'application/octet-stream');
+  const len = resp.headers.get('content-length');
+  if (len) h.set('Content-Length', len);
+  const cr = resp.headers.get('content-range');
+  if (cr) h.set('Content-Range', cr);
+  h.set('Accept-Ranges', 'bytes');
+  h.set('Access-Control-Expose-Headers', 'Content-Range, Content-Length');
+  h.set('Content-Disposition', 'attachment; filename="' + filename + '"');
+  h.set('Cache-Control', 'no-store');
+  h.set('Access-Control-Allow-Origin', '*');
+  return new Response(resp.body, { status: resp.status === 206 ? 206 : 200, headers: h });
+}
+
+function ytdlUpstreamHeaders(request, ua, extra) {
+  const upHeaders = { 'User-Agent': ua || UA_PC, Accept: '*/*' };
+  // 登录态客户端（WEB / MWEB / TVHTML5）签发的流，媒体请求也要带同一份 Cookie。
+  if (extra?.cookie) {
+    upHeaders.Cookie = extra.cookie;
+    upHeaders.Referer = 'https://www.youtube.com/';
+    upHeaders.Origin = 'https://www.youtube.com';
+  }
+  const range = request.headers.get('Range');
+  if (range && /^bytes=\d+-\d*$/.test(range)) upHeaders.Range = range;
+  return upHeaders;
+}
+
+// 先打 yt-hd 用过的那个客户端（通常一次就中）。没有直链再带 visitor 重试，然后换同组里的另外两个。
+// 匿名客户端绝不附带 Cookie；Cookie 客户端才附带。
+function ytdlResolveSteps(clientKey) {
+  const named = YT_CLIENT_BY_KEY[String(clientKey || '').trim()] || null;
+  const pool = named
+    ? (YT_COOKIE_KEYS.has(named.key) ? YT_COOKIE_CLIENTS : YT_CLIENTS)
+    : YT_CLIENTS.concat(YT_COOKIE_CLIENTS);
+  const clients = [];
+  if (named) clients.push(named);
+  for (const c of pool) {
+    if (!clients.some((x) => x.key === c.key)) clients.push(c);
+  }
+  const steps = [];
+  if (clients[0]) {
+    steps.push({ client: clients[0], withVisitor: false });
+    steps.push({ client: clients[0], withVisitor: true });
+  }
+  for (const c of clients.slice(1, 3)) steps.push({ client: c, withVisitor: false });
+  return steps;
+}
+
+async function ytdlResolveHit(vid, itag, step, auth) {
+  const c = step.client;
+  const useCookie = YT_COOKIE_KEYS.has(c.key) && !!auth.cookie;
+  const cAuth = useCookie ? auth : { poToken: auth.poToken };
+  const visitor = step.withVisitor
+    ? await ytVisitorData({ cookie: useCookie ? auth.cookie : '', force: true })
+    : '';
+  const player = await ytPlayer(vid, c, visitor, cAuth);
+  const fmt = findFormatByItag(player, itag);
+  if (!fmt || !isAllowedMediaUrl(fmt.url)) return null;
+  return { url: fmt.url, ua: c.ua, cookie: useCookie ? auth.cookie : '' };
+}
+
+async function proxyResolvedYtDl(request, env, vid, itag, clientKey, filename) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 120000);
+  try {
+    const auth = await ytAuthFromEnv(env || {});
+    let fetches = 0;
+    let lastStatus = 0;
+    for (const step of ytdlResolveSteps(clientKey)) {
+      if (fetches >= 3) break;
+      let hit = null;
+      try { hit = await ytdlResolveHit(vid, itag, step, auth); } catch { hit = null; }
+      if (!hit) continue;
+      fetches++;
+      const resp = await fetch(hit.url, {
+        headers: ytdlUpstreamHeaders(request, hit.ua, { cookie: hit.cookie }),
+        signal: ctrl.signal,
+      });
+      if (resp.ok && resp.body) return ytdlMediaResponse(resp, filename);
+      lastStatus = resp.status || 0;
+      try { if (resp.body) await resp.body.cancel(); } catch { /* 换下一条直链 */ }
+      if (lastStatus !== 401 && lastStatus !== 403 && lastStatus !== 410) return ytdlFail(lastStatus);
+    }
+    if (!lastStatus)
+      return json({ ok: false, error: '直链失效：没有拿到可下载的视频流，请重新解析后再试' }, 502);
+    return ytdlFail(lastStatus);
+  } catch (e) {
+    return json({ ok: false, error: '下载失败：' + (e.message || '网络错误') }, 502);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function handleYtDl(request, env) {
+  const u = new URL(request.url);
+  const filename = ytdlFilename(u.searchParams.get('filename'));
+  const vid = String(u.searchParams.get('v') || '').trim();
+  const itagRaw = String(u.searchParams.get('itag') || '').trim();
+  if (vid || itagRaw) {
+    if (!/^[A-Za-z0-9_-]{11}$/.test(vid) || !/^\d{1,4}$/.test(itagRaw) || +itagRaw <= 0)
+      return json({ ok: false, error: '无效的视频或画质参数' }, 400);
+    const clientKey = u.searchParams.get('client') || u.searchParams.get('ua') || '';
+    return proxyResolvedYtDl(request, env, vid, +itagRaw, clientKey, filename);
+  }
+
+  const mediaUrl = u.searchParams.get('url') || '';
+  try { new URL(mediaUrl); } catch {
     return json({ ok: false, error: '无效的下载地址' }, 400);
   }
-  // 仅允许 googlevideo / youtube 媒体域名
-  const allowed = /(^|\.)googlevideo\.com$|(^|\.)youtube\.com$|(^|\.)youtu\.be$|(^|\.)ytimg\.com$/i;
-  if (!/^https:$/.test(target.protocol) || !allowed.test(target.hostname))
+  if (!isAllowedMediaUrl(mediaUrl))
     return json({ ok: false, error: '不支持的下载地址' }, 400);
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 120000);
   try {
-    const upHeaders = { 'User-Agent': YT_UA[u.searchParams.get('ua') || ''] || UA_PC, Accept: '*/*' };
-    const range = request.headers.get('Range');   // 浏览器合并时分段下载
-    if (range && /^bytes=\d+-\d*$/.test(range)) upHeaders['Range'] = range;
     const resp = await fetch(mediaUrl, {
-      headers: upHeaders,
+      headers: ytdlUpstreamHeaders(request, YT_UA[u.searchParams.get('ua') || ''] || UA_PC),
       signal: ctrl.signal,
     });
-    if (!resp.ok || !resp.body)
-      return json({ ok: false, error: '下载失败（HTTP ' + resp.status + '）' }, 502);
-    const h = new Headers();
-    h.set('Content-Type', resp.headers.get('content-type') || 'application/octet-stream');
-    const len = resp.headers.get('content-length');
-    if (len) h.set('Content-Length', len);
-    const cr = resp.headers.get('content-range');
-    if (cr) h.set('Content-Range', cr);
-    h.set('Accept-Ranges', 'bytes');
-    h.set('Access-Control-Expose-Headers', 'Content-Range, Content-Length');
-    h.set('Content-Disposition', 'attachment; filename="' + filename + '"');
-    h.set('Cache-Control', 'no-store');
-    h.set('Access-Control-Allow-Origin', '*');
-    return new Response(resp.body, { status: resp.status === 206 ? 206 : 200, headers: h });
+    if (!resp.ok || !resp.body) return ytdlFail(resp.status);
+    return ytdlMediaResponse(resp, filename);
   } catch (e) {
     return json({ ok: false, error: '下载失败：' + (e.message || '网络错误') }, 502);
   } finally {
@@ -900,6 +1006,8 @@ const YT_COOKIE_CLIENTS = [
     extra: {} },
 ];
 const YT_UA = Object.fromEntries(YT_CLIENTS.concat(YT_COOKIE_CLIENTS).map((c) => [c.key, c.ua]));
+const YT_CLIENT_BY_KEY = Object.fromEntries(YT_CLIENTS.concat(YT_COOKIE_CLIENTS).map((c) => [c.key, c]));
+const YT_COOKIE_KEYS = new Set(YT_COOKIE_CLIENTS.map((c) => c.key));
 // 机器人墙重试时先打曾经能出 720P 的 IOS，再打另外两个匿名客户端。
 const YT_BOT_RETRY_CLIENTS = [YT_CLIENTS[1], YT_CLIENTS[2], YT_CLIENTS[0]];
 
@@ -1131,6 +1239,20 @@ function fmtHeight(f) {
 function isAvcMp4(f) {
   const mime = String(f?.mimeType || '');
   return /^video\/mp4/i.test(mime) && /avc1/i.test(mime);
+}
+
+// 只要带直链的那一条。signatureCipher 没有 url，不能在这次请求里播。
+export function findFormatByItag(player, itag) {
+  const want = +itag;
+  if (!want) return null;
+  const lists = [player?.streamingData?.formats, player?.streamingData?.adaptiveFormats];
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const f of list) {
+      if (f && +f.itag === want && f.url) return f;
+    }
+  }
+  return null;
 }
 
 // 自适应 avc1+音频优先；没有分离音轨时退回渐进式 MP4（itag 18/22 这类，文件里已经有声音）。
@@ -1451,7 +1573,7 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === '/api/parse') return handleParse(request, env);
-    if (url.pathname === '/api/ytdl') return handleYtDl(request);
+    if (url.pathname === '/api/ytdl') return handleYtDl(request, env);
     if (url.pathname === '/api/yt1080-start') return handleYt1080Start(request, env);
     if (url.pathname === '/api/yt1080-status') return handleYt1080Status(request, env);
     if (url.pathname === '/api/yt1080-file') return handleYt1080File(request, env);

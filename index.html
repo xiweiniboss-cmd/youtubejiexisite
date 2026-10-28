@@ -260,9 +260,39 @@ var deviceId = (function(){
   function resetParseBtn(){ setParseBtn('开始解析', false); }
 
   // 下载单个资源：经 /api/ytdl 代理中转（googlevideo 无 CORS 头，手机直接 fetch 会被拦），成功则经系统分享保存
+  function readProxyError(res){
+    return res.text().then(function(t){
+      var msg = 'HTTP ' + res.status;
+      try {
+        var j = JSON.parse(t);
+        if (j && j.error) msg = String(j.error);
+      } catch (e) {}
+      throw new Error(msg);
+    });
+  }
+  function formatDlError(e){
+    var m = String((e && e.message) || e || '网络错误').replace(/^Error:\s*/, '');
+    if (/直链失效/.test(m)) return m;
+    if (/HTTP\s*40[13]|HTTP\s*410/.test(m)) return '直链失效（' + m + '），请重新解析后再试';
+    return m;
+  }
+  function streamSpec(stream, vid, client){
+    if (!vid || !stream || !stream.itag) return null;
+    return { v: vid, itag: stream.itag, client: client || '' };
+  }
+  function ytdlProxyUrl(url, filename, ua, spec){
+    if (spec && spec.v && spec.itag) {
+      var q = '/api/ytdl?v=' + encodeURIComponent(spec.v) + '&itag=' + encodeURIComponent(spec.itag);
+      if (spec.client || ua) q += '&client=' + encodeURIComponent(spec.client || ua);
+      q += '&filename=' + encodeURIComponent(filename || 'youtube_video.mp4');
+      if (ua) q += '&ua=' + encodeURIComponent(ua);
+      return q;
+    }
+    return '/api/ytdl?url=' + encodeURIComponent(url) + '&filename=' + encodeURIComponent(filename) + (ua ? '&ua=' + encodeURIComponent(ua) : '');
+  }
   function fetchBlobProgress(url, onProgress){
     return fetch(url).then(function(res){
-      if(!res.ok) throw new Error('HTTP ' + res.status);
+      if(!res.ok) return readProxyError(res);
       var total = parseInt(res.headers.get('Content-Length') || '0', 10) || 0;
       var ctype = res.headers.get('Content-Type') || 'video/mp4';
       if(!res.body || !res.body.getReader) return res.blob();
@@ -353,10 +383,10 @@ var deviceId = (function(){
   }
   function hideDlProg(){ document.getElementById('dlProg').style.display = 'none'; }
 
-  function downloadResource(url, filename, ua){
+  function downloadResource(url, filename, ua, spec){
     setParseBtn('正在准备下载…', true); __hkHideBtn();
     resetDlProg();
-    var proxyUrl = '/api/ytdl?url=' + encodeURIComponent(url) + '&filename=' + encodeURIComponent(filename) + (ua ? '&ua=' + encodeURIComponent(ua) : '');
+    var proxyUrl = ytdlProxyUrl(url, filename, ua, spec);
     fetchBlobProgress(proxyUrl, setDlProg).then(function(blob){
       hideDlProg();
       resetParseBtn();
@@ -364,7 +394,7 @@ var deviceId = (function(){
     }).catch(function(e){
       resetParseBtn();
       hideDlProg();
-      showError('下载失败：' + (e.message || '网络错误') +
+      showError('下载失败：' + formatDlError(e) +
         '<br><br>💡 可点右侧「🔗 复制直链」粘贴到 Safari 直接打开播放。<br>💡 直链有时效，超时请重新解析。');
     });
   }
@@ -403,7 +433,7 @@ var deviceId = (function(){
     return c[0] || null;
   }
   var _merging = false;
-  function mergeDownload(v, a, title, btn, ua){
+  function mergeDownload(v, a, title, btn, ua, vid){
     if (_merging) return; _merging = true;
     var old = btn.textContent; btn.disabled = true; __hkHideBtn(); hideError();
     var bar = document.getElementById('dlProgBar'), txt = document.getElementById('dlProgTxt');
@@ -416,9 +446,10 @@ var deviceId = (function(){
     }
     stage('准备下载…', 0);
     var pre = window.YTMerge.preload(function(t){ if (!vt) stage(t, 2); }).catch(function(e){ return e; });
+    var vSpec = streamSpec(v, vid, ua), aSpec = streamSpec(a, vid, ua);
     Promise.all([
-      window.YTFetch.get(v.url, 'video/mp4', function(g, t){ vg = g; vt = t; prog(); }, ua),
-      window.YTFetch.get(a.url, 'audio/mp4', function(g, t){ ag = g; at = t; prog(); }, ua)
+      window.YTFetch.get(v.url, 'video/mp4', function(g, t){ vg = g; vt = t; prog(); }, ua, vSpec),
+      window.YTFetch.get(a.url, 'audio/mp4', function(g, t){ ag = g; at = t; prog(); }, ua, aSpec)
     ]).then(function(r){
       return pre.then(function(){
         return window.YTMerge.merge(r[0], r[1], function(t){ stage(t, 95); });
@@ -429,7 +460,7 @@ var deviceId = (function(){
       __hkSave(out, fileName(title + '_' + (v.height || resHeight(v) || 'HD') + 'P', 'mp4'));
     }).catch(function(e){
       hideDlProg();
-      showError('合并下载失败：' + (e && e.message || e) + '<br><br>💡 可以先分别下载下面的「无声视频」和「纯音频」，或重新解析再试。');
+      showError('合并下载失败：' + formatDlError(e) + '<br><br>💡 可以先分别下载下面的「无声视频」和「纯音频」，或重新解析再试。');
     }).then(function(){ _merging = false; btn.disabled = false; btn.textContent = old; });
   }
 
@@ -498,15 +529,16 @@ var deviceId = (function(){
           var sz = (h.video.size || audioSize) ? '，约 ' + fmtMB((h.video.size || 0) + audioSize) : '';
           var ht = document.createElement('div');
           ht.className = 'hint';
+          var hdVid = h.videoId || d.videoId || '';
           if (h.progressive || !h.audio) {
             hb.textContent = '⭐ 下载 ' + px + 'P（已含声音' + sz + '）';
-            hb.onclick = function(){ downloadResource(h.video.url, fileName((d.title || 'youtube') + '_' + px + 'P', 'mp4'), h.client); };
+            hb.onclick = function(){ downloadResource(h.video.url, fileName((d.title || 'youtube') + '_' + px + 'P', 'mp4'), h.client, streamSpec(h.video, hdVid, h.client)); };
             ht.textContent = px >= 1080
               ? '声音已经在这个文件里，直接下载即可'
               : ('已拿到 ' + px + 'P，这是当前最高可用画质，声音已经在这个文件里');
           } else {
             hb.textContent = '⭐ 一键下载 ' + px + 'P（含声音' + sz + '）';
-            hb.onclick = function(){ mergeDownload(h.video, h.audio, d.title || 'youtube', hb, h.client); };
+            hb.onclick = function(){ mergeDownload(h.video, h.audio, d.title || 'youtube', hb, h.client, hdVid); };
             ht.textContent = px >= 1080
               ? '高清画面和声音是分开的两条流，下载后在你手机里合成一个带声音的 MP4'
               : ('已拿到 ' + px + 'P，这是当前最高可用画质。画面和声音是两条流，下载后在手机里合成一个带声音的 MP4');
