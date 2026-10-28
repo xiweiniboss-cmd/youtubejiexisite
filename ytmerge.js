@@ -58,6 +58,7 @@ window.YTFetch = (function(){
       if (spec.client || ua) q += '&client=' + encodeURIComponent(spec.client || ua);
       q += '&filename=part.bin';
       if (ua) q += '&ua=' + encodeURIComponent(ua);
+      if (u) q += '&url=' + encodeURIComponent(u);
       return q;
     }
     return '/api/ytdl?url=' + encodeURIComponent(u) + '&filename=part.bin' + (ua ? '&ua=' + encodeURIComponent(ua) : '');

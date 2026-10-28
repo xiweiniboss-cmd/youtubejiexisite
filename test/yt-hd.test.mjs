@@ -474,12 +474,19 @@ test('index.html failure copy follows the real code and 720 is a real button', (
   assert.match(html, /streamSpec\(h\.video, hdVid, h\.client\)/);
   assert.match(html, /mergeDownload\(h\.video, h\.audio, d\.title \|\| 'youtube', hb, h\.client, hdVid\)/);
   assert.match(html, /downloadResource\(r\.url,/);
-  assert.match(html, /mergeDownload\(best, bestA,/);
+  assert.match(html, /mergeDownload\(best, bestA, d\.title \|\| 'youtube', mb, '', d\.videoId/);
+  assert.match(html, /r\.itag = it/);
+  assert.match(html, /function offerServerMerge/);
+  assert.match(html, /e\.serverMerge && \(code === 'BOT_CHECK' \|\| code === 'UNAVAILABLE'\)/);
+  assert.match(html, /function startServerMerge/);
+  assert.match(html, /服务器合并 ' \+ q \+ 'P/);
+  assert.match(html, /复制直链/);
   assert.match(html, /function formatDlError/);
   assert.match(html, /直链失效/);
   assert.match(mergeJs, /\/api\/ytdl\?v=/);
   assert.match(mergeJs, /spec\.itag/);
   assert.match(mergeJs, /\/api\/ytdl\?url=/);
+  assert.match(mergeJs, /&url=/);
 });
 
 test('findFormatByItag ignores cipher-only formats', () => {
@@ -661,6 +668,124 @@ test('ytdl 403 becomes a Chinese 直链失效 error and the legacy url proxy sti
     const badHost = await worker.fetch(new Request('https://example.com/api/ytdl?url=' + encodeURIComponent('https://evil.example/a')), {});
     assert.equal(badHost.status, 400);
     assert.match((await badHost.json()).error, /不支持的下载地址/);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test('ytdl falls back to the parse-time url when re-resolve misses or media is 403', async () => {
+  const orig = globalThis.fetch;
+  const fallback = 'https://rr.googlevideo.com/videoplayback?id=redfox';
+  const fresh = 'https://fresh.googlevideo.com/videoplayback?id=new';
+  let mode = 'miss';
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    const headers = init?.headers || {};
+    calls.push({ u, cookie: headers.Cookie || '', range: headers.Range || '' });
+    if (u.includes('sw.js_data')) return new Response('none', { status: 200 });
+    if (u.includes('/youtubei/v1/player')) {
+      if (mode === 'miss') return playerJson({ playabilityStatus: BOT_PS });
+      return playerJson({
+        playabilityStatus: { status: 'OK' },
+        streamingData: { formats: [{ itag: 18, url: fresh, mimeType: 'video/mp4; codecs="avc1"' }] },
+      });
+    }
+    if (u === fresh) return new Response('no', { status: 403 });
+    if (u === fallback) {
+      if (mode === 'both') return new Response('no', { status: 403 });
+      return new Response('ftyp', {
+        status: 206,
+        headers: { 'Content-Type': 'video/mp4', 'Content-Length': '4', 'Content-Range': 'bytes 0-15/100' },
+      });
+    }
+    throw new Error('unexpected ' + u);
+  };
+  const q = 'https://example.com/api/ytdl?v=mOzcOE03prg&itag=18&filename=a.mp4&url=' + encodeURIComponent(fallback);
+  try {
+    mode = 'miss';
+    const ok = await worker.fetch(new Request(q, { headers: { Range: 'bytes=0-15' } }), {
+      YT_COOKIES: 'LOGIN_INFO=super-secret-session; SAPISID=sap-secret',
+    });
+    assert.equal(ok.status, 206);
+    assert.equal(ok.headers.get('Content-Range'), 'bytes 0-15/100');
+    assert.equal(await ok.text(), 'ftyp');
+    assert.ok(calls.some((c) => c.u.includes('/youtubei/v1/player')));
+    const fb = calls.filter((c) => c.u === fallback);
+    assert.equal(fb.length, 1);
+    assert.equal(fb[0].range, 'bytes=0-15');
+    assert.equal(fb[0].cookie, '');
+    assert.equal(calls.some((c) => c.u === fresh), false);
+    assert.equal(JSON.stringify(calls).includes('super-secret-session'), false);
+
+    mode = '403';
+    calls.length = 0;
+    const viaFallback = await worker.fetch(new Request(q, { headers: { Range: 'bytes=0-15' } }), {});
+    assert.equal(viaFallback.status, 206);
+    assert.equal(await viaFallback.text(), 'ftyp');
+    assert.equal(calls.some((c) => c.u === fresh), true);
+    assert.equal(calls.filter((c) => c.u === fallback).length, 1);
+
+    mode = 'both';
+    const denied = await worker.fetch(new Request(q, { headers: { Range: 'bytes=0-15' } }), {});
+    assert.equal(denied.status, 502);
+    const body = await denied.json();
+    assert.match(body.error, /直链失效/);
+    assert.match(body.error, /403/);
+    assert.match(body.error, /复制直链/);
+    assert.match(body.error, /服务器合并/);
+    assert.match(body.error, /都失败了/);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test('bot-gated yt-hd offers server merge only when YT_MERGE_TOKEN is set', async () => {
+  const orig = globalThis.fetch;
+  const delays = ytHdTiming.botRetryDelaysMs;
+  ytHdTiming.botRetryDelaysMs = [0, 0];
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('sw.js_data')) return new Response('none', { status: 200 });
+    return playerJson({ playabilityStatus: BOT_PS });
+  };
+  try {
+    const hidden = await worker.fetch(new Request('https://example.com/api/yt-hd?url=mOzcOE03prg'), {});
+    const hiddenBody = await hidden.json();
+    assert.equal(hidden.status, 503);
+    assert.equal(hiddenBody.code, 'BOT_CHECK');
+    assert.equal(hiddenBody.serverMerge, undefined);
+    assert.match(hiddenBody.error, /机器人/);
+
+    const shown = await worker.fetch(
+      new Request('https://example.com/api/yt-hd?url=mOzcOE03prg'),
+      { YT_MERGE_TOKEN: 'merge-secret' },
+    );
+    const shownBody = await shown.json();
+    assert.equal(shown.status, 503);
+    assert.equal(shownBody.code, 'BOT_CHECK');
+    assert.equal(shownBody.serverMerge, true);
+    assert.equal(JSON.stringify(shownBody).includes('merge-secret'), false);
+  } finally {
+    ytHdTiming.botRetryDelaysMs = delays;
+    globalThis.fetch = orig;
+  }
+});
+
+test('non-JSON merge 500 becomes a Chinese origin-down error', async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () => new Response('Internal Server Error', { status: 500, headers: { 'Content-Type': 'text/plain' } });
+  try {
+    const res = await worker.fetch(
+      new Request('https://example.com/api/yt1080-start?url=https://youtu.be/mOzcOE03prg&quality=720&mode=merged', { method: 'POST' }),
+      { YT_MERGE_TOKEN: 'local-test-token' },
+    );
+    const body = await res.json();
+    assert.equal(res.status, 502);
+    assert.equal(body.code, 'MERGE_ORIGIN_DOWN');
+    assert.match(body.error, /合并服务器连不上或内部出错/);
+    assert.match(body.error, /HTTP 500/);
+    assert.match(body.error, /复制直链/);
+    assert.equal(JSON.stringify(body).includes('local-test-token'), false);
   } finally {
     globalThis.fetch = orig;
   }
