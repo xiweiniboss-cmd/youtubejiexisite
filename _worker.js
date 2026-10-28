@@ -308,8 +308,9 @@ async function handleParse(request, env) {
 // ---------- YouTube 直链下载代理 ----------
 // googlevideo 不发送 CORS 头，手机端 fetch 会被拦；由 Worker 中转后加 CORS 头返回。
 // /api/yt-hd 返回的 media URL 带 ip=<当时的 Worker 出口>。另一次 /api/ytdl 可能从别的边缘出口出去，
-// googlevideo 直接 403（进度条一闪就关）。带 v+itag（+client）时，在同一次请求里重新向 player 要直链再拉流，
-// 让签发和下载共用这次出口。RedFox 等只带 url= 的下载仍走原来的透传。
+// googlevideo 直接 403（进度条一闪就关）。带 v+itag（+client）时，在同一次请求里重新向 player 要直链再拉流。
+// 同时带上解析时的 url= 时：重新签发失败或媒体 401/403/410，就在这一次请求里改拉那条直链。
+// 只带 url= 的老下载仍走原来的透传。
 function ytdlFilename(raw) {
   return String(raw || 'youtube_video.mp4').replace(/["\r\n]/g, '').slice(0, 80) || 'youtube_video.mp4';
 }
@@ -321,10 +322,27 @@ function isAllowedMediaUrl(mediaUrl) {
   return /^https:$/.test(target.protocol) && allowed.test(target.hostname);
 }
 
-function ytdlFail(status) {
+function ytdlFail(status, opts = {}) {
   const code = status || 0;
-  if (code === 401 || code === 403 || code === 410)
-    return json({ ok: false, error: '直链失效（HTTP ' + code + '），请重新解析后再试' }, 502);
+  const http = code ? '（HTTP ' + code + '）' : '';
+  if (opts.both) {
+    return json({
+      ok: false,
+      error: '直链失效' + http + '。重新签发和解析时的直链都失败了。请点「复制直链」用 Safari 打开；若是机器人校验，请改用「服务器合并」。',
+    }, 502);
+  }
+  if (!code) {
+    return json({
+      ok: false,
+      error: '直链失效：没有拿到可下载的视频流。YouTube 可能把服务器当成了机器人。请点「复制直链」用 Safari 打开，或改用「服务器合并」。',
+    }, 502);
+  }
+  if (code === 401 || code === 403 || code === 410) {
+    return json({
+      ok: false,
+      error: '直链失效（HTTP ' + code + '）。请点「复制直链」用 Safari 打开，或改用「服务器合并」。',
+    }, 502);
+  }
   return json({ ok: false, error: '下载失败（HTTP ' + code + '）' }, 502);
 }
 
@@ -390,30 +408,58 @@ async function ytdlResolveHit(vid, itag, step, auth) {
   return { url: fmt.url, ua: c.ua, cookie: useCookie ? auth.cookie : '' };
 }
 
-async function proxyResolvedYtDl(request, env, vid, itag, clientKey, filename) {
+async function ytdlReadMedia(request, mediaUrl, ua, cookie, signal) {
+  const resp = await fetch(mediaUrl, {
+    headers: ytdlUpstreamHeaders(request, ua, cookie ? { cookie } : undefined),
+    signal,
+  });
+  return resp;
+}
+
+// fallbackUrl：解析当时的 googlevideo 直链。重新签发拿不到或媒体 401/403/410 时，同一次请求里再试这条。
+// 有回退地址时只打一次 player，避免机器人墙把 YTFetch 的每个分段都拖住。
+async function proxyResolvedYtDl(request, env, vid, itag, clientKey, filename, fallbackUrl) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 120000);
+  const fallbackOk = isAllowedMediaUrl(fallbackUrl);
   try {
     const auth = await ytAuthFromEnv(env || {});
+    const steps = ytdlResolveSteps(clientKey);
+    const plan = fallbackOk ? steps.slice(0, 1) : steps;
     let fetches = 0;
     let lastStatus = 0;
-    for (const step of ytdlResolveSteps(clientKey)) {
+    for (const step of plan) {
       if (fetches >= 3) break;
       let hit = null;
       try { hit = await ytdlResolveHit(vid, itag, step, auth); } catch { hit = null; }
       if (!hit) continue;
       fetches++;
-      const resp = await fetch(hit.url, {
-        headers: ytdlUpstreamHeaders(request, hit.ua, { cookie: hit.cookie }),
-        signal: ctrl.signal,
-      });
+      let resp = null;
+      try {
+        resp = await ytdlReadMedia(request, hit.url, hit.ua, hit.cookie, ctrl.signal);
+      } catch (e) {
+        if (!fallbackOk) throw e;
+        break;
+      }
       if (resp.ok && resp.body) return ytdlMediaResponse(resp, filename);
       lastStatus = resp.status || 0;
       try { if (resp.body) await resp.body.cancel(); } catch { /* 换下一条直链 */ }
-      if (lastStatus !== 401 && lastStatus !== 403 && lastStatus !== 410) return ytdlFail(lastStatus);
+      if (!fallbackOk && lastStatus !== 401 && lastStatus !== 403 && lastStatus !== 410) return ytdlFail(lastStatus);
+      if (fallbackOk) break;
     }
-    if (!lastStatus)
-      return json({ ok: false, error: '直链失效：没有拿到可下载的视频流，请重新解析后再试' }, 502);
+    if (fallbackOk) {
+      let resp = null;
+      try {
+        resp = await ytdlReadMedia(request, fallbackUrl, YT_UA[clientKey] || UA_PC, '', ctrl.signal);
+      } catch (e) {
+        if (!lastStatus) return json({ ok: false, error: '下载失败：' + (e.message || '网络错误') }, 502);
+        return ytdlFail(lastStatus, { both: true });
+      }
+      if (resp.ok && resp.body) return ytdlMediaResponse(resp, filename);
+      lastStatus = resp.status || lastStatus;
+      try { if (resp.body) await resp.body.cancel(); } catch { /* 两条都失败 */ }
+      return ytdlFail(lastStatus, { both: true });
+    }
     return ytdlFail(lastStatus);
   } catch (e) {
     return json({ ok: false, error: '下载失败：' + (e.message || '网络错误') }, 502);
@@ -431,7 +477,16 @@ async function handleYtDl(request, env) {
     if (!/^[A-Za-z0-9_-]{11}$/.test(vid) || !/^\d{1,4}$/.test(itagRaw) || +itagRaw <= 0)
       return json({ ok: false, error: '无效的视频或画质参数' }, 400);
     const clientKey = u.searchParams.get('client') || u.searchParams.get('ua') || '';
-    return proxyResolvedYtDl(request, env, vid, +itagRaw, clientKey, filename);
+    const fallbackUrl = u.searchParams.get('url') || '';
+    return proxyResolvedYtDl(
+      request,
+      env,
+      vid,
+      +itagRaw,
+      clientKey,
+      filename,
+      isAllowedMediaUrl(fallbackUrl) ? fallbackUrl : '',
+    );
   }
 
   const mediaUrl = u.searchParams.get('url') || '';
@@ -1407,6 +1462,8 @@ async function handleYtHd(request, env) {
   if (best) return hdSuccessJson(vid, best.client, best.j, best.pair);
   const body = ytHdFailureBody(state);
   body.tried = tried;
+  // 机器人墙 / 不可播时，前端可以改走已配置的服务器合并，而不是死在手机里的 403。
+  if ((env.YT_MERGE_TOKEN || '').trim()) body.serverMerge = true;
   return json(body, body.code === 'LOGIN_REQUIRED' ? 403 : 503);
 }
 
@@ -1454,6 +1511,13 @@ async function mergePassthrough(resp) {
   try {
     JSON.parse(text);
   } catch {
+    if (resp.status >= 500) {
+      return json({
+        ok: false,
+        code: 'MERGE_ORIGIN_DOWN',
+        error: '合并服务器连不上或内部出错（HTTP ' + resp.status + '）。请确认 EC2 上的合并服务进程正在运行（Pages 环境变量 YT_MERGE_BASE）。可以先点「复制直链」用 Safari 打开。',
+      }, 502);
+    }
     return json({ ok: false, error: '合并服务返回异常（HTTP ' + resp.status + '）：' + text.slice(0, 200) }, resp.status >= 400 ? resp.status : 502);
   }
   return new Response(text, {
