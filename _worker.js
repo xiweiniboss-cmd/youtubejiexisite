@@ -5,6 +5,13 @@
 // 反馈系统：KV 绑定 FEEDBACK_KV、R2 绑定 FEEDBACK_BUCKET、环境变量 FEEDBACK_ADMIN_KEY
 //   （与小红书站/TikTok站/抖音站共用同一套 KV/R2/管理密码）
 // 人机验证：TURNSTILE_SITE_KEY（公开）+ TURNSTILE_SECRET_KEY（保密），各站共用同一套
+// 高清直连 /api/yt-hd（都不写进仓库，只在 Pages → Settings → Environment variables 配加密变量）：
+//   YT_COOKIES   已登录 youtube.com 的 Cookie（请求头 "a=b; c=d"，或 Netscape cookies.txt，或 [{name,value}] JSON）。别名 YT_COOKIE
+//   YT_PO_TOKEN  可选。InnerTube player 的 PO Token，放进 serviceIntegrityDimensions.poToken。别名 YT_POT
+// 服务器合并 /api/yt1080-*（前端不持有口令，由 Worker 转发）：
+//   YT_MERGE_TOKEN  与 EC2 合并服务口令一致；不配则接口直接说明未配置
+//   YT_MERGE_BASE   EC2 根地址，默认 http://3-129-45-49.sslip.io:30002
+// 年龄限制看 playabilityStatus.reason，不要只看 status：LOGIN_REQUIRED 也会是「Sign in to confirm you're not a bot」。
 
 const REDFOX_BASE = 'https://redfox.hk';
 const UA_MOBILE =
@@ -876,16 +883,159 @@ const YT_CLIENTS = [
 ];
 const YT_UA = Object.fromEntries(YT_CLIENTS.map((c) => [c.key, c.ua]));
 
+// 带 Cookie 时额外试这些客户端。ANDROID / IOS 不吃网页登录态，TV / MWEB 才会用 YT_COOKIES。
+const YT_COOKIE_CLIENTS = [
+  { key: 'tv', name: 'TVHTML5', id: 7, version: '7.20260707.07.00',
+    ua: 'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)',
+    extra: {} },
+  { key: 'mweb', name: 'MWEB', id: 2, version: '2.20260708.05.00',
+    ua: 'Mozilla/5.0 (iPad; CPU OS 16_7_10 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1,gzip(gfe)',
+    extra: {} },
+];
+
+let ytVisitorCache = '';
 async function ytVisitorData() {
+  if (ytVisitorCache) return ytVisitorCache;
   try {
     const r = await fetch('https://www.youtube.com/sw.js_data', { headers: { 'User-Agent': UA_PC } });
     const t = await r.text();
     const m = t.match(/"(Cg[A-Za-z0-9_%-]{20,})"/);
-    return m ? decodeURIComponent(m[1]) : '';
-  } catch { return ''; }
+    ytVisitorCache = m ? decodeURIComponent(m[1]) : '';
+  } catch { ytVisitorCache = ''; }
+  return ytVisitorCache;
 }
 
-async function ytPlayer(vid, c, visitorData) {
+// YouTube 用同一个 status=LOGIN_REQUIRED 表示两件事，必须看 reason：
+//   「Sign in to confirm you're not a bot」→ 机器人校验（BOT_CHECK）
+//   「Sign in to confirm your age」/「inappropriate for some users」/ desktopLegacyAgeGateReason → 登录或年龄墙
+export function classifyPlayability(ps) {
+  const status = String(ps?.status || '');
+  const reason = String(ps?.reason || '');
+  const messages = Array.isArray(ps?.messages) ? ps.messages.map((x) => String(x)).join(' ') : '';
+  const sub = ps?.errorScreen?.playerErrorMessageRenderer?.subreason;
+  const subText = typeof sub?.simpleText === 'string'
+    ? sub.simpleText
+    : (Array.isArray(sub?.runs) ? sub.runs.map((r) => r?.text || '').join('') : '');
+  const text = reason + '\n' + messages + '\n' + subText;
+  const bot = /not a bot|confirm you.?re not a bot|unusual traffic|机器人/i.test(text);
+  const age = (ps?.desktopLegacyAgeGateReason != null && ps.desktopLegacyAgeGateReason !== 0)
+    || /inappropriate for some users|confirm your age|age[- ]restricted|年龄限制|确认你的年龄|确认您的年龄/i.test(text)
+    || status === 'AGE_CHECK_REQUIRED'
+    || status === 'AGE_VERIFICATION_REQUIRED';
+  if (status === 'OK') return { kind: 'ok', status, reason };
+  if (bot && !age) return { kind: 'bot', status, reason };
+  if (age || status === 'LOGIN_REQUIRED') return { kind: 'login', status, reason };
+  return { kind: 'other', status, reason };
+}
+
+// 接受三种写法，方便从浏览器或扩展粘贴。不记录、不回传原文。
+export function normalizeCookieHeader(raw) {
+  const text = String(raw || '').replace(/^\uFEFF/, '').trim();
+  if (!text) return '';
+  if (text.startsWith('[') || text.startsWith('{')) {
+    try {
+      const data = JSON.parse(text);
+      const list = Array.isArray(data) ? data : (data.cookies || data.cookie || []);
+      if (Array.isArray(list) && list.length) {
+        const pairs = [];
+        for (const c of list) {
+          const name = c && (c.name || c.key);
+          if (!name || c.value == null) continue;
+          pairs.push(String(name).trim() + '=' + String(c.value));
+        }
+        if (pairs.length) return pairs.join('; ');
+      }
+    } catch { /* 不是 JSON 就按文本 Cookie 解析 */ }
+  }
+  if (text.includes('\t') || text.startsWith('#')) {
+    const pairs = [];
+    for (const line of text.split(/\r?\n/)) {
+      let s = line.trim();
+      if (!s) continue;
+      if (s.startsWith('#HttpOnly_')) s = s.slice('#HttpOnly_'.length);
+      else if (s.startsWith('#')) continue;
+      const cols = s.split('\t');
+      if (cols.length < 7) continue;
+      const name = cols[5].trim();
+      const value = cols.slice(6).join('\t');
+      if (!name) continue;
+      pairs.push(name + '=' + value);
+    }
+    if (pairs.length) return pairs.join('; ');
+  }
+  return text.replace(/[\r\n]+/g, ' ').replace(/\s*;\s*/g, '; ').replace(/;\s*$/, '').trim();
+}
+
+function cookieMap(header) {
+  const map = Object.create(null);
+  for (const part of String(header || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i <= 0) continue;
+    const k = part.slice(0, i).trim();
+    const v = part.slice(i + 1).trim();
+    if (k && map[k] == null) map[k] = v;
+  }
+  return map;
+}
+
+async function sha1Hex(text) {
+  const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Authorization: SAPISIDHASH <ts>_<sha1(ts + " " + SAPISID + " " + origin)>
+// 同时带上 1P / 3P（有对应 Cookie 才生成）。SAPISID 缺失时用 __Secure-3PAPISID 顶上。
+export async function ytSapiSidAuthorization(cookieHeader, origin = 'https://www.youtube.com', nowSec) {
+  const map = cookieMap(cookieHeader);
+  const sapisid = map.SAPISID || map['__Secure-3PAPISID'] || '';
+  const one = map['__Secure-1PAPISID'] || '';
+  const three = map['__Secure-3PAPISID'] || '';
+  const ts = String(nowSec != null ? nowSec : Math.floor(Date.now() / 1000));
+  const parts = [];
+  for (const [scheme, sid] of [['SAPISIDHASH', sapisid], ['SAPISID1PHASH', one], ['SAPISID3PHASH', three]]) {
+    if (!sid) continue;
+    parts.push(scheme + ' ' + ts + '_' + await sha1Hex(ts + ' ' + sid + ' ' + origin));
+  }
+  return parts.join(' ');
+}
+
+async function ytAuthFromEnv(env) {
+  const cookie = normalizeCookieHeader(env?.YT_COOKIES || env?.YT_COOKIE || '');
+  const poToken = String(env?.YT_PO_TOKEN || env?.YT_POT || '').trim();
+  let authorization = '';
+  if (cookie) {
+    try { authorization = await ytSapiSidAuthorization(cookie); } catch { authorization = ''; }
+  }
+  return { cookie, poToken, authorization };
+}
+
+export function loginRequiredMessage(hasCookies) {
+  if (hasCookies) {
+    return '这部视频需要已登录的 YouTube 会话（年龄限制或登录墙）。已读取环境变量 YT_COOKIES，但 YouTube 仍返回 LOGIN_REQUIRED：请换一份有效 Cookie（需包含 LOGIN_INFO，以及 SAPISID 或 __Secure-3PAPISID），并确认该账号已通过年龄验证，保存后重新部署。';
+  }
+  return '这部视频需要已登录的 YouTube 会话（年龄限制或登录墙），当前服务器没有可用的登录 Cookie。请在 Cloudflare Pages 环境变量设置 YT_COOKIES（浏览器里已登录 youtube.com 的 Cookie，可选再设 YT_PO_TOKEN），保存后重新部署。';
+}
+
+const YT_BOT_ERROR = 'YouTube 暂时把服务器当成了机器人，没拿到高清流，过一会再试';
+
+export function ytHdFailureBody(state) {
+  if (state?.sawLogin) {
+    const body = {
+      ok: false,
+      code: 'LOGIN_REQUIRED',
+      error: loginRequiredMessage(!!state.cookiesConfigured),
+    };
+    if (state.loginReason) body.reason = String(state.loginReason).slice(0, 180);
+    return body;
+  }
+  return {
+    ok: false,
+    code: state?.sawBot ? 'BOT_CHECK' : 'UNAVAILABLE',
+    error: YT_BOT_ERROR,
+  };
+}
+
+async function ytPlayer(vid, c, visitorData, auth) {
   const headers = {
     'Content-Type': 'application/json',
     'User-Agent': c.ua,
@@ -894,34 +1044,48 @@ async function ytPlayer(vid, c, visitorData) {
     Origin: 'https://www.youtube.com',
   };
   if (visitorData) headers['X-Goog-Visitor-Id'] = visitorData;
+  if (auth?.cookie) headers.Cookie = auth.cookie;
+  if (auth?.authorization) {
+    headers.Authorization = auth.authorization;
+    headers['X-Origin'] = 'https://www.youtube.com';
+    headers['X-Goog-AuthUser'] = '0';
+  }
+  const context = {
+    client: { clientName: c.name, clientVersion: c.version, hl: 'en', gl: 'US', ...(visitorData ? { visitorData } : {}), ...c.extra },
+  };
+  if (auth?.cookie) context.user = { enableSafetyMode: false, lockedSafetyMode: false };
   const body = {
-    context: { client: { clientName: c.name, clientVersion: c.version, hl: 'en', gl: 'US', ...(visitorData ? { visitorData } : {}), ...c.extra } },
+    context,
     videoId: vid, contentCheckOk: true, racyCheckOk: true,
   };
+  if (auth?.poToken) body.serviceIntegrityDimensions = { poToken: auth.poToken };
   const r = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', { method: 'POST', headers, body: JSON.stringify(body) });
   return r.json();
 }
 
-async function handleYtHd(request) {
-  const u = new URL(request.url);
-  const src = u.searchParams.get('url') || '';
-  const m = src.match(/(?:[?&]v=|youtu\.be\/|shorts\/|embed\/|live\/)([A-Za-z0-9_-]{11})/) || src.match(/^([A-Za-z0-9_-]{11})$/);
-  if (!m) return json({ ok: false, error: '没找到视频 ID' }, 400);
-  const vid = m[1];
-  const tried = [];
+function hdStream(j) {
+  const fmts = (j?.streamingData?.adaptiveFormats || []).filter((f) => f.url);
+  const vids = fmts.filter((f) => /^video\/mp4/.test(f.mimeType) && /avc1/.test(f.mimeType) && (f.height || 0) <= 1080)
+    .sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0));
+  const auds = fmts.filter((f) => /^audio\/mp4/.test(f.mimeType)).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+  return { fmts, vids, auds };
+}
+
+// 先按原来的匿名客户端取流（公开视频行为不变）。配了 YT_COOKIES 仍失败时，再带 Cookie / SAPISIDHASH 重试，并加上 TV、MWEB。
+async function ytHdTry(vid, clients, auth, tried, state) {
   for (const round of [0, 1]) {
     const vd = round ? await ytVisitorData() : '';
-    for (const c of YT_CLIENTS) {
+    for (const c of clients) {
       let j;
-      try { j = await ytPlayer(vid, c, vd); } catch (e) { tried.push(c.key + ':err'); continue; }
-      const st = j?.playabilityStatus?.status || '';
-      const fmts = (j?.streamingData?.adaptiveFormats || []).filter((f) => f.url);
-      tried.push(c.key + (round ? '+vd' : '') + ':' + (st || 'none') + ':' + fmts.length);
-      if (st !== 'OK' || !fmts.length) continue;
-      const vids = fmts.filter((f) => /^video\/mp4/.test(f.mimeType) && /avc1/.test(f.mimeType) && (f.height || 0) <= 1080)
-        .sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0));
-      const auds = fmts.filter((f) => /^audio\/mp4/.test(f.mimeType)).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-      if (!vids.length || !auds.length) continue;
+      try { j = await ytPlayer(vid, c, vd, auth); } catch (e) { tried.push(c.key + ':err'); continue; }
+      const kind = classifyPlayability(j?.playabilityStatus);
+      const { fmts, vids, auds } = hdStream(j);
+      tried.push(c.key + (round ? '+vd' : '') + (auth?.cookie ? '+ck' : '') + ':' + (kind.status || 'none') + ':' + fmts.length + ':' + kind.kind);
+      if (kind.kind === 'login') {
+        state.sawLogin = true;
+        if (!state.loginReason && kind.reason) state.loginReason = kind.reason;
+      } else if (kind.kind === 'bot') state.sawBot = true;
+      if (kind.status !== 'OK' || !vids.length || !auds.length) continue;
       const v = vids[0], a = auds[0];
       return json({
         ok: true, videoId: vid, client: c.key,
@@ -931,7 +1095,28 @@ async function handleYtHd(request) {
       });
     }
   }
-  return json({ ok: false, error: 'YouTube 暂时把服务器当成了机器人，没拿到高清流，过一会再试', tried }, 503);
+  return null;
+}
+
+async function handleYtHd(request, env) {
+  const u = new URL(request.url);
+  const src = u.searchParams.get('url') || '';
+  const m = src.match(/(?:[?&]v=|youtu\.be\/|shorts\/|embed\/|live\/)([A-Za-z0-9_-]{11})/) || src.match(/^([A-Za-z0-9_-]{11})$/);
+  if (!m) return json({ ok: false, error: '没找到视频 ID' }, 400);
+  const vid = m[1];
+  const auth = await ytAuthFromEnv(env);
+  const tried = [];
+  const state = { sawLogin: false, sawBot: false, loginReason: '', cookiesConfigured: !!auth.cookie };
+  ytVisitorCache = '';
+  const anon = await ytHdTry(vid, YT_CLIENTS, { poToken: auth.poToken }, tried, state);
+  if (anon) return anon;
+  if (auth.cookie) {
+    const loggedIn = await ytHdTry(vid, YT_CLIENTS.concat(YT_COOKIE_CLIENTS), auth, tried, state);
+    if (loggedIn) return loggedIn;
+  }
+  const body = ytHdFailureBody(state);
+  body.tried = tried;
+  return json(body, body.code === 'LOGIN_REQUIRED' ? 403 : 503);
 }
 
 /* ================= 1080P 服务器合并（EC2 yt-dlp + ffmpeg） ================= */
@@ -948,8 +1133,31 @@ function mergeBase(env) {
 function mergeToken(env) {
   return (env.YT_MERGE_TOKEN || '').trim();
 }
+// Cloudflare 530 + error code 1016 = 源站域名解析失败（sslip.io 那台 EC2 不在线或 YT_MERGE_BASE 写错）。
+// 521/522/523 同样是源站连不上。不要把英文错误页原样丢给前端。
+export function mergeOriginDown(status, text) {
+  const body = String(text || '');
+  if (status === 530 || status === 521 || status === 522 || status === 523) return true;
+  return /error\s*code:\s*1016|Error 1016|Origin DNS error/i.test(body);
+}
+export function mergeOriginDownMessage(status, text) {
+  const hit1016 = /1016/.test(String(text || '')) || status === 530;
+  const code = hit1016 ? '530/1016' : String(status || '');
+  return '合并服务器连不上（Cloudflare ' + code + '，源站不可达）。请检查 Pages 环境变量 YT_MERGE_BASE（EC2 合并服务地址）和 YT_MERGE_TOKEN（须与 EC2 口令一致），并确认 EC2 上的合并服务进程正在运行。默认 sslip.io 源站不可达时，把 YT_MERGE_BASE 改成你自己的服务地址后重新部署。';
+}
+function mergeConnectError(e) {
+  const detail = (e && e.message) ? String(e.message).replace(/[\r\n]/g, ' ').slice(0, 160) : '网络错误';
+  return json({
+    ok: false,
+    code: 'MERGE_ORIGIN_DOWN',
+    error: '合并服务暂时连不上（' + detail + '）。请检查 Pages 环境变量 YT_MERGE_BASE、YT_MERGE_TOKEN，以及 EC2 上的合并服务是否在运行。',
+  }, 502);
+}
 async function mergePassthrough(resp) {
   const text = await resp.text();
+  if (mergeOriginDown(resp.status, text)) {
+    return json({ ok: false, code: 'MERGE_ORIGIN_DOWN', error: mergeOriginDownMessage(resp.status, text) }, 502);
+  }
   // EC2 正常时返回 JSON；若上游返回非 JSON（如 Cloudflare 1003），
   // 不能原样透传（前端 r.json() 会抛晦涩的英文错），要转成中文 JSON 错误。
   try {
@@ -985,7 +1193,7 @@ async function handleYt1080Start(request, env) {
     });
     return mergePassthrough(resp);
   } catch (e) {
-    return json({ ok: false, error: '合并服务暂时连不上，请稍后再试' }, 502);
+    return mergeConnectError(e);
   }
 }
 async function handleYt1080Status(request, env) {
@@ -999,7 +1207,7 @@ async function handleYt1080Status(request, env) {
     });
     return mergePassthrough(resp);
   } catch (e) {
-    return json({ ok: false, error: '合并服务暂时连不上，请稍后再试' }, 502);
+    return mergeConnectError(e);
   }
 }
 async function handleYt1080File(request, env) {
@@ -1017,7 +1225,7 @@ async function handleYt1080File(request, env) {
     headers.set('Access-Control-Allow-Origin', '*');
     return new Response(resp.body, { status: 200, headers });
   } catch (e) {
-    return json({ ok: false, error: '合并服务暂时连不上，请稍后再试' }, 502);
+    return mergeConnectError(e);
   }
 }
 
@@ -1079,7 +1287,7 @@ export default {
     if (url.pathname === '/api/yt1080-status') return handleYt1080Status(request, env);
     if (url.pathname === '/api/yt1080-file') return handleYt1080File(request, env);
     if (url.pathname === '/api/yt-direct') return handleYtDirect(request, env);
-    if (url.pathname === '/api/yt-hd') return handleYtHd(request);
+    if (url.pathname === '/api/yt-hd') return handleYtHd(request, env);
 
     if (url.pathname === '/api/diag')
       return json({
@@ -1087,6 +1295,8 @@ export default {
         hasApiKey: !!(env.REDFOX_API_KEY || '').trim(),
         hasAssets: typeof env.ASSETS?.fetch === 'function',
         hasMergeToken: !!(env.YT_MERGE_TOKEN || '').trim(),
+        hasYtCookies: !!(env.YT_COOKIES || env.YT_COOKIE || '').trim(),
+        hasYtPoToken: !!(env.YT_PO_TOKEN || env.YT_POT || '').trim(),
       });
 
     // Turnstile 公开 site key 下发
