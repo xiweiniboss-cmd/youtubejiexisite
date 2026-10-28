@@ -48,14 +48,31 @@ window.YTMerge = (function(){
   return { merge: merge, preload: getFF };
 })();
 
-// 分段下载（经 /api/ytdl 代理 + Range）：googlevideo 对无声 1080P 整段下载会限速，分段并发快很多
+// 分段下载（经 /api/ytdl 代理 + Range）：googlevideo 对无声 1080P 整段下载会限速，分段并发快很多。
+// spec = {v, itag, client} 时每次 Range 都让 Worker 在同一次请求里重新签发直链，避免 ip= 和出口对不上。
 window.YTFetch = (function(){
   var CH = 8 * 1024 * 1024, PAR = 3;
-  var UA = '';
-  function proxy(u){ return '/api/ytdl?url=' + encodeURIComponent(u) + '&filename=part.bin' + (UA ? '&ua=' + UA : ''); }
-  async function getRange(u, s, e){
-    var res = await fetch(proxy(u), { headers: { Range: 'bytes=' + s + '-' + e } });
-    if (!(res.status === 206 || res.status === 200)) throw new Error('HTTP ' + res.status);
+  function proxyFor(u, ua, spec){
+    if (spec && spec.v && spec.itag) {
+      var q = '/api/ytdl?v=' + encodeURIComponent(spec.v) + '&itag=' + encodeURIComponent(spec.itag);
+      if (spec.client || ua) q += '&client=' + encodeURIComponent(spec.client || ua);
+      q += '&filename=part.bin';
+      if (ua) q += '&ua=' + encodeURIComponent(ua);
+      return q;
+    }
+    return '/api/ytdl?url=' + encodeURIComponent(u) + '&filename=part.bin' + (ua ? '&ua=' + encodeURIComponent(ua) : '');
+  }
+  async function getRange(proxyUrl, s, e){
+    var res = await fetch(proxyUrl, { headers: { Range: 'bytes=' + s + '-' + e } });
+    if (!(res.status === 206 || res.status === 200)) {
+      var msg = 'HTTP ' + res.status;
+      try {
+        var t = await res.text();
+        var j = JSON.parse(t);
+        if (j && j.error) msg = String(j.error);
+      } catch (err) {}
+      throw new Error(msg);
+    }
     return res;
   }
   async function readAll(res, onChunk){
@@ -64,10 +81,11 @@ window.YTFetch = (function(){
     return parts;
   }
   // 返回 Blob；onProg(本文件已收字节, 本文件总字节)
-  async function get(u, type, onProg, ua){
-    UA = ua || '';
+  // spec 跟这一路流绑定，视频和音频并行时不能共用一个全局参数。
+  async function get(u, type, onProg, ua, spec){
+    var proxyUrl = proxyFor(u, ua || '', spec || null);
     var got = 0, total = 0;
-    var first = await getRange(u, 0, CH - 1);
+    var first = await getRange(proxyUrl, 0, CH - 1);
     var cr = first.headers.get('Content-Range') || '';
     var m = cr.match(/\/(\d+)\s*$/);
     if (first.status === 200 || !m) {           // 不支持 Range：整段读
@@ -85,7 +103,7 @@ window.YTFetch = (function(){
         var j = jobs.shift(), tries = 0;
         for(;;){
           var mine = 0;
-          try { var res = await getRange(u, j.s, j.e); slots[j.k] = await readAll(res, function(n){ mine += n; got += n; onProg(got, total); }); break; }
+          try { var res = await getRange(proxyUrl, j.s, j.e); slots[j.k] = await readAll(res, function(n){ mine += n; got += n; onProg(got, total); }); break; }
           catch (err) { got -= mine; if (++tries >= 3) throw err; await new Promise(function(r){ setTimeout(r, 800 * tries); }); }
         }
       }

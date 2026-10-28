@@ -11,6 +11,7 @@ import worker, {
   ytHdFailureBody,
   loginRequiredMessage,
   pickHdPair,
+  findFormatByItag,
   ytHdTiming,
 } from '../_worker.js';
 
@@ -459,6 +460,7 @@ test('diag hasYtPoToken follows the env var and does not echo it', async () => {
 
 test('index.html failure copy follows the real code and 720 is a real button', () => {
   const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const mergeJs = readFileSync(new URL('../ytmerge.js', import.meta.url), 'utf8');
   assert.equal(html.includes('暂时没拿到 1080P'), false);
   assert.equal(html.includes('没拿到 1080P'), false);
   assert.match(html, /正在获取可用画质/);
@@ -468,4 +470,198 @@ test('index.html failure copy follows the real code and 720 is a real button', (
   assert.match(html, /下载 ' \+ px \+ 'P（已含声音/);
   assert.match(html, /这是当前最高可用画质/);
   assert.match(html, /h\.progressive \|\| !h\.audio/);
+  assert.match(html, /var hdVid = h\.videoId \|\| d\.videoId/);
+  assert.match(html, /streamSpec\(h\.video, hdVid, h\.client\)/);
+  assert.match(html, /mergeDownload\(h\.video, h\.audio, d\.title \|\| 'youtube', hb, h\.client, hdVid\)/);
+  assert.match(html, /downloadResource\(r\.url,/);
+  assert.match(html, /mergeDownload\(best, bestA,/);
+  assert.match(html, /function formatDlError/);
+  assert.match(html, /直链失效/);
+  assert.match(mergeJs, /\/api\/ytdl\?v=/);
+  assert.match(mergeJs, /spec\.itag/);
+  assert.match(mergeJs, /\/api\/ytdl\?url=/);
+});
+
+test('findFormatByItag ignores cipher-only formats', () => {
+  const fmt = findFormatByItag({
+    streamingData: {
+      formats: [{ itag: 22, signatureCipher: 's=1' }],
+      adaptiveFormats: [
+        { itag: 136, url: 'https://rr.googlevideo.com/v' },
+        { itag: 140, url: 'https://rr.googlevideo.com/a' },
+      ],
+    },
+  }, 136);
+  assert.equal(fmt.url, 'https://rr.googlevideo.com/v');
+  assert.equal(findFormatByItag({ streamingData: { formats: [{ itag: 22, signatureCipher: 'x' }] } }, 22), null);
+  assert.equal(findFormatByItag({ streamingData: { adaptiveFormats: [{ itag: 140, url: 'https://rr.googlevideo.com/a' }] } }, '140').url, 'https://rr.googlevideo.com/a');
+});
+
+function ytdlPlayer(itag, mediaUrl) {
+  return {
+    playabilityStatus: { status: 'OK' },
+    streamingData: {
+      adaptiveFormats: [
+        { itag, url: mediaUrl, mimeType: 'video/mp4; codecs="avc1"', height: 720, contentLength: '1000' },
+        { itag: 140, url: 'https://rr3.googlevideo.com/audio', mimeType: 'audio/mp4', contentLength: '40' },
+      ],
+    },
+  };
+}
+
+test('ytdl re-resolves itag in the same request, forwards Range, and ignores a stale url', async () => {
+  const orig = globalThis.fetch;
+  const calls = [];
+  const fresh = 'https://rr1---sn.googlevideo.com/videoplayback?id=fresh&ip=this-request';
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    const headers = init?.headers || {};
+    calls.push({
+      u,
+      range: headers.Range || '',
+      cookie: headers.Cookie || '',
+      ua: headers['User-Agent'] || '',
+      name: init?.body ? JSON.parse(init.body).context.client.clientName : '',
+    });
+    if (u.includes('/youtubei/v1/player')) return playerJson(ytdlPlayer(136, fresh));
+    if (u === fresh) {
+      return new Response('ftyp', {
+        status: 206,
+        headers: {
+          'Content-Type': 'video/mp4',
+          'Content-Length': '4',
+          'Content-Range': 'bytes 0-99/1000',
+        },
+      });
+    }
+    throw new Error('unexpected fetch ' + u);
+  };
+  try {
+    const stale = encodeURIComponent('https://stale.googlevideo.com/videoplayback?id=old&ip=other-edge');
+    const res = await worker.fetch(
+      new Request(
+        'https://example.com/api/ytdl?v=dQw4w9WgXcQ&itag=136&client=vr&filename=clip.mp4&url=' + stale,
+        { headers: { Range: 'bytes=0-99' } },
+      ),
+      { YT_COOKIES: 'LOGIN_INFO=super-secret-session; SAPISID=sap-secret' },
+    );
+    assert.equal(res.status, 206);
+    assert.equal(res.headers.get('Content-Type'), 'video/mp4');
+    assert.equal(res.headers.get('Content-Range'), 'bytes 0-99/1000');
+    assert.equal(res.headers.get('Content-Length'), '4');
+    assert.equal(res.headers.get('Access-Control-Allow-Origin'), '*');
+    assert.equal(res.headers.get('Access-Control-Expose-Headers'), 'Content-Range, Content-Length');
+    assert.match(res.headers.get('Content-Disposition') || '', /filename="clip\.mp4"/);
+    assert.equal(res.headers.get('Accept-Ranges'), 'bytes');
+    assert.equal(await res.text(), 'ftyp');
+    const players = calls.filter((c) => c.u.includes('/youtubei/v1/player'));
+    assert.equal(players.length, 1);
+    assert.equal(players[0].name, 'ANDROID_VR');
+    assert.equal(players[0].cookie, '');
+    assert.match(players[0].ua, /youtube\.vr\.oculus/);
+    const media = calls.filter((c) => c.u.includes('googlevideo.com'));
+    assert.equal(media.length, 1);
+    assert.equal(media[0].u, fresh);
+    assert.equal(media[0].range, 'bytes=0-99');
+    assert.equal(media[0].cookie, '');
+    assert.match(media[0].ua, /youtube\.vr\.oculus/);
+    assert.equal(calls.some((c) => c.u.includes('stale.googlevideo.com')), false);
+    assert.equal(JSON.stringify(calls).includes('super-secret-session'), false);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test('ytdl cookie client sends Cookie on the player and the media fetch', async () => {
+  const orig = globalThis.fetch;
+  const calls = [];
+  const fresh = 'https://rr2.googlevideo.com/videoplayback?id=web';
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    const headers = init?.headers || {};
+    const name = init?.body ? JSON.parse(init.body).context.client.clientName : '';
+    calls.push({ u, name, cookie: headers.Cookie || '', referer: headers.Referer || '', auth: headers.Authorization || '' });
+    if (u.includes('/youtubei/v1/player')) return playerJson(ytdlPlayer(22, fresh));
+    if (u === fresh) return new Response('ok', { status: 200, headers: { 'Content-Type': 'video/mp4', 'Content-Length': '2' } });
+    throw new Error('unexpected fetch ' + u);
+  };
+  try {
+    const res = await worker.fetch(
+      new Request('https://example.com/api/ytdl?v=dQw4w9WgXcQ&itag=22&client=web&filename=p.mp4'),
+      { YT_COOKIES: 'LOGIN_INFO=super-secret-session; SAPISID=sap-secret' },
+    );
+    assert.equal(res.status, 200);
+    assert.equal(await res.text(), 'ok');
+    assert.equal(calls.filter((c) => c.name === 'WEB').length, 1);
+    assert.equal(calls.some((c) => c.name === 'ANDROID_VR' || c.name === 'IOS' || c.name === 'ANDROID'), false);
+    const media = calls.find((c) => c.u === fresh);
+    assert.ok(media);
+    assert.match(media.cookie, /LOGIN_INFO=super-secret-session/);
+    assert.equal(media.referer, 'https://www.youtube.com/');
+    assert.equal(media.auth, '');
+    assert.equal(JSON.stringify({ status: res.status }).includes('super-secret-session'), false);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test('ytdl 403 becomes a Chinese 直链失效 error and the legacy url proxy still streams', async () => {
+  const orig = globalThis.fetch;
+  let mediaHits = 0;
+  let playerN = 0;
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    if (u.includes('sw.js_data')) return new Response('none', { status: 200 });
+    if (u.includes('/youtubei/v1/player')) {
+      playerN += 1;
+      return playerJson(ytdlPlayer(136, 'https://rr' + playerN + '.googlevideo.com/videoplayback?id=x'));
+    }
+    if (u.includes('googlevideo.com/videoplayback')) {
+      mediaHits++;
+      assert.equal(init?.headers?.Cookie || '', '');
+      return new Response('nope', { status: 403 });
+    }
+    if (u === 'https://rr.googlevideo.com/legacy') {
+      assert.equal(init?.headers?.Range, 'bytes=0-1');
+      assert.match(init?.headers?.['User-Agent'] || '', /youtube\.vr\.oculus/);
+      return new Response('ab', {
+        status: 206,
+        headers: { 'Content-Type': 'video/mp4', 'Content-Length': '2', 'Content-Range': 'bytes 0-1/9' },
+      });
+    }
+    throw new Error('unexpected fetch ' + u);
+  };
+  try {
+    const denied = await worker.fetch(
+      new Request('https://example.com/api/ytdl?v=dQw4w9WgXcQ&itag=136&client=vr&filename=x.mp4', {
+        headers: { Range: 'bytes=0-7' },
+      }),
+      { YT_COOKIES: 'LOGIN_INFO=super-secret-session; SAPISID=sap-secret' },
+    );
+    assert.equal(denied.status, 502);
+    const body = await denied.json();
+    assert.match(body.error, /直链失效/);
+    assert.match(body.error, /403/);
+    assert.equal(body.error.includes('super-secret-session'), false);
+    assert.ok(mediaHits >= 1 && mediaHits <= 3);
+
+    const legacy = await worker.fetch(
+      new Request('https://example.com/api/ytdl?url=' + encodeURIComponent('https://rr.googlevideo.com/legacy') + '&filename=z.mp4&ua=vr', {
+        headers: { Range: 'bytes=0-1' },
+      }),
+      {},
+    );
+    assert.equal(legacy.status, 206);
+    assert.equal(legacy.headers.get('Content-Range'), 'bytes 0-1/9');
+    assert.match(legacy.headers.get('Content-Disposition') || '', /z\.mp4/);
+    assert.equal(await legacy.text(), 'ab');
+
+    const bad = await worker.fetch(new Request('https://example.com/api/ytdl?v=short&itag=18'), {});
+    assert.equal(bad.status, 400);
+    const badHost = await worker.fetch(new Request('https://example.com/api/ytdl?url=' + encodeURIComponent('https://evil.example/a')), {});
+    assert.equal(badHost.status, 400);
+    assert.match((await badHost.json()).error, /不支持的下载地址/);
+  } finally {
+    globalThis.fetch = orig;
+  }
 });
