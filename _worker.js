@@ -8,6 +8,11 @@
 // 高清直连 /api/yt-hd（都不写进仓库，只在 Pages → Settings → Environment variables 配加密变量）：
 //   YT_COOKIES   已登录 youtube.com 的 Cookie（请求头 "a=b; c=d"，或 Netscape cookies.txt，或 [{name,value}] JSON）。别名 YT_COOKIE
 //   YT_PO_TOKEN  可选。InnerTube player 的 PO Token，放进 serviceIntegrityDimensions.poToken。别名 YT_POT
+//                这是 player token，不会写进 googlevideo 的 pot 参数，也绝不能在代码里伪造。
+//                数据中心 IP 上，部分视频（例如音乐/现场）会间歇性返回「Sign in to confirm you're not a bot」，
+//                或者匿名客户端最多只给到 720P。要稳定拿到 1080P，把真实 player PO Token 配进 YT_PO_TOKEN 后重新部署。
+//                生成方式见 yt-dlp PO Token 指南里的 player token（https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide）。
+//                /api/diag 的 hasYtPoToken 只在该变量去空白后非空时为 true，不会回显内容。
 // 服务器合并 /api/yt1080-*（前端不持有口令，由 Worker 转发）：
 //   YT_MERGE_TOKEN  与 EC2 合并服务口令一致；不配则接口直接说明未配置
 //   YT_MERGE_BASE   EC2 根地址，默认 http://3-129-45-49.sslip.io:30002
@@ -881,28 +886,42 @@ const YT_CLIENTS = [
     ua: 'com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip',
     extra: { androidSdkVersion: 34, osName: 'Android', osVersion: '14' } },
 ];
-const YT_UA = Object.fromEntries(YT_CLIENTS.map((c) => [c.key, c.ua]));
-
-// 带 Cookie 时额外试这些客户端。ANDROID / IOS 不吃网页登录态，TV / MWEB 才会用 YT_COOKIES。
+// 带 Cookie 时只试这些客户端。ANDROID / IOS / ANDROID_VR 不吃网页登录态，
+// 带上 YT_COOKIES 会得到没有 playabilityStatus 的错误体（tried 里是 +ck:none），帮不上忙。
 const YT_COOKIE_CLIENTS = [
-  { key: 'tv', name: 'TVHTML5', id: 7, version: '7.20260707.07.00',
-    ua: 'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)',
-    extra: {} },
   { key: 'mweb', name: 'MWEB', id: 2, version: '2.20260708.05.00',
     ua: 'Mozilla/5.0 (iPad; CPU OS 16_7_10 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1,gzip(gfe)',
     extra: {} },
+  { key: 'tv', name: 'TVHTML5', id: 7, version: '7.20260707.07.00',
+    ua: 'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)',
+    extra: {} },
+  { key: 'web', name: 'WEB', id: 1, version: '2.20260708.00.00',
+    ua: UA_PC,
+    extra: {} },
 ];
+const YT_UA = Object.fromEntries(YT_CLIENTS.concat(YT_COOKIE_CLIENTS).map((c) => [c.key, c.ua]));
+// 机器人墙重试时先打曾经能出 720P 的 IOS，再打另外两个匿名客户端。
+const YT_BOT_RETRY_CLIENTS = [YT_CLIENTS[1], YT_CLIENTS[2], YT_CLIENTS[0]];
 
 let ytVisitorCache = '';
-async function ytVisitorData() {
-  if (ytVisitorCache) return ytVisitorCache;
+// opts.cookie：带登录态取 visitor 时把 Cookie 一并带上，避免匿名 visitor 和会话对不上。
+// opts.force：机器人墙重试必须重新取，不能复用上一轮可能已经被标脏的 visitor。
+async function ytVisitorData(opts = {}) {
+  const cookie = opts.cookie || '';
+  if (!opts.force && !cookie && ytVisitorCache) return ytVisitorCache;
   try {
-    const r = await fetch('https://www.youtube.com/sw.js_data', { headers: { 'User-Agent': UA_PC } });
+    const headers = { 'User-Agent': UA_PC };
+    if (cookie) headers.Cookie = cookie;
+    const r = await fetch('https://www.youtube.com/sw.js_data', { headers });
     const t = await r.text();
     const m = t.match(/"(Cg[A-Za-z0-9_%-]{20,})"/);
-    ytVisitorCache = m ? decodeURIComponent(m[1]) : '';
-  } catch { ytVisitorCache = ''; }
-  return ytVisitorCache;
+    const vd = m ? decodeURIComponent(m[1]) : '';
+    if (!cookie) ytVisitorCache = vd;
+    return vd;
+  } catch {
+    if (!cookie) ytVisitorCache = '';
+    return '';
+  }
 }
 
 // YouTube 用同一个 status=LOGIN_REQUIRED 表示两件事，必须看 reason：
@@ -917,15 +936,15 @@ export function classifyPlayability(ps) {
     ? sub.simpleText
     : (Array.isArray(sub?.runs) ? sub.runs.map((r) => r?.text || '').join('') : '');
   const text = reason + '\n' + messages + '\n' + subText;
-  const bot = /not a bot|confirm you.?re not a bot|unusual traffic|机器人/i.test(text);
+  const bot = /not a bot|not a robot|confirm you.?re not a bot|unusual traffic|机器人/i.test(text);
   const age = (ps?.desktopLegacyAgeGateReason != null && ps.desktopLegacyAgeGateReason !== 0)
     || /inappropriate for some users|confirm your age|age[- ]restricted|年龄限制|确认你的年龄|确认您的年龄/i.test(text)
     || status === 'AGE_CHECK_REQUIRED'
     || status === 'AGE_VERIFICATION_REQUIRED';
-  if (status === 'OK') return { kind: 'ok', status, reason };
-  if (bot && !age) return { kind: 'bot', status, reason };
-  if (age || status === 'LOGIN_REQUIRED') return { kind: 'login', status, reason };
-  return { kind: 'other', status, reason };
+  if (status === 'OK') return { kind: 'ok', status, reason, age: false };
+  if (bot && !age) return { kind: 'bot', status, reason, age: false };
+  if (age || status === 'LOGIN_REQUIRED') return { kind: 'login', status, reason, age: !!age };
+  return { kind: 'other', status, reason, age: false };
 }
 
 // 接受三种写法，方便从浏览器或扩展粘贴。不记录、不回传原文。
@@ -964,6 +983,20 @@ export function normalizeCookieHeader(raw) {
     if (pairs.length) return pairs.join('; ');
   }
   return text.replace(/[\r\n]+/g, ' ').replace(/\s*;\s*/g, '; ').replace(/;\s*$/, '').trim();
+}
+
+// PREF=hl=zh-CN&gl=CN… 登录态请求沿用账号地区，避免写死 gl=US 把可播会话打成 UNPLAYABLE。
+function cookieLocale(cookieHeader) {
+  const pref = cookieMap(cookieHeader).PREF || '';
+  if (!pref) return {};
+  let text = pref;
+  try { text = decodeURIComponent(pref); } catch { /* PREF 不一定带百分号编码 */ }
+  const hl = (text.match(/(?:^|[?&\s])hl=([A-Za-z0-9-]+)/i) || [])[1] || '';
+  const gl = (text.match(/(?:^|[?&\s])gl=([A-Za-z]{2})/i) || [])[1] || '';
+  const out = {};
+  if (hl) out.hl = hl;
+  if (gl) out.gl = gl.toUpperCase();
+  return out;
 }
 
 function cookieMap(header) {
@@ -1016,10 +1049,17 @@ export function loginRequiredMessage(hasCookies) {
   return '这部视频需要已登录的 YouTube 会话（年龄限制或登录墙），当前服务器没有可用的登录 Cookie。请在 Cloudflare Pages 环境变量设置 YT_COOKIES（浏览器里已登录 youtube.com 的 Cookie，可选再设 YT_PO_TOKEN），保存后重新部署。';
 }
 
-const YT_BOT_ERROR = 'YouTube 暂时把服务器当成了机器人，没拿到高清流，过一会再试';
+const YT_BOT_ERROR = 'YouTube 暂时把服务器当成了机器人，这次没有拿到可下载的视频流，过一会再试';
+
+function isAgeLoginReason(reason) {
+  return /inappropriate for some users|confirm your age|age[- ]restricted|年龄限制|确认你的年龄|确认您的年龄/i.test(String(reason || ''));
+}
 
 export function ytHdFailureBody(state) {
-  if (state?.sawLogin) {
+  // 年龄墙优先于机器人墙（有的客户端把年龄限制也报成 bot）。
+  // 只有机器人墙、登录原因又不是年龄时，仍然报 BOT_CHECK，避免被空的 LOGIN_REQUIRED 盖掉。
+  const age = !!(state?.sawAge || isAgeLoginReason(state?.loginReason));
+  if (state?.sawLogin && (age || !state?.sawBot)) {
     const body = {
       ok: false,
       code: 'LOGIN_REQUIRED',
@@ -1028,10 +1068,14 @@ export function ytHdFailureBody(state) {
     if (state.loginReason) body.reason = String(state.loginReason).slice(0, 180);
     return body;
   }
+  if (state?.sawBot) {
+    return { ok: false, code: 'BOT_CHECK', error: YT_BOT_ERROR };
+  }
+  const other = state?.otherReason ? String(state.otherReason).replace(/\s+/g, ' ').slice(0, 180) : '';
   return {
     ok: false,
-    code: state?.sawBot ? 'BOT_CHECK' : 'UNAVAILABLE',
-    error: YT_BOT_ERROR,
+    code: 'UNAVAILABLE',
+    error: other ? ('没拿到可下载的视频流：' + other) : '没拿到可下载的视频流',
   };
 }
 
@@ -1050,8 +1094,16 @@ async function ytPlayer(vid, c, visitorData, auth) {
     headers['X-Origin'] = 'https://www.youtube.com';
     headers['X-Goog-AuthUser'] = '0';
   }
+  const loc = auth?.cookie ? cookieLocale(auth.cookie) : {};
   const context = {
-    client: { clientName: c.name, clientVersion: c.version, hl: 'en', gl: 'US', ...(visitorData ? { visitorData } : {}), ...c.extra },
+    client: {
+      clientName: c.name,
+      clientVersion: c.version,
+      hl: loc.hl || 'en',
+      gl: loc.gl || 'US',
+      ...(visitorData ? { visitorData } : {}),
+      ...c.extra,
+    },
   };
   if (auth?.cookie) context.user = { enableSafetyMode: false, lockedSafetyMode: false };
   const body = {
@@ -1063,39 +1115,139 @@ async function ytPlayer(vid, c, visitorData, auth) {
   return r.json();
 }
 
-function hdStream(j) {
-  const fmts = (j?.streamingData?.adaptiveFormats || []).filter((f) => f.url);
-  const vids = fmts.filter((f) => /^video\/mp4/.test(f.mimeType) && /avc1/.test(f.mimeType) && (f.height || 0) <= 1080)
-    .sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0));
-  const auds = fmts.filter((f) => /^audio\/mp4/.test(f.mimeType)).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  return { fmts, vids, auds };
+const HD_TARGET = 1080;
+const ITAG_HEIGHT = {
+  18: 360, 22: 720, 37: 1080, 59: 480,
+  133: 240, 134: 360, 135: 480, 136: 720, 137: 1080,
+  298: 720, 299: 1080, 398: 720, 399: 1080,
+};
+
+function fmtHeight(f) {
+  const h = +f?.height || 0;
+  if (h) return h;
+  return ITAG_HEIGHT[+f?.itag] || 0;
 }
 
-// 先按原来的匿名客户端取流（公开视频行为不变）。配了 YT_COOKIES 仍失败时，再带 Cookie / SAPISIDHASH 重试，并加上 TV、MWEB。
-async function ytHdTry(vid, clients, auth, tried, state) {
-  for (const round of [0, 1]) {
-    const vd = round ? await ytVisitorData() : '';
+function isAvcMp4(f) {
+  const mime = String(f?.mimeType || '');
+  return /^video\/mp4/i.test(mime) && /avc1/i.test(mime);
+}
+
+// 自适应 avc1+音频优先；没有分离音轨时退回渐进式 MP4（itag 18/22 这类，文件里已经有声音）。
+// 只要有直链就用，不要求 playabilityStatus 一定是 OK——有的响应带着可用流却标了别的状态。
+export function pickHdPair(j) {
+  const adaptive = (j?.streamingData?.adaptiveFormats || []).filter((f) => f && f.url);
+  const progressive = (j?.streamingData?.formats || []).filter((f) => f && f.url);
+  const vids = adaptive.filter((f) => isAvcMp4(f) && fmtHeight(f) > 0 && fmtHeight(f) <= HD_TARGET)
+    .sort((a, b) => fmtHeight(b) - fmtHeight(a) || (b.bitrate || 0) - (a.bitrate || 0));
+  const auds = adaptive.filter((f) => /^audio\/mp4/i.test(f.mimeType || ''))
+    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+  const audsWebm = adaptive.filter((f) => /^audio\/webm/i.test(f.mimeType || ''))
+    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+  let adaptivePair = null;
+  if (vids.length && (auds.length || audsWebm.length)) {
+    const video = vids[0];
+    adaptivePair = { video, audio: auds[0] || audsWebm[0], progressive: false, height: fmtHeight(video) };
+  }
+  const prog = progressive.filter((f) => isAvcMp4(f) && fmtHeight(f) > 0 && fmtHeight(f) <= HD_TARGET)
+    .sort((a, b) => fmtHeight(b) - fmtHeight(a) || (b.bitrate || 0) - (a.bitrate || 0));
+  let progPair = null;
+  if (prog.length) {
+    const video = prog[0];
+    progPair = { video, audio: null, progressive: true, height: fmtHeight(video) };
+  }
+  if (adaptivePair && progPair) {
+    // 同清晰度优先分离音轨（码率通常更高）；渐进式更高时用渐进式，不要为了“必须成对”丢掉 720/1080。
+    return pairBeats(progPair, adaptivePair) ? adaptivePair : progPair;
+  }
+  return adaptivePair || progPair;
+}
+
+function pairBeats(best, hit) {
+  if (!hit) return false;
+  if (!best) return true;
+  if (hit.height !== best.height) return hit.height > best.height;
+  if (!!hit.audio !== !!best.audio) return !!hit.audio;
+  return (hit.video?.bitrate || 0) > (best.video?.bitrate || 0);
+}
+
+function hdSuccessJson(vid, client, j, pair) {
+  const v = pair.video;
+  const body = {
+    ok: true,
+    videoId: vid,
+    client: client.key,
+    title: j?.videoDetails?.title || '',
+    capped: pair.height < HD_TARGET,
+    video: {
+      url: v.url,
+      height: pair.height,
+      width: v.width || 0,
+      size: +v.contentLength || 0,
+      itag: v.itag,
+    },
+    progressive: !pair.audio,
+  };
+  body.audio = pair.audio
+    ? { url: pair.audio.url, size: +pair.audio.contentLength || 0, itag: pair.audio.itag }
+    : null;
+  return json(body);
+}
+
+// 匿名轮换先跑（公开视频仍在 ANDROID_VR 第一次成功就返回）。
+// 机器人墙且一个直链都没有时，按 ytHdTiming.botRetryDelaysMs 退避再打匿名客户端。
+// Cookie 只发给 MWEB / TV / WEB。已经拿到 720P 就不会因为后面的 BOT_CHECK 把结果丢掉。
+export const ytHdTiming = {
+  botRetryDelaysMs: [400, 1000],
+};
+
+function sleepMs(ms) {
+  if (!ms) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function ytHdOnce(vid, c, visitorData, auth, tried, state) {
+  const tag = c.key + (visitorData ? '+vd' : '') + (auth?.cookie ? '+ck' : '');
+  let j;
+  try {
+    j = await ytPlayer(vid, c, visitorData, auth);
+  } catch {
+    tried.push(tag + ':err');
+    return null;
+  }
+  const kind = classifyPlayability(j?.playabilityStatus);
+  const urlCount = [...(j?.streamingData?.formats || []), ...(j?.streamingData?.adaptiveFormats || [])]
+    .filter((f) => f && f.url).length;
+  const errLabel = j?.error ? 'error' : '';
+  tried.push(tag + ':' + (kind.status || errLabel || 'none') + ':' + urlCount + ':' + kind.kind);
+  if (kind.kind === 'login') {
+    state.sawLogin = true;
+    if (kind.age) state.sawAge = true;
+    if (!state.loginReason && kind.reason) state.loginReason = kind.reason;
+  } else if (kind.kind === 'bot') state.sawBot = true;
+  else if (kind.reason && !state.otherReason) state.otherReason = kind.reason;
+  const pair = pickHdPair(j);
+  if (!pair) return null;
+  return { pair, j, client: c };
+}
+
+async function runClientList(vid, clients, auth, tried, state, opts = {}) {
+  let best = opts.best || null;
+  const rounds = opts.rounds == null ? 2 : opts.rounds;
+  for (let round = 0; round < rounds; round++) {
+    const wantVisitor = !!(opts.withVisitor || round > 0);
+    const vd = wantVisitor ? await ytVisitorData({ cookie: opts.visitorCookie || '', force: true }) : '';
     for (const c of clients) {
-      let j;
-      try { j = await ytPlayer(vid, c, vd, auth); } catch (e) { tried.push(c.key + ':err'); continue; }
-      const kind = classifyPlayability(j?.playabilityStatus);
-      const { fmts, vids, auds } = hdStream(j);
-      tried.push(c.key + (round ? '+vd' : '') + (auth?.cookie ? '+ck' : '') + ':' + (kind.status || 'none') + ':' + fmts.length + ':' + kind.kind);
-      if (kind.kind === 'login') {
-        state.sawLogin = true;
-        if (!state.loginReason && kind.reason) state.loginReason = kind.reason;
-      } else if (kind.kind === 'bot') state.sawBot = true;
-      if (kind.status !== 'OK' || !vids.length || !auds.length) continue;
-      const v = vids[0], a = auds[0];
-      return json({
-        ok: true, videoId: vid, client: c.key,
-        title: j?.videoDetails?.title || '',
-        video: { url: v.url, height: v.height, width: v.width, size: +v.contentLength || 0, itag: v.itag },
-        audio: { url: a.url, size: +a.contentLength || 0, itag: a.itag },
-      });
+      const hit = await ytHdOnce(vid, c, vd, auth, tried, state);
+      if (!hit) continue;
+      if (pairBeats(
+        best && { height: best.pair.height, audio: best.pair.audio, video: best.pair.video },
+        { height: hit.pair.height, audio: hit.pair.audio, video: hit.pair.video },
+      )) best = hit;
+      if (best && best.pair.height >= HD_TARGET) return best;
     }
   }
-  return null;
+  return best;
 }
 
 async function handleYtHd(request, env) {
@@ -1106,14 +1258,31 @@ async function handleYtHd(request, env) {
   const vid = m[1];
   const auth = await ytAuthFromEnv(env);
   const tried = [];
-  const state = { sawLogin: false, sawBot: false, loginReason: '', cookiesConfigured: !!auth.cookie };
+  const state = {
+    sawLogin: false, sawBot: false, sawAge: false, loginReason: '', otherReason: '',
+    cookiesConfigured: !!auth.cookie,
+  };
   ytVisitorCache = '';
-  const anon = await ytHdTry(vid, YT_CLIENTS, { poToken: auth.poToken }, tried, state);
-  if (anon) return anon;
-  if (auth.cookie) {
-    const loggedIn = await ytHdTry(vid, YT_CLIENTS.concat(YT_COOKIE_CLIENTS), auth, tried, state);
-    if (loggedIn) return loggedIn;
+  const anonAuth = { poToken: auth.poToken };
+  let best = await runClientList(vid, YT_CLIENTS, anonAuth, tried, state, { rounds: 2 });
+  // 年龄墙重试匿名客户端没有用。只有纯机器人墙、而且现在一个流都没有，才退避重试。
+  if (!best && state.sawBot && !state.sawAge) {
+    for (const delay of ytHdTiming.botRetryDelaysMs) {
+      await sleepMs(delay);
+      ytVisitorCache = '';
+      best = await runClientList(vid, YT_BOT_RETRY_CLIENTS, anonAuth, tried, state, { rounds: 1, withVisitor: true });
+      if (best) break;
+    }
   }
+  if (auth.cookie && (!best || best.pair.height < HD_TARGET)) {
+    const cookieBest = await runClientList(vid, YT_COOKIE_CLIENTS, auth, tried, state, {
+      rounds: best ? 1 : 2,
+      best,
+      visitorCookie: auth.cookie,
+    });
+    if (cookieBest) best = cookieBest;
+  }
+  if (best) return hdSuccessJson(vid, best.client, best.j, best.pair);
   const body = ytHdFailureBody(state);
   body.tried = tried;
   return json(body, body.code === 'LOGIN_REQUIRED' ? 403 : 503);

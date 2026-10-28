@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { webcrypto } from 'node:crypto';
 import worker, {
   classifyPlayability,
@@ -9,11 +10,13 @@ import worker, {
   mergeOriginDownMessage,
   ytHdFailureBody,
   loginRequiredMessage,
+  pickHdPair,
+  ytHdTiming,
 } from '../_worker.js';
 
 if (!globalThis.crypto?.subtle) globalThis.crypto = webcrypto;
 
-const BOT = 'YouTube 暂时把服务器当成了机器人，没拿到高清流，过一会再试';
+const BOT = 'YouTube 暂时把服务器当成了机器人，这次没有拿到可下载的视频流，过一会再试';
 
 test('bot LOGIN_REQUIRED is not an age gate', () => {
   const kind = classifyPlayability({
@@ -256,4 +259,213 @@ test('merge proxy rewrites a Cloudflare 1016 body and passes JSON through', asyn
   } finally {
     globalThis.fetch = orig;
   }
+});
+
+function playerAt(height, { progressive = false } = {}) {
+  if (progressive) {
+    return {
+      playabilityStatus: { status: 'OK' },
+      videoDetails: { title: 'progressive' },
+      streamingData: {
+        formats: [
+          { url: 'https://example.com/p' + height, mimeType: 'video/mp4; codecs="avc1.4d401f, mp4a.40.2"', height, width: 1280, contentLength: '8', bitrate: 40, itag: 22 },
+        ],
+      },
+    };
+  }
+  return {
+    playabilityStatus: { status: 'OK' },
+    videoDetails: { title: 'adaptive' },
+    streamingData: {
+      adaptiveFormats: [
+        { url: 'https://example.com/v' + height, mimeType: 'video/mp4; codecs="avc1.4d401f"', height, width: 1280, contentLength: '10', bitrate: height, itag: height >= 1080 ? 137 : 136 },
+        { url: 'https://example.com/a' + height, mimeType: 'audio/mp4; codecs="mp4a.40.2"', contentLength: '5', bitrate: 50, itag: 140 },
+      ],
+    },
+  };
+}
+const BOT_PS = { status: 'LOGIN_REQUIRED', reason: "Sign in to confirm you're not a bot" };
+
+test('pickHdPair keeps a 720 progressive file when adaptive avc1 is missing', () => {
+  const pair = pickHdPair(playerAt(720, { progressive: true }));
+  assert.equal(pair.height, 720);
+  assert.equal(pair.progressive, true);
+  assert.equal(pair.audio, null);
+  const mixed = pickHdPair({
+    streamingData: {
+      adaptiveFormats: [
+        { url: 'https://example.com/v360', mimeType: 'video/mp4; codecs="avc1.4d401e"', height: 360, bitrate: 10, itag: 134 },
+        { url: 'https://example.com/a', mimeType: 'audio/mp4; codecs="mp4a.40.2"', bitrate: 50, itag: 140 },
+      ],
+      formats: [
+        { url: 'https://example.com/p720', mimeType: 'video/mp4; codecs="avc1.4d401f, mp4a.40.2"', height: 720, bitrate: 80, itag: 22 },
+      ],
+    },
+  });
+  assert.equal(mixed.height, 720);
+  assert.equal(mixed.progressive, true);
+});
+
+test('a later 1080 replaces an earlier 720, and a later bot does not drop the 720', async () => {
+  const orig = globalThis.fetch;
+  const delays = ytHdTiming.botRetryDelaysMs;
+  ytHdTiming.botRetryDelaysMs = [0, 0];
+  try {
+    const upgrade = [];
+    globalThis.fetch = async (url, init) => {
+      if (String(url).includes('sw.js_data')) return new Response('none', { status: 200 });
+      const name = JSON.parse(init.body).context.client.clientName;
+      upgrade.push(name);
+      if (name === 'IOS') return playerJson(playerAt(1080));
+      if (name === 'ANDROID_VR') return playerJson(playerAt(720));
+      return playerJson({ playabilityStatus: BOT_PS });
+    };
+    const up = await worker.fetch(new Request('https://example.com/api/yt-hd?url=https://youtu.be/mOzcOE03prg'), {});
+    const upBody = await up.json();
+    assert.equal(up.status, 200);
+    assert.equal(upBody.ok, true);
+    assert.equal(upBody.client, 'ios');
+    assert.equal(upBody.video.height, 1080);
+    assert.equal(upBody.capped, false);
+    assert.equal(upBody.audio.itag, 140);
+    assert.deepEqual(upgrade, ['ANDROID_VR', 'IOS']);
+
+    const kept = [];
+    globalThis.fetch = async (url, init) => {
+      if (String(url).includes('sw.js_data')) return new Response('none', { status: 200 });
+      const name = JSON.parse(init.body).context.client.clientName;
+      kept.push(name);
+      if (name === 'ANDROID_VR' && kept.filter((n) => n === 'ANDROID_VR').length === 1) return playerJson(playerAt(720));
+      return playerJson({ playabilityStatus: BOT_PS });
+    };
+    const low = await worker.fetch(new Request('https://example.com/api/yt-hd?url=mOzcOE03prg'), {});
+    const lowBody = await low.json();
+    assert.equal(low.status, 200);
+    assert.equal(lowBody.client, 'vr');
+    assert.equal(lowBody.video.height, 720);
+    assert.equal(lowBody.capped, true);
+    assert.equal(lowBody.progressive, false);
+    assert.doesNotMatch(JSON.stringify(lowBody), /1080P/);
+  } finally {
+    ytHdTiming.botRetryDelaysMs = delays;
+    globalThis.fetch = orig;
+  }
+});
+
+test('progressive 720 is returned instead of BOT_CHECK when later clients are bot-walled', async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('sw.js_data')) return new Response('none', { status: 200 });
+    const name = JSON.parse(init.body).context.client.clientName;
+    if (name === 'ANDROID_VR') return playerJson(playerAt(720, { progressive: true }));
+    return playerJson({ playabilityStatus: BOT_PS });
+  };
+  try {
+    const res = await worker.fetch(new Request('https://example.com/api/yt-hd?url=https://youtu.be/mOzcOE03prg'), {});
+    const body = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(body.ok, true);
+    assert.equal(body.video.height, 720);
+    assert.equal(body.progressive, true);
+    assert.equal(body.audio, null);
+    assert.equal(body.capped, true);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test('bot wall retries anonymous clients and does not attach cookies to ios/android/vr', async () => {
+  const orig = globalThis.fetch;
+  const delays = ytHdTiming.botRetryDelaysMs;
+  ytHdTiming.botRetryDelaysMs = [0, 0];
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    if (u.includes('sw.js_data')) return new Response('"Cgabcdefghijklmnopqrstuvwxyz012345"', { status: 200 });
+    const headers = init?.headers || {};
+    const body = JSON.parse(init.body);
+    const name = body.context.client.clientName;
+    const cookie = headers.Cookie || '';
+    calls.push({ name, cookie: cookie ? 'yes' : 'no' });
+    const iosAnon = calls.filter((c) => c.name === 'IOS' && c.cookie === 'no').length;
+    if (name === 'IOS' && !cookie && iosAnon >= 3) return playerJson(playerAt(720));
+    if (name === 'WEB') {
+      return playerJson({ playabilityStatus: { status: 'LOGIN_REQUIRED', reason: 'Please sign in' } });
+    }
+    return playerJson({ playabilityStatus: BOT_PS });
+  };
+  try {
+    const res = await worker.fetch(
+      new Request('https://example.com/api/yt-hd?url=https://youtu.be/mOzcOE03prg'),
+      { YT_COOKIES: 'LOGIN_INFO=super-secret-session; SAPISID=sap-secret; PREF=hl=zh-CN&gl=HK' },
+    );
+    const body = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(body.ok, true);
+    assert.equal(body.client, 'ios');
+    assert.equal(body.video.height, 720);
+    assert.equal(body.capped, true);
+    const mobile = calls.filter((c) => c.name === 'IOS' || c.name === 'ANDROID' || c.name === 'ANDROID_VR');
+    assert.ok(mobile.length >= 3);
+    assert.ok(mobile.every((c) => c.cookie === 'no'));
+    assert.ok(calls.some((c) => c.name === 'MWEB' && c.cookie === 'yes'));
+    assert.equal(JSON.stringify(body).includes('super-secret-session'), false);
+    const authed = calls.find((c) => c.cookie === 'yes');
+    assert.ok(authed);
+  } finally {
+    ytHdTiming.botRetryDelaysMs = delays;
+    globalThis.fetch = orig;
+  }
+});
+
+test('a pure bot wall stays BOT_CHECK and does not claim 1080P is the thing that failed', async () => {
+  const orig = globalThis.fetch;
+  const delays = ytHdTiming.botRetryDelaysMs;
+  ytHdTiming.botRetryDelaysMs = [0, 0];
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('sw.js_data')) return new Response('none', { status: 200 });
+    return playerJson({ playabilityStatus: BOT_PS });
+  };
+  try {
+    const res = await worker.fetch(
+      new Request('https://example.com/api/yt-hd?url=https://youtu.be/mOzcOE03prg'),
+      { YT_COOKIES: 'LOGIN_INFO=super-secret-session; SAPISID=sap-secret' },
+    );
+    const body = await res.json();
+    assert.equal(res.status, 503);
+    assert.equal(body.code, 'BOT_CHECK');
+    assert.equal(body.error, BOT);
+    assert.doesNotMatch(body.error, /1080/);
+    assert.ok(body.tried.some((t) => t.startsWith('ios') && t.endsWith(':bot')));
+    assert.ok(body.tried.every((t) => !/^(vr|ios|android)(\+vd)?\+ck:/.test(t)));
+    const masked = ytHdFailureBody({ sawLogin: true, sawBot: true, loginReason: 'Please sign in', cookiesConfigured: true });
+    assert.equal(masked.code, 'BOT_CHECK');
+  } finally {
+    ytHdTiming.botRetryDelaysMs = delays;
+    globalThis.fetch = orig;
+  }
+});
+
+test('diag hasYtPoToken follows the env var and does not echo it', async () => {
+  const empty = await (await worker.fetch(new Request('https://example.com/api/diag'), {})).json();
+  assert.equal(empty.hasYtPoToken, false);
+  assert.equal(empty.hasYtCookies, false);
+  const blank = await (await worker.fetch(new Request('https://example.com/api/diag'), { YT_PO_TOKEN: '   ', YT_POT: '\n' })).json();
+  assert.equal(blank.hasYtPoToken, false);
+  const set = await (await worker.fetch(new Request('https://example.com/api/diag'), { YT_POT: 'player-pot-secret' })).json();
+  assert.equal(set.hasYtPoToken, true);
+  assert.equal(JSON.stringify(set).includes('player-pot-secret'), false);
+});
+
+test('index.html failure copy follows the real code and 720 is a real button', () => {
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  assert.equal(html.includes('暂时没拿到 1080P'), false);
+  assert.equal(html.includes('没拿到 1080P'), false);
+  assert.match(html, /正在获取可用画质/);
+  assert.match(html, /function hdFailText/);
+  assert.match(html, /hdFailText\(e\)/);
+  assert.match(html, /一键下载 ' \+ px \+ 'P/);
+  assert.match(html, /下载 ' \+ px \+ 'P（已含声音/);
+  assert.match(html, /这是当前最高可用画质/);
+  assert.match(html, /h\.progressive \|\| !h\.audio/);
 });

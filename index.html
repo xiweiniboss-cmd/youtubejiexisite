@@ -353,10 +353,10 @@ var deviceId = (function(){
   }
   function hideDlProg(){ document.getElementById('dlProg').style.display = 'none'; }
 
-  function downloadResource(url, filename){
+  function downloadResource(url, filename, ua){
     setParseBtn('正在准备下载…', true); __hkHideBtn();
     resetDlProg();
-    var proxyUrl = '/api/ytdl?url=' + encodeURIComponent(url) + '&filename=' + encodeURIComponent(filename);
+    var proxyUrl = '/api/ytdl?url=' + encodeURIComponent(url) + '&filename=' + encodeURIComponent(filename) + (ua ? '&ua=' + encodeURIComponent(ua) : '');
     fetchBlobProgress(proxyUrl, setDlProg).then(function(blob){
       hideDlProg();
       resetParseBtn();
@@ -433,6 +433,14 @@ var deviceId = (function(){
     }).then(function(){ _merging = false; btn.disabled = false; btn.textContent = old; });
   }
 
+  // 失败文案跟着接口的 code 走（BOT_CHECK / LOGIN_REQUIRED），按真实高度显示按钮。
+  function hdFailText(e){
+    var code = String(e && e.code || '').replace(/[^A-Z0-9_]/g, '');
+    var msg = String(e && e.message || '没拿到可下载的视频流').replace(/[<>]/g, '');
+    if (code) return msg + '（' + code + '）';
+    return msg;
+  }
+
   function resLabel(r, i){
     var label = String(r.type || '');
     if (isAudio(r)) return '🎵 纯音频';
@@ -468,14 +476,15 @@ var deviceId = (function(){
       var auds = resources.filter(function(r){ return isAudio(r); });
       var ordered = vids.concat(auds);
       var best = pickBestVideo(vids), bestA = pickBestAudio(auds);
-      // RedFox 常常只给 360P：另走 Worker 直连 YouTube 拿 1080P 无声流 + 音频
+      // RedFox 常常只给 360P：另走 Worker 直连 YouTube。能拿到的最高画质是多少就显示多少（720 也要给按钮）。
       var hdSlot = document.createElement('div');
       resList.appendChild(hdSlot);
       if (window.YTMerge && (d.videoId || '')) {
-        hdSlot.innerHTML = '<div class="hint">⏳ 正在获取 1080P 高清流…</div>';
+        hdSlot.innerHTML = '<div class="hint">⏳ 正在获取可用画质…</div>';
         fetch('/api/yt-hd?url=' + encodeURIComponent('https://youtu.be/' + d.videoId)).then(function(r){ return r.json(); }).then(function(h){
-          if (!h || !h.ok || !h.video || !h.audio) {
-            var hdErr = new Error((h && h.error) || '没拿到高清流');
+          var hasPair = h && h.ok && h.video && h.video.url && (h.audio || h.progressive);
+          if (!hasPair) {
+            var hdErr = new Error((h && h.error) || '没拿到可下载的视频流');
             hdErr.code = h && h.code;
             throw hdErr;
           }
@@ -484,19 +493,29 @@ var deviceId = (function(){
           var hb = document.createElement('button');
           hb.className = 'btn';
           hb.style.cssText = 'margin-top:10px;font-size:15px;font-weight:700';
-          var sz = (h.video.size + h.audio.size) ? '，约 ' + fmtMB(h.video.size + h.audio.size) : '';
-          hb.textContent = '⭐ 一键下载 ' + h.video.height + 'P（含声音' + sz + '）';
-          hb.onclick = function(){ mergeDownload(h.video, h.audio, d.title || 'youtube', hb, h.client); };
-          hdSlot.appendChild(hb);
+          var px = h.video.height || '';
+          var audioSize = (h.audio && h.audio.size) || 0;
+          var sz = (h.video.size || audioSize) ? '，约 ' + fmtMB((h.video.size || 0) + audioSize) : '';
           var ht = document.createElement('div');
           ht.className = 'hint';
-          ht.textContent = '高清画面和声音是分开的两条流，下载后在你手机里合成一个带声音的 MP4';
+          if (h.progressive || !h.audio) {
+            hb.textContent = '⭐ 下载 ' + px + 'P（已含声音' + sz + '）';
+            hb.onclick = function(){ downloadResource(h.video.url, fileName((d.title || 'youtube') + '_' + px + 'P', 'mp4'), h.client); };
+            ht.textContent = px >= 1080
+              ? '声音已经在这个文件里，直接下载即可'
+              : ('已拿到 ' + px + 'P，这是当前最高可用画质，声音已经在这个文件里');
+          } else {
+            hb.textContent = '⭐ 一键下载 ' + px + 'P（含声音' + sz + '）';
+            hb.onclick = function(){ mergeDownload(h.video, h.audio, d.title || 'youtube', hb, h.client); };
+            ht.textContent = px >= 1080
+              ? '高清画面和声音是分开的两条流，下载后在你手机里合成一个带声音的 MP4'
+              : ('已拿到 ' + px + 'P，这是当前最高可用画质。画面和声音是两条流，下载后在手机里合成一个带声音的 MP4');
+          }
+          hdSlot.appendChild(hb);
           hdSlot.appendChild(ht);
           var mbOld = document.getElementById('redfoxMergeBtn'); if (mbOld) { mbOld.style.display = 'none'; if (mbOld.nextSibling) mbOld.nextSibling.style.display = 'none'; }
         }).catch(function(e){
-          var msg = String(e.message || e).replace(/[<>]/g, '');
-          if (e.code === 'LOGIN_REQUIRED') hdSlot.innerHTML = '<div class="hint">⚠️ ' + msg + '</div>';
-          else hdSlot.innerHTML = '<div class="hint">⚠️ 暂时没拿到 1080P（' + msg + '），可以稍后重新解析</div>';
+          hdSlot.innerHTML = '<div class="hint">⚠️ ' + hdFailText(e) + '</div>';
         });
       }
       if (best && bestA && window.YTMerge) {
