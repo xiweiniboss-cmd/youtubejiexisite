@@ -228,6 +228,8 @@ var deviceId = (function(){
   var urlInput = $('urlInput'), parseBtn = $('parseBtn'), loading = $('loading'),
       errBox = $('err'), resultBox = $('result'), mediaBox = $('mediaBox'),
       resList = $('resList'), dlHint = $('dlHint');
+  // 页面一加载就记住提示的默认文案，后面任何地方改了 dlHint 都能在下次渲染时恢复。
+  if (dlHint && !dlHint.getAttribute('data-default')) dlHint.setAttribute('data-default', dlHint.innerHTML);
 
   // 一键粘贴：从剪贴板读取分享链接
   $('pasteBtn').onclick = function(){
@@ -266,7 +268,10 @@ var deviceId = (function(){
       try {
         var j = JSON.parse(t);
         if (j && j.error) msg = String(j.error);
-      } catch (e) {}
+        var err = new Error(msg);
+        if (j && j.code) err.code = j.code;
+        throw err;
+      } catch (e) { if (e && e.code) throw e; }
       throw new Error(msg);
     });
   }
@@ -517,11 +522,12 @@ var deviceId = (function(){
       hb.disabled = true;
       startServerMerge('https://youtu.be/' + (d.videoId || ''), String(q), 'merged', q + 'P 含声音', function(html){
         ht.innerHTML = html;
-        if (/失败|连不上|超时|不可用/.test(String(html).replace(/<[^>]+>/g, ''))) hb.disabled = false;
+        if (/失败|连不上|超时|不可用|存不了/.test(String(html).replace(/<[^>]+>/g, ''))) hb.disabled = false;
       });
     };
     slot.appendChild(hb);
     slot.appendChild(ht);
+    return hb;
   }
 
   function resLabel(r, i){
@@ -545,7 +551,6 @@ var deviceId = (function(){
     resList.innerHTML = '';
     dlHint.style.display = 'none';
     dlHint.innerHTML = dlHint.getAttribute('data-default') || dlHint.innerHTML;
-    if (!dlHint.getAttribute('data-default')) dlHint.setAttribute('data-default', dlHint.innerHTML);
 
     if (isInAppBrowser()) {
       var warn = document.createElement('div');
@@ -618,7 +623,7 @@ var deviceId = (function(){
         }).catch(function(e){
           var code = String(e && e.code || '').replace(/[^A-Z0-9_]/g, '');
           if (e && e.serverMerge && (code === 'BOT_CHECK' || code === 'UNAVAILABLE')) {
-            offerServerMerge(hdSlot, d, best);
+            var smBtn = offerServerMerge(hdSlot, d, best);
             if (best && isProgressive(best)) {
               // 机器人墙时 RedFox 往往只给 360P 合流 MP4。它本身有声音、能直接存相册，放在最前面，
               // 服务器合并（几分钟、不一定成功）作为「想要更清晰」的次选。
@@ -633,7 +638,6 @@ var deviceId = (function(){
               pt.textContent = '这条视频高清流被 YouTube 拦了，目前能秒下的是 ' + ph + 'P（画面和声音都在一个 MP4 里）。想要更清晰的再点下面的「服务器合并」，要等几分钟。';
               hdSlot.insertBefore(pt, hdSlot.firstChild);
               hdSlot.insertBefore(pb, hdSlot.firstChild);
-              var smBtn = hdSlot.querySelector('button.btn:not(:first-child)');
               if (smBtn) smBtn.className = 'btn ghost';
             }
             var mbOld = document.getElementById('redfoxMergeBtn');
@@ -912,18 +916,26 @@ var deviceId = (function(){
     var m = Math.floor(s / 60), sec = s % 60;
     return m > 0 ? m + '分' + sec + '秒' : sec + '秒';
   }
-  function downloadMerged(jobId, filename){
+  // 成品文件名统一成 .mp4（服务器已确认不是 WebM/AV1/Opus，才会走到保存这一步）。
+  function mergedName(filename, blobType){
+    var n = String(filename || 'youtube_1080p').replace(/[\\/:*?"<>|]/g, '_');
+    if (/webm|matroska/i.test(blobType || '')) return n;
+    return /\.mp4$/i.test(n) ? n : n.replace(/\.(webm|mkv|m4v|mov)$/i, '') + '.mp4';
+  }
+  function downloadMerged(jobId, filename, onStatus){
+    var report = function(html){ setMergeStatus(html); if (typeof onStatus === 'function') onStatus(html); };
     setMergeBtn('正在下载成品…', true);
     resetDlProg();
     fetchBlobProgress('/api/yt1080-file?id=' + encodeURIComponent(jobId), setDlProg).then(function(blob){
       hideDlProg();
       resetMergeBtn();
-      setMergeStatus('✅ 合并完成，文件 ' + fmtMB(blob.size) + '，正在弹出保存…');
-      __hkSave(blob, filename || 'youtube_1080p.mp4');
+      report('✅ 合并完成，文件 ' + fmtMB(blob.size) + '，正在弹出保存…');
+      __hkSave(blob, mergedName(filename, blob.type));
     }).catch(function(e){
       resetMergeBtn();
       hideDlProg();
-      setMergeStatus('下载失败：' + (e.message || '网络错误') + '，成品在服务器上保留 1 小时，稍后可重新提交（若服务器空闲会重新合一份）。');
+      if (e && e.code === 'MERGE_NOT_IPHONE') { report('⚠️ ' + e.message); return; }
+      report('下载失败：' + (e.message || '网络错误') + '，成品在服务器上保留 1 小时，稍后可重新提交（若服务器空闲会重新合一份）。');
     });
   }
   function startServerMerge(ytUrl, quality, mode, label, onStatus){
@@ -960,6 +972,12 @@ var deviceId = (function(){
           fetch('/api/yt1080-status?id=' + encodeURIComponent(jobId))
             .then(function(r){ return r.text().then(function(t){ try { return JSON.parse(t); } catch(e){ throw new Error('服务器返回异常，请稍后重试'); } }); })
             .then(function(s){
+              if(!s.ok && s.code === 'MERGE_NOT_IPHONE'){
+                clearInterval(mergeTimer); mergeTimer = null;
+                resetMergeBtn();
+                status('⚠️ ' + s.error);
+                return;
+              }
               if(!s.ok){
                 clearInterval(mergeTimer); mergeTimer = null;
                 resetMergeBtn();
@@ -972,7 +990,7 @@ var deviceId = (function(){
                 filename = s.filename || 'youtube_1080p.mp4';
                 saveHistory({ jobId: jobId, filename: filename, size: s.size || 0, label: label, time: new Date().toLocaleString() });
                 status('✅ 合并完成（' + fmtMB(s.size || 0) + '），正在下载…已记入合并历史，1 小时内可从历史重下。');
-                downloadMerged(jobId, filename);
+                downloadMerged(jobId, filename, onStatus);
               } else if(s.status === 'error'){
                 clearInterval(mergeTimer); mergeTimer = null;
                 resetMergeBtn();

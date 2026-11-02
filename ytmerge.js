@@ -54,15 +54,20 @@ window.YTMerge = (function(){
     var prog = function(e){ onStage && onStage('正在合并音视频… ' + Math.max(0, Math.min(100, Math.round(e.progress * 100))) + '%'); };
     ff.on('progress', prog);
     var aArgs = ai.aac ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '160k', '-ac', '2'];
-    var code = await ff.exec(['-i', 'v.' + vExt, '-i', 'a.' + aExt, '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy'].concat(aArgs, ['-movflags', '+faststart', 'out.mp4']));
-    ff.off('progress', prog);
-    try { await ff.deleteFile('v.' + vExt); await ff.deleteFile('a.' + aExt); } catch (e) {}
-    if (code !== 0) throw new Error('合并失败（ffmpeg ' + code + '）');
-    var data = await ff.readFile('out.mp4');
-    try { await ff.deleteFile('out.mp4'); } catch (e) {}
+    var code, data;
+    try {
+      code = await ff.exec(['-i', 'v.' + vExt, '-i', 'a.' + aExt, '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy'].concat(aArgs, ['-movflags', '+faststart', 'out.mp4']));
+      if (code !== 0) throw new Error('合并失败（ffmpeg ' + code + '）');
+      data = await ff.readFile('out.mp4');
+    } finally {
+      // exec 抛异常（内存不够、被中断）时也要解绑进度回调、删掉临时文件，否则下一次合并会串进度、占内存。
+      ff.off('progress', prog);
+      var tmp = ['v.' + vExt, 'a.' + aExt, 'out.mp4'];
+      for (var k = 0; k < tmp.length; k++) { try { await ff.deleteFile(tmp[k]); } catch (e) {} }
+    }
     return new Blob([data.buffer], { type: 'video/mp4' });
   }
-  return { merge: merge, preload: getFF, _sniffAudio: sniffAudio };
+  return { merge: merge, preload: getFF };
 })();
 
 // 分段下载（经 /api/ytdl 代理 + Range）：googlevideo 对无声 1080P 整段下载会限速，分段并发快很多。

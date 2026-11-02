@@ -14,7 +14,11 @@ import worker, {
   findFormatByItag,
   ytHdTiming,
   mergeFormat,
+  mergeCodecVerdict,
+  sniffMergedHead,
+  rfc5987,
 } from '../_worker.js';
+import { spawnSync } from 'node:child_process';
 
 if (!globalThis.crypto?.subtle) globalThis.crypto = webcrypto;
 
@@ -815,29 +819,175 @@ test('pickHdPair pairs avc1 only with AAC, never with Opus', () => {
   assert.equal(nothing, null);
 });
 
-test('mergeFormat asks EC2 yt-dlp for avc1 + mp4a only', () => {
-  assert.equal(mergeFormat(720, 'merged'), 'bv*[height<=720][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<=720][ext=mp4][vcodec^=avc1]/b[ext=mp4]');
+test('mergeFormat asks EC2 yt-dlp for avc1 + mp4a first and always ends with a fallback', () => {
+  assert.equal(mergeFormat(720, 'merged'), 'bv*[height<=720][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<=720][ext=mp4][vcodec^=avc1]/b[ext=mp4]/bv*[height<=720]+ba/b');
+  assert.equal(mergeFormat(720, 'silent'), 'bv*[height<=720][vcodec^=avc1]/b[height<=720][ext=mp4][vcodec^=avc1]/bv*[height<=720]');
   assert.match(mergeFormat(1080, 'merged'), /^bv\*\[height<=1080\]\[vcodec\^=avc1\]\+ba\[acodec\^=mp4a\]/);
   assert.doesNotMatch(mergeFormat(720, 'silent'), /\+ba/);
 });
 
-test('yt1080-start forwards the H.264/AAC format; yt1080-file is a video/mp4 attachment', async () => {
-  const orig = globalThis.fetch;
-  let sent;
-  globalThis.fetch = async (url, init) => {
-    if (String(url).endsWith('/yt1080-jobs')) { sent = JSON.parse(init.body); return new Response(JSON.stringify({ ok: true, job_id: 'j1' }), { headers: { 'content-type': 'application/json' } }); }
-    return new Response('xx', { status: 200, headers: { 'content-type': 'application/octet-stream', 'content-disposition': 'inline; filename="NEFFEX Statement.webm"' } });
+// 没有 avc1 / mp4a 的模拟格式表：只有 AV1、VP9 和 Opus（WeiM_vffWAw 在机房 IP 上的样子去掉 H.264/AAC）。
+const NO_AVC_INFO = {
+  id: 'noavc0000_1', title: 'no avc', extractor: 'generic', extractor_key: 'Generic', webpage_url: 'https://example.com/v', _type: 'video',
+  formats: [
+    { format_id: '251', url: 'https://example.com/251', ext: 'webm', vcodec: 'none', acodec: 'opus', abr: 130, protocol: 'https' },
+    { format_id: '247', url: 'https://example.com/247', ext: 'webm', vcodec: 'vp9', acodec: 'none', height: 720, width: 1280, tbr: 1500, protocol: 'https' },
+    { format_id: '398', url: 'https://example.com/398', ext: 'mp4', vcodec: 'av01.0.05M.08', acodec: 'none', height: 720, width: 1280, tbr: 1400, protocol: 'https' },
+    { format_id: '399', url: 'https://example.com/399', ext: 'mp4', vcodec: 'av01.0.08M.08', acodec: 'none', height: 1080, width: 1920, tbr: 2500, protocol: 'https' },
+  ],
+};
+const ytdlp = process.env.YTDLP || 'yt-dlp';
+const hasYtdlp = spawnSync(ytdlp, ['--version']).status === 0;
+test('yt-dlp still picks something from a format list without avc1 (fallback works)', { skip: !hasYtdlp && 'yt-dlp not installed (set YTDLP=/path)' }, async () => {
+  const { writeFileSync, mkdtempSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const f = join(mkdtempSync(join(tmpdir(), 'ytm-')), 'info.json');
+  writeFileSync(f, JSON.stringify(NO_AVC_INFO));
+  const pick = (fmt) => spawnSync(ytdlp, ['-q', '--no-warnings', '--load-info-json', f, '-f', fmt, '--simulate', '--print', '%(format_id)s'], { encoding: 'utf8' });
+  const merged = pick(mergeFormat(720, 'merged'));
+  assert.equal(merged.status, 0, merged.stderr);
+  assert.equal(merged.stdout.trim(), '398+251');
+  const silent = pick(mergeFormat(720, 'silent'));
+  assert.equal(silent.status, 0, silent.stderr);
+  assert.equal(silent.stdout.trim(), '398');
+  // 旧格式串（没有退路）在这里会报 Requested format is not available
+  const old = pick('bv*[height<=720][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<=720][ext=mp4][vcodec^=avc1]/b[ext=mp4]');
+  assert.notEqual(old.status, 0);
+  assert.match(old.stderr, /Requested format is not available/);
+});
+
+// ---- 合成的文件头 ----
+function box(type, ...parts) {
+  const payload = Buffer.concat(parts.map((p) => (typeof p === 'string' ? Buffer.from(p, 'latin1') : p)));
+  const h = Buffer.alloc(8); h.writeUInt32BE(8 + payload.length, 0); h.write(type, 4, 'latin1');
+  return Buffer.concat([h, payload]);
+}
+const ftyp = (brands) => box('ftyp', 'isom', Buffer.alloc(4), brands);
+const moov = (...entries) => box('moov', box('mvhd', Buffer.alloc(100)), ...entries.map((e) => box('trak', box('stsd', Buffer.alloc(8), box(e, Buffer.alloc(70))))));
+const mdat = box('mdat', Buffer.alloc(4096, 7));
+const EBML = Buffer.concat([Buffer.from([0x1a, 0x45, 0xdf, 0xa3]), Buffer.alloc(4096, 1)]);
+const MP4_H264_AAC = Buffer.concat([ftyp('isomiso2avc1mp41'), moov('avc1', 'mp4a'), mdat]);
+const MP4_H264_OPUS = Buffer.concat([ftyp('isomiso2avc1mp41'), moov('avc1', 'Opus'), mdat]);
+const MP4_AV1_BRAND_TAIL = Buffer.concat([ftyp('isomav01iso2mp41'), mdat, moov('av01', 'Opus')]);
+const MP4_MOOV_AT_END = Buffer.concat([ftyp('isomiso2mp41'), mdat, moov('avc1', 'mp4a')]);
+
+test('sniffMergedHead: EBML/AV1/Opus are rejected, avc1+mp4a passes, moov at the end is unknown', () => {
+  assert.deepEqual(sniffMergedHead(EBML), { kind: 'webm', ok: false, fmt: 'WebM' });
+  assert.equal(sniffMergedHead(MP4_H264_AAC).ok, true);
+  assert.equal(sniffMergedHead(MP4_H264_OPUS).ok, false);
+  assert.equal(sniffMergedHead(MP4_AV1_BRAND_TAIL).ok, false);
+  const tail = sniffMergedHead(MP4_MOOV_AT_END.subarray(0, 1024));
+  assert.equal(tail.kind, 'mp4');
+  assert.equal(tail.ok, undefined);
+  // moov 只读到一半：没看到坏标记就不下结论
+  const half = sniffMergedHead(MP4_H264_AAC.subarray(0, 60));
+  assert.notEqual(half.ok, false);
+  assert.equal(sniffMergedHead(Buffer.from('hello world, not a video')).kind, 'unknown');
+});
+
+test('mergeCodecVerdict uses EC2 status codec fields when present', () => {
+  assert.equal(mergeCodecVerdict({ status: 'done' }), null);
+  assert.deepEqual(mergeCodecVerdict({ vcodec: 'avc1.4D401F', acodec: 'mp4a.40.2', ext: 'mp4' }), { ok: true });
+  assert.deepEqual(mergeCodecVerdict({ vcodec: 'h264', acodec: 'none' }), { ok: true });
+  assert.equal(mergeCodecVerdict({ vcodec: 'av01.0.05M.08', acodec: 'opus' }).ok, false);
+  assert.equal(mergeCodecVerdict({ vcodec: 'avc1', acodec: 'aac', ext: 'webm' }).ok, false);
+});
+
+test('rfc5987 escapes quote and brackets', () => {
+  assert.equal(rfc5987("a'(b)*.mp4"), 'a%27%28b%29%2A.mp4');
+});
+
+function mergeEnvFetch(fileBody, fileHeaders, statusBody) {
+  const sent = {};
+  const f = async (url, init) => {
+    const u = String(url);
+    if (u.endsWith('/yt1080-jobs')) { sent.start = JSON.parse(init.body); return new Response(JSON.stringify({ ok: true, job_id: 'j1' }), { headers: { 'content-type': 'application/json' } }); }
+    if (u.endsWith('/file')) return new Response(fileBody, { status: 200, headers: fileHeaders });
+    return new Response(JSON.stringify(statusBody || { ok: true, status: 'done', filename: 'x.mp4' }), { headers: { 'content-type': 'application/json' } });
   };
-  try {
-    const env = { YT_MERGE_TOKEN: 'local-test-token' };
-    await worker.fetch(new Request('https://example.com/api/yt1080-start?url=https://youtu.be/WeiM_vffWAw&quality=720', { method: 'POST' }), env);
-    assert.equal(sent.format, mergeFormat(720, sent.mode || 'merged'));
-    assert.equal(sent.merge_output_format, 'mp4');
-    const f = await worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), env);
-    assert.equal(f.headers.get('content-type'), 'video/mp4');
-    assert.match(f.headers.get('content-disposition'), /^attachment; filename="NEFFEX Statement\.mp4"/);
-    assert.equal(await f.text(), 'xx');
-  } finally {
-    globalThis.fetch = orig;
-  }
+  return { f, sent };
+}
+const ENV = { YT_MERGE_TOKEN: 'local-test-token' };
+async function withFetch(f, fn) {
+  const orig = globalThis.fetch; globalThis.fetch = f;
+  try { return await fn(); } finally { globalThis.fetch = orig; }
+}
+
+test('yt1080-start forwards the H.264/AAC format with its fallback', async () => {
+  const { f, sent } = mergeEnvFetch();
+  await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-start?url=https://youtu.be/WeiM_vffWAw&quality=720', { method: 'POST' }), ENV));
+  assert.equal(sent.start.format, mergeFormat(720, sent.start.mode || 'merged'));
+  assert.equal(sent.start.merge_output_format, 'mp4');
+});
+
+test('yt1080-file: a webm is not renamed to .mp4 — it becomes a Chinese MERGE_NOT_IPHONE error', async () => {
+  const { f } = mergeEnvFetch(EBML, { 'content-type': 'application/octet-stream', 'content-disposition': 'attachment; filename="NEFFEX Statement.webm"' });
+  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+  assert.equal(r.status, 415);
+  const j = await r.json();
+  assert.equal(j.code, 'MERGE_NOT_IPHONE');
+  assert.match(j.error, /iPhone 相册存不了/);
+  assert.match(j.error, /360P/);
+});
+
+test('yt1080-file: AV1/Opus mp4 (the WeiM_vffWAw file) is rejected even though it is named .mp4', async () => {
+  const { f } = mergeEnvFetch(MP4_AV1_BRAND_TAIL, { 'content-type': 'video/mp4', 'content-disposition': 'attachment; filename="a.mp4"' });
+  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+  assert.equal(r.status, 415);
+  assert.equal((await r.json()).code, 'MERGE_NOT_IPHONE');
+});
+
+test('yt1080-file: H.264+AAC streams through unchanged as a video/mp4 attachment', async () => {
+  const { f } = mergeEnvFetch(MP4_H264_AAC, { 'content-type': 'application/octet-stream', 'content-disposition': "attachment; filename=\"NEFFEX (Statement).mp4\"" });
+  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get('content-type'), 'video/mp4');
+  assert.match(r.headers.get('content-disposition'), /^attachment; filename="NEFFEX \(Statement\)\.mp4"; filename\*=UTF-8''NEFFEX%20%28Statement%29\.mp4$/);
+  assert.deepEqual(Buffer.from(await r.arrayBuffer()), MP4_H264_AAC);
+});
+
+test('yt1080-file: undecidable file passes through with its real type and name (no rename)', async () => {
+  const body = Buffer.concat([Buffer.from('RIFF....AVI LIST'), Buffer.alloc(2048, 3)]);
+  const { f } = mergeEnvFetch(body, { 'content-type': 'video/x-msvideo', 'content-disposition': 'attachment; filename="clip.avi"' });
+  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get('content-type'), 'video/x-msvideo');
+  assert.match(r.headers.get('content-disposition'), /filename="clip\.avi"/);
+  assert.equal(Buffer.from(await r.arrayBuffer()).length, body.length);
+  // moov 在文件尾的 mp4：放行
+  const t = mergeEnvFetch(MP4_MOOV_AT_END, { 'content-type': 'video/mp4' });
+  const r2 = await withFetch(t.f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+  assert.equal(r2.status, 200);
+  assert.match(r2.headers.get('content-disposition'), /filename="youtube_j1\.mp4"/);
+});
+
+test('yt1080-file: upstream 200 JSON is not labelled video/mp4', async () => {
+  const { f } = mergeEnvFetch(JSON.stringify({ ok: false, error: 'job not ready' }), { 'content-type': 'application/json' });
+  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+  assert.match(r.headers.get('content-type'), /json/);
+});
+
+test('yt1080-status: done with AV1/Opus codecs becomes MERGE_NOT_IPHONE; without codec fields it passes', async () => {
+  const bad = mergeEnvFetch(null, null, { ok: true, status: 'done', vcodec: 'av01.0.05M.08', acodec: 'opus', filename: 'a.mp4' });
+  const r = await withFetch(bad.f, () => worker.fetch(new Request('https://example.com/api/yt1080-status?id=j1'), ENV));
+  const j = await r.json();
+  assert.equal(j.ok, false);
+  assert.equal(j.code, 'MERGE_NOT_IPHONE');
+  const plain = mergeEnvFetch(null, null, { ok: true, status: 'done', filename: 'a.mp4', size: 10 });
+  const r2 = await withFetch(plain.f, () => worker.fetch(new Request('https://example.com/api/yt1080-status?id=j1'), ENV));
+  assert.deepEqual(await r2.json(), { ok: true, status: 'done', filename: 'a.mp4', size: 10 });
+});
+
+test('index.html shows MERGE_NOT_IPHONE, forces .mp4 on merged saves, and keeps data-default from page load', () => {
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  assert.match(html, /s\.code === 'MERGE_NOT_IPHONE'/);
+  assert.match(html, /e\.code === 'MERGE_NOT_IPHONE'/);
+  assert.match(html, /__hkSave\(blob, mergedName\(filename, blob\.type\)\)/);
+  assert.doesNotMatch(html, /:not\(:first-child\)/);
+  const at = html.indexOf("dlHint = $('dlHint');");
+  assert.ok(html.indexOf("setAttribute('data-default'", at) - at < 300);
+  const mergeJs = readFileSync(new URL('../ytmerge.js', import.meta.url), 'utf8');
+  assert.match(mergeJs, /finally \{[\s\S]*ff\.off\('progress', prog\)/);
+  assert.doesNotMatch(mergeJs, /_sniffAudio/);
 });
