@@ -1231,7 +1231,7 @@ refreshQuota();
     setText('srvRun', '-'); setText('srvQueue', '-');
   }
   function note(text){
-    show('srvBars', !text); show('srvJobs', !text); show('srvNote', !!text); setText('srvNote', text || '');
+    show('srvBars', !text); show('srvJobs', false); show('srvNote', !!text); setText('srvNote', text || '');
   }
   function render(s){
     if (!s || !s.online) {
