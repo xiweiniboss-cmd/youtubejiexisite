@@ -803,18 +803,20 @@ var deviceId = (function(){
   var TS_MSG_LOADING = '人机验证加载中…';
   var TS_MSG_LOAD_FAIL = '人机验证组件加载失败，请检查网络或 VPN 后刷新';
   var TS_MSG_EXPIRED = '验证已过期，请重新点开始解析';
+  var TS_MSG_REJECTED = '人机验证未通过，请刷新页面重试';
   var TS_RENDER_TIMEOUT_MS = 8000;
   var tsState = 'idle', tsRequired = false, tsLoadTimer = null;
   function tsSetState(st){
     if (tsState === 'ready' && st !== 'ready') return; // 已经渲染出来就不再回退（晚到的超时 / 报错不覆盖）
     tsState = st;
-    if (tsLoadTimer && (st === 'ready' || st === 'failed' || st === 'off')) { clearTimeout(tsLoadTimer); tsLoadTimer = null; }
+    if (tsLoadTimer && (st === 'ready' || st === 'failed' || st === 'rejected' || st === 'off')) { clearTimeout(tsLoadTimer); tsLoadTimer = null; }
     var el = document.getElementById('tsParseState');
     if (!el) return;
     // 服务器不要求验证（只配了 site key 没配 secret）时，组件加载不出来也不影响解析，不打扰用户
     if (!tsRequired && (st === 'loading' || st === 'failed')) st = 'quiet';
     if (st === 'loading') { el.className = 'hint ts-state'; el.textContent = TS_MSG_LOADING; el.style.display = 'block'; }
     else if (st === 'failed') { el.className = 'hint ts-state ts-fail'; el.textContent = '⚠️ ' + TS_MSG_LOAD_FAIL; el.style.display = 'block'; }
+    else if (st === 'rejected') { el.className = 'hint ts-state ts-fail'; el.textContent = '⚠️ ' + TS_MSG_REJECTED; el.style.display = 'block'; }
     else { el.textContent = ''; el.style.display = 'none'; }
   }
   var _tsScriptPromise = null;
@@ -867,6 +869,7 @@ var deviceId = (function(){
     var code = (body && body.code) || '';
     if (code === 'HUMAN_REQUIRED') {
       if (tsParseWidgetId !== null && tsState === 'ready') return TS_MSG_EXPIRED;
+      if (tsState === 'rejected') return TS_MSG_REJECTED;
       if (tsState === 'loading') return TS_MSG_LOADING + '请稍候再试';
       return TS_MSG_LOAD_FAIL;
     }
@@ -889,7 +892,10 @@ var deviceId = (function(){
         'expired-callback': function(){ resetParseTs(); },
         'timeout-callback': function(){ resetParseTs(); },
         'error-callback': function(){
-          if (tsState !== 'ready') tsSetState('failed');
+          // 组件已经渲染出来（iframe 在封闭 shadow 里查不到，用隐藏的 cf-turnstile-response 判断）
+          // 但 Turnstile 自己判失败（如域名没授权 110200）→ 不是网络问题
+          var hasFrame = !!(box && box.querySelector('iframe, input[name="cf-turnstile-response"]'));
+          if (tsState !== 'ready') tsSetState(hasFrame ? 'rejected' : 'failed');
           else showError('人机验证失败，请重试（刷新页面也可以）');
         }
       });
