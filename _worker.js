@@ -22,8 +22,11 @@
 //   {"ok":true,"mem":{"total":字节,"used":字节},"cpu":{"load1":f,"load5":f,"load15":f,"cores":n},
 //    "disk":{"total":字节,"used":字节},"uptimeSec":n,"jobs":{"running":n,"queued":n}}
 //   Worker 只取这些字段并转成数字，自己算百分比（CPU = load1/cores*100，封顶 100），口令不会回传。
-//   旧版 EC2 没有 /status 返回 404 时视为「在线但未提供详细状态」（statusSupported:false）。
-//   结果在边缘缓存约 15 秒。/api/ping 只给浏览器测「你→本站」延迟。
+//   旧版 EC2 没有 /status 返回 404 时视为「在线但未提供详细状态」（statusSupported:false）；
+//   401/403 视为在线但口令不匹配（authFailed:true）；5xx 视为在线但异常（degraded:true）；
+//   超时 / 连不上 / Cloudflare 530·1016 视为离线。响应体最多读 16KB，超出按格式异常处理。
+//   结果在边缘缓存约 15 秒，同一 isolate 内并发请求共用一次 EC2 请求（单飞）。
+//   /api/ping 只给浏览器测「你→本站」延迟。两个接口都不加 CORS 头。
 // 年龄限制看 playabilityStatus.reason，不要只看 status：LOGIN_REQUIRED 也会是「Sign in to confirm you're not a bot」。
 
 const REDFOX_BASE = 'https://redfox.hk';
@@ -1871,9 +1874,13 @@ async function handleYt1080File(request, env) {
 /* ================= 服务器状态 /api/server-status、/api/ping ================= */
 // 前端「服务器状态」卡片用。Worker 带 X-Merge-Token 请求 EC2 的 GET /status（契约见文件顶部注释），
 // 只回传清洗过的数字，绝不回传口令或上游原文。结果在边缘缓存 SERVER_STATUS_TTL 秒，避免频繁打 EC2。
+// 这两个接口只给本站页面用，不加 Access-Control-Allow-Origin。
 export const SERVER_STATUS_TIMEOUT_MS = 5000;
+export const SERVER_STATUS_MAX_BODY = 16 * 1024;
 const SERVER_STATUS_TTL = 15;
-const serverStatusMemo = new Map(); // mergeBase -> { at, body }（同一 isolate 内的兜底缓存，pages.dev 上 Cache API 不生效）
+// mergeBase -> { done, at, promise }：同一 isolate 内单飞 + 15 秒兜底缓存（pages.dev 上 Cache API 不生效），
+// 并发请求共用同一个进行中的 EC2 请求。
+const serverStatusMemo = new Map();
 
 function statusNum(v) {
   const n = typeof v === 'string' && v.trim() !== '' ? Number(v) : v;
@@ -1910,7 +1917,41 @@ export function sanitizeServerStatus(raw) {
   };
 }
 
+// 最多读 limit 字节；超过就停止读取并返回 { text: 已读部分, over: true }
+async function readBodyCapped(resp, limit) {
+  if (!resp.body || typeof resp.body.getReader !== 'function') {
+    const t = await resp.text();
+    return new TextEncoder().encode(t).length > limit ? { text: t.slice(0, limit), over: true } : { text: t, over: false };
+  }
+  const reader = resp.body.getReader();
+  const chunks = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) {
+      try { await reader.cancel(); } catch {}
+      chunks.push(value.subarray(0, Math.max(0, value.byteLength - (size - limit))));
+      return { text: new TextDecoder().decode(concatBytes(chunks)), over: true };
+    }
+    chunks.push(value);
+  }
+  return { text: new TextDecoder().decode(concatBytes(chunks)), over: false };
+}
+function concatBytes(chunks) {
+  let n = 0;
+  for (const c of chunks) n += c.byteLength;
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const c of chunks) { out.set(c, o); o += c.byteLength; }
+  return out;
+}
+
 // 实际探测 EC2。返回给前端的 body（不含口令）。opts.timeoutMs 仅供测试缩短超时。
+// online:false  —— 未配置口令 / 超时 / 连不上 / Cloudflare 530·1016 等源站不可达 / 其它非预期状态 / 格式异常
+// online:true   —— 200 正常（statusSupported:true）；404 旧版无 /status（statusSupported:false）；
+//                  401/403 口令不匹配（authFailed:true）；5xx 服务在但出错（degraded:true）。后三种不带统计数据。
 export async function fetchServerStatus(env, opts) {
   const checkedAt = Date.now();
   const token = mergeToken(env);
@@ -1934,14 +1975,23 @@ export async function fetchServerStatus(env, opts) {
       return offline('无法连接服务器');
     }
     const latencyMs = Math.max(0, Date.now() - t0);
-    let text = '';
-    try { text = await resp.text(); } catch { if (timedOut) return offline('连接超时'); }
-    if (mergeOriginDown(resp.status, text)) return offline('服务器不可达');
-    if (resp.status === 404) return { ok: true, online: true, latencyMs, statusSupported: false, checkedAt };
-    if (resp.status === 401 || resp.status === 403) return offline('口令不匹配（HTTP ' + resp.status + '）');
-    if (resp.status !== 200) return offline('服务器异常（HTTP ' + resp.status + '）');
+    let body;
+    try {
+      body = await readBodyCapped(resp, SERVER_STATUS_MAX_BODY);
+    } catch {
+      if (timedOut) return offline('连接超时');
+      body = { text: '', over: false };
+    }
+    const st = resp.status;
+    if (mergeOriginDown(st, body.text)) return offline('服务器不可达');
+    const onlineBut = (extra) => Object.assign({ ok: true, online: true, latencyMs }, extra, { checkedAt });
+    if (st === 404) return onlineBut({ statusSupported: false });
+    if (st === 401 || st === 403) return onlineBut({ authFailed: true, error: '状态鉴权失败（HTTP ' + st + '）' });
+    if (st >= 500 && st <= 599) return onlineBut({ degraded: true, error: '服务器异常（HTTP ' + st + '）' });
+    if (st !== 200) return offline('服务器异常（HTTP ' + st + '）');
+    if (body.over) return offline('服务器返回格式异常');
     let raw;
-    try { raw = JSON.parse(text); } catch { return offline('服务器返回格式异常'); }
+    try { raw = JSON.parse(body.text); } catch { return offline('服务器返回格式异常'); }
     if (!raw || typeof raw !== 'object' || raw.ok === false) return offline('服务器返回格式异常');
     return Object.assign({ ok: true, online: true, latencyMs, statusSupported: true }, sanitizeServerStatus(raw), { checkedAt });
   } finally {
@@ -1953,35 +2003,59 @@ export function _resetServerStatusCache() {
   serverStatusMemo.clear();
 }
 
-async function handleServerStatus(request, env, ctx) {
-  const headers = {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
-    'Cache-Control': 'public, max-age=' + SERVER_STATUS_TTL,
-  };
-  const memoKey = mergeBase(env) + '|' + (mergeToken(env) ? '1' : '0');
-  const memo = serverStatusMemo.get(memoKey);
-  if (memo && Date.now() - memo.at < SERVER_STATUS_TTL * 1000) {
-    return new Response(JSON.stringify(memo.body), { status: 200, headers });
-  }
+// 先查 Cache API，没有再问 EC2 并写回缓存。整个过程只在单飞 Promise 里跑一次。
+async function loadServerStatus(request, env, ctx) {
   const cache = typeof caches !== 'undefined' && caches && caches.default ? caches.default : null;
   const cacheKey = new Request(new URL('/api/server-status', request.url).toString(), { method: 'GET' });
   if (cache) {
     try {
       const hit = await cache.match(cacheKey);
-      if (hit) return hit;
+      if (hit) return await hit.json();
     } catch {}
   }
   const body = await fetchServerStatus(env);
-  serverStatusMemo.set(memoKey, { at: Date.now(), body });
-  const resp = new Response(JSON.stringify(body), { status: 200, headers });
   if (cache) {
     try {
-      const p = cache.put(cacheKey, resp.clone());
-      if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(p); else await p;
+      const p = cache.put(cacheKey, new Response(JSON.stringify(body), {
+        headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'public, max-age=' + SERVER_STATUS_TTL },
+      }));
+      if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(p.catch(() => {})); else await p;
     } catch {}
   }
-  return resp;
+  return body;
+}
+
+async function handleServerStatus(request, env, ctx) {
+  const memoKey = mergeBase(env) + '|' + (mergeToken(env) ? '1' : '0');
+  let entry = serverStatusMemo.get(memoKey);
+  const fresh = entry && (!entry.done || Date.now() - entry.at < SERVER_STATUS_TTL * 1000);
+  if (!fresh) {
+    // 同步登记，后续并发请求直接复用这个 Promise
+    const e = { done: false, at: 0, promise: null };
+    e.promise = loadServerStatus(request, env, ctx).then(
+      (body) => { e.done = true; e.at = Date.now(); return body; },
+      (err) => { if (serverStatusMemo.get(memoKey) === e) serverStatusMemo.delete(memoKey); throw err; },
+    );
+    serverStatusMemo.set(memoKey, e);
+    entry = e;
+  }
+  let body;
+  try {
+    body = await entry.promise;
+  } catch {
+    body = { ok: true, online: false, latencyMs: null, error: '无法连接服务器', checkedAt: Date.now() };
+  }
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'public, max-age=' + SERVER_STATUS_TTL },
+  });
+}
+
+function handlePing() {
+  return new Response(JSON.stringify({ ok: true, t: Date.now() }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
+  });
 }
 
 /* Experimental direct parse (no RedFox): Worker fetches YouTube InnerTube
@@ -2036,7 +2110,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    if (url.pathname === '/api/ping') return json({ ok: true, t: Date.now() });
+    if (url.pathname === '/api/ping') return handlePing();
     if (url.pathname === '/api/server-status') return handleServerStatus(request, env, ctx);
 
     if (url.pathname === '/api/parse') return handleParse(request, env);

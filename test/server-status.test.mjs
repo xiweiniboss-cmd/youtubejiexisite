@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
-import worker, { fetchServerStatus, sanitizeServerStatus, _resetServerStatusCache } from '../_worker.js';
+import worker, { fetchServerStatus, sanitizeServerStatus, _resetServerStatusCache, SERVER_STATUS_MAX_BODY } from '../_worker.js';
 
 const TOKEN = 'merge-token-SECRET-123';
 const GB = 1073741824;
@@ -37,6 +37,7 @@ test('server-status: online with full data, token sent as X-Merge-Token, percent
     const { resp, text, body } = await callRoute({ YT_MERGE_TOKEN: ' ' + TOKEN + ' ', YT_MERGE_BASE: 'http://ec2.example:30002/' });
     assert.equal(resp.status, 200);
     assert.match(resp.headers.get('Cache-Control'), /max-age=15/);
+    assert.equal(resp.headers.get('Access-Control-Allow-Origin'), null);
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, 'http://ec2.example:30002/status');
     assert.equal(calls[0].headers.get('X-Merge-Token'), TOKEN);
@@ -94,13 +95,12 @@ test('server-status: timeout -> online:false, latencyMs:null, Chinese error', as
   });
 });
 
-test('server-status: unreachable / 530 / 500 / non-JSON -> online:false with HTTP 200', async () => {
+test('server-status: unreachable / 530 / non-JSON / other status -> online:false with HTTP 200', async () => {
   const cases = [
     [async () => { throw new TypeError('connect ECONNREFUSED ' + TOKEN); }, '无法连接服务器'],
     [async () => new Response('error code: 1016', { status: 530 }), '服务器不可达'],
-    [async () => new Response('boom', { status: 500 }), '服务器异常（HTTP 500）'],
     [async () => new Response('<html>hi</html>', { status: 200 }), '服务器返回格式异常'],
-    [async () => new Response('denied', { status: 403 }), '口令不匹配（HTTP 403）'],
+    [async () => new Response('moved', { status: 302, headers: { Location: '/x' } }), '服务器异常（HTTP 302）'],
   ];
   for (const [fake, msg] of cases) {
     await withFetch(fake, async () => {
@@ -131,46 +131,170 @@ test('api/ping returns ok + timestamp with no-store', async () => {
   const before = Date.now();
   const { resp, body } = await callRoute({}, '/api/ping');
   assert.equal(resp.headers.get('Cache-Control'), 'no-store');
+  assert.equal(resp.headers.get('Access-Control-Allow-Origin'), null);
   assert.equal(body.ok, true);
   assert.ok(body.t >= before);
 });
 
-test('index.html: server status card renders online, 404 and offline states', async () => {
+test('server-status: EC2 401/403 -> online:true, authFailed:true, no stats', async () => {
+  for (const st of [401, 403]) {
+    await withFetch(async () => new Response('denied ' + TOKEN, { status: st }), async () => {
+      const { resp, body, text } = await callRoute({ YT_MERGE_TOKEN: TOKEN });
+      assert.equal(resp.status, 200);
+      assert.equal(body.online, true);
+      assert.equal(body.authFailed, true);
+      assert.equal(typeof body.latencyMs, 'number');
+      assert.equal(body.mem, undefined);
+      assert.equal(body.jobs, undefined);
+      assert.equal(body.error, '状态鉴权失败（HTTP ' + st + '）');
+      assert.ok(!text.includes(TOKEN));
+    });
+  }
+});
+
+test('server-status: EC2 5xx -> online:true, degraded:true; 530/1016 stays offline', async () => {
+  for (const st of [500, 502, 503]) {
+    await withFetch(async () => new Response('boom', { status: st }), async () => {
+      const { body } = await callRoute({ YT_MERGE_TOKEN: TOKEN });
+      assert.equal(body.online, true);
+      assert.equal(body.degraded, true);
+      assert.equal(body.error, '服务器异常（HTTP ' + st + '）');
+      assert.equal(body.cpu, undefined);
+    });
+  }
+  await withFetch(async () => new Response('<h1>Error 1016</h1> Origin DNS error', { status: 502 }), async () => {
+    const { body } = await callRoute({ YT_MERGE_TOKEN: TOKEN });
+    assert.equal(body.online, false);
+    assert.equal(body.error, '服务器不可达');
+  });
+});
+
+test('server-status: single-flight — 50 concurrent requests share one EC2 fetch (EC2 delayed 300ms)', async () => {
+  let calls = 0;
+  await withFetch(async () => {
+    calls++;
+    await new Promise((r) => setTimeout(r, 300));
+    return new Response(JSON.stringify(FULL), { status: 200 });
+  }, async () => {
+    const env = { YT_MERGE_TOKEN: TOKEN, YT_MERGE_BASE: 'http://ec2.single:30002' };
+    const results = await Promise.all(Array.from({ length: 50 }, () => callRoute(env)));
+    assert.equal(calls, 1);
+    for (const r of results) {
+      assert.equal(r.resp.status, 200);
+      assert.equal(r.body.online, true);
+      assert.equal(r.body.cpu.percent, 75);
+      assert.ok(!r.text.includes(TOKEN));
+    }
+    // 缓存窗口内再来一批也不打 EC2
+    await Promise.all(Array.from({ length: 10 }, () => callRoute(env)));
+    assert.equal(calls, 1);
+  });
+});
+
+test('server-status: body over 16KB -> 服务器返回格式异常 and the stream is not fully read', async () => {
+  let pulled = 0;
+  await withFetch(async () => {
+    const chunk = new TextEncoder().encode('{"ok":true,"pad":"' + 'x'.repeat(4096));
+    const stream = new ReadableStream({
+      pull(ctrl) { pulled++; if (pulled > 1000) ctrl.close(); else ctrl.enqueue(chunk); },
+    });
+    return new Response(stream, { status: 200 });
+  }, async () => {
+    const body = await fetchServerStatus({ YT_MERGE_TOKEN: TOKEN });
+    assert.equal(body.online, false);
+    assert.equal(body.error, '服务器返回格式异常');
+    assert.ok(pulled < 20, 'pulled ' + pulled);
+  });
+  // 刚好 16KB 以内的正常 JSON 不受影响
+  const padded = JSON.stringify(Object.assign({}, FULL, { pad: 'y'.repeat(SERVER_STATUS_MAX_BODY - 400) }));
+  assert.ok(padded.length <= SERVER_STATUS_MAX_BODY);
+  await withFetch(async () => new Response(padded, { status: 200 }), async () => {
+    const body = await fetchServerStatus({ YT_MERGE_TOKEN: TOKEN });
+    assert.equal(body.online, true);
+    assert.equal(body.mem.percent, 25);
+  });
+});
+
+test('index.html: card is collapsed by default; online / auth / 5xx / 404 / offline states; toggle; ping median', async () => {
   const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
   assert.match(html, /本站已解析 <b id="parseCount">-<\/b> 次<\/p>\n  <\/section>\n\n  <!-- 服务器状态/);
-  const script = html.split('<script>').map((s) => s.split('</script>')[0]).find((s) => s.includes("$('srvCard')"));
+  assert.match(html, /id="srvDetail" style="display:none"/);
+  assert.match(html, /详情 ▾/);
+  const script = html.split('<script>').map((x) => x.split('</script>')[0]).find((x) => x.includes("$('srvCard')"));
   assert.ok(script);
-  const ids = [...html.matchAll(/id="(srv[A-Za-z]+)"/g)].map((m) => m[1]);
-  async function run(statusBody) {
+  const ids = [...html.matchAll(/id="(srv[A-Za-z0-9]+)"/g)].map((m) => m[1]);
+  async function run(statusBody, pingFails = 0) {
     const els = {};
-    for (const id of ids) els[id] = { textContent: '-', innerHTML: '-', className: '', style: { display: '', width: '' } };
-    els.srvCard = { style: {} };
+    for (const id of ids) els[id] = { textContent: '-', innerHTML: '-', className: '', style: { display: '', width: '' }, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } };
+    els.srvDetail.style.display = 'none';
+    let pings = 0, clock = 0;
     const ctx = {
       document: { hidden: false, getElementById: (id) => els[id] || null, addEventListener() {} },
-      window: {},
+      window: { performance: { now: () => clock } },
+      performance: { now: () => clock },
       Date, Math, Promise, isFinite, String,
       setInterval: () => 1, clearInterval() {},
-      fetch: async (url) => ({ ok: true, json: async () => (String(url).startsWith('/api/ping') ? { ok: true, t: 1 } : statusBody) }),
+      fetch: async (url) => {
+        if (String(url).startsWith('/api/ping')) {
+          pings++;
+          clock += [0, 10, 100, 30][pings] || 0; // 每次 ping 的耗时：10 / 100 / 30
+          if (pings <= pingFails) throw new Error('net');
+          return { ok: true, json: async () => ({ ok: true, t: 1 }) };
+        }
+        return { ok: true, json: async () => statusBody };
+      },
     };
     vm.runInNewContext(script, ctx);
     await new Promise((r) => setTimeout(r, 20));
     return els;
   }
-  let e = await run({ ok: true, online: true, statusSupported: true, latencyMs: 42, mem: { total: 4 * GB, used: GB, percent: 25 }, cpu: { load1: 0.5, cores: 2, percent: 25 }, disk: { total: 40 * GB, used: 10 * GB, percent: 25 }, jobs: { running: 1, queued: 0 } });
+  const ONLINE = { ok: true, online: true, statusSupported: true, latencyMs: 42, mem: { total: 4 * GB, used: GB, percent: 25 }, cpu: { load1: 0.5, cores: 2, percent: 25 }, disk: { total: 40 * GB, used: 10 * GB, percent: 25 }, jobs: { running: 1, queued: 0 } };
+  let e = await run(ONLINE);
   assert.equal(e.srvOnline.textContent, '在线');
   assert.equal(e.srvDot.className, 'srv-dot on');
-  assert.match(e.srvLat.innerHTML, /^42/);
-  assert.match(e.srvPing.innerHTML, /ms/);
+  assert.equal(e.srvLat.textContent, '42ms');
+  assert.equal(e.srvPing.textContent, '30ms'); // 10/100/30 的中位数
+  assert.equal(e.srvDetail.style.display, 'none');
   assert.equal(e.srvMemBar.style.width, '25%');
   assert.match(e.srvMem.innerHTML, /25%.*1\.0\/4\.0 GB/);
   assert.equal(e.srvRun.textContent, '1');
   assert.equal(e.srvQueue.textContent, '0');
+  e.srvToggle.onclick();
+  assert.equal(e.srvDetail.style.display, '');
+  assert.equal(e.srvToggle.textContent, '收起 ▴');
+  assert.equal(e.srvToggle.attrs['aria-expanded'], 'true');
+  e.srvToggle.onclick();
+  assert.equal(e.srvDetail.style.display, 'none');
+  assert.equal(e.srvToggle.textContent, '详情 ▾');
+
+  // 第 1 次 ping 失败：取剩下两次（100、30）的中位数 65；全失败才是 "-"
+  e = await run(ONLINE, 1);
+  assert.equal(e.srvPing.textContent, '65ms');
+  e = await run(ONLINE, 3);
+  assert.equal(e.srvPing.textContent, '-');
+
+  e = await run({ ok: true, online: true, latencyMs: 41, authFailed: true, error: '状态鉴权失败（HTTP 403）' });
+  assert.equal(e.srvOnline.textContent, '在线 · 状态鉴权失败');
+  assert.equal(e.srvDot.className, 'srv-dot warn');
+  assert.equal(e.srvLine.className, 'srv-line long');
+  assert.equal(e.srvLat.textContent, '41ms');
+  assert.equal(e.srvBars.style.display, 'none');
+  assert.equal(e.srvJobs.style.display, 'none');
+
+  e = await run({ ok: true, online: true, latencyMs: 44, degraded: true, error: '服务器异常（HTTP 500）' });
+  assert.equal(e.srvOnline.textContent, '在线 · 异常');
+  assert.equal(e.srvDot.className, 'srv-dot warn');
+
   e = await run({ ok: true, online: true, statusSupported: false, latencyMs: 30 });
+  assert.equal(e.srvOnline.textContent, '在线 · 未提供详细状态');
+  assert.equal(e.srvDot.className, 'srv-dot na');
   assert.equal(e.srvBars.style.display, 'none');
   assert.equal(e.srvNote.textContent, '服务器暂未提供详细状态');
+
   e = await run({ ok: true, online: false, latencyMs: null, error: '连接超时' });
   assert.equal(e.srvOnline.textContent, '离线');
   assert.equal(e.srvDot.className, 'srv-dot off');
   assert.equal(e.srvLat.textContent, '-');
   assert.equal(e.srvMem.textContent, '-');
+  assert.equal(e.srvLine.className, 'srv-line');
 });
