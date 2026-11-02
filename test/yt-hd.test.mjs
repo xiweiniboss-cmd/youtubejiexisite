@@ -19,7 +19,10 @@ import worker, {
   rfc5987,
   dispositionFilename,
   withKnownLength,
+  directProbeRange,
+  DIRECT_LIMITED_MSG,
 } from '../_worker.js';
+import vm from 'node:vm';
 import { spawnSync } from 'node:child_process';
 
 if (!globalThis.crypto?.subtle) globalThis.crypto = webcrypto;
@@ -739,7 +742,7 @@ test('ytdl falls back to the parse-time url when re-resolve misses or media is 4
     const body = await denied.json();
     assert.match(body.error, /直链失效/);
     assert.match(body.error, /403/);
-    assert.match(body.error, /复制直链/);
+    assert.doesNotMatch(body.error, /复制直链|Safari/);
     assert.match(body.error, /服务器合并/);
     assert.match(body.error, /都失败了/);
   } finally {
@@ -791,7 +794,7 @@ test('non-JSON merge 500 becomes a Chinese origin-down error', async () => {
     assert.equal(body.code, 'MERGE_ORIGIN_DOWN');
     assert.match(body.error, /合并服务器连不上或内部出错/);
     assert.match(body.error, /HTTP 500/);
-    assert.match(body.error, /复制直链/);
+    assert.doesNotMatch(body.error, /复制直链|Safari/);
     assert.equal(JSON.stringify(body).includes('local-test-token'), false);
   } finally {
     globalThis.fetch = orig;
@@ -1127,4 +1130,180 @@ test('withKnownLength skips FixedLengthStream when upstream has Content-Encoding
   } finally {
     delete globalThis.FixedLengthStream;
   }
+});
+
+// ---- 直链尾部探测（Worker 签发的直链只给开头一段） ----
+const BIG_V = 50_000_000, BIG_A = 9_000_000;
+function playerFor(name, opts = {}) {
+  const base = 'https://rr1.googlevideo.com/' + name;
+  return {
+    playabilityStatus: { status: 'OK' },
+    videoDetails: { title: 't' },
+    streamingData: {
+      adaptiveFormats: [
+        { url: base + '/v', mimeType: 'video/mp4; codecs="avc1.640028"', height: 1080, width: 1920, contentLength: opts.noSize ? undefined : String(BIG_V), bitrate: 100, itag: 137 },
+        { url: base + '/a', mimeType: 'audio/mp4; codecs="mp4a.40.2"', contentLength: opts.noSize ? undefined : String(BIG_A), bitrate: 50, itag: 140 },
+      ],
+    },
+  };
+}
+// limitedFor: 这些客户端签的直链在尾部返回 403。probes 记下每次媒体探测。
+function directMock({ limitedFor = [], mediaStatus, mediaThrow = false, hang = false, players = [], probes = [], noSize = false }) {
+  return async (url, init) => {
+    const u = String(url);
+    if (u.includes('sw.js_data')) return new Response('none', { status: 200 });
+    if (u.includes('/youtubei/v1/player')) {
+      const name = JSON.parse(init.body).context.client.clientName;
+      players.push({ name, cookie: init.headers.Cookie || '' });
+      return playerJson(playerFor(name, { noSize }));
+    }
+    if (u.includes('googlevideo.com')) {
+      const name = u.split('/')[3];
+      probes.push({ url: u, range: init?.headers?.Range, ua: init?.headers?.['User-Agent'], cookie: init?.headers?.Cookie || '' });
+      if (hang) {
+        return new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(new Error('aborted'))));
+      }
+      if (mediaThrow) throw new Error('network down');
+      if (limitedFor.includes(name)) return new Response('denied', { status: 403 });
+      return new Response(new Uint8Array(1024), { status: mediaStatus || 206 });
+    }
+    return new Response('nope', { status: 404 });
+  };
+}
+
+test('directProbeRange asks for the last 1 KB, or 1 KB at 8 MB when the size is unknown', () => {
+  assert.equal(directProbeRange(50_000_000), 'bytes=49998976-49999999');
+  assert.equal(directProbeRange('9000000'), 'bytes=8998976-8999999');
+  assert.equal(directProbeRange(0), 'bytes=8388608-8389631');
+  assert.equal(directProbeRange(undefined), 'bytes=8388608-8389631');
+  assert.equal(directProbeRange(100), 'bytes=8388608-8389631');
+});
+
+test('yt-hd probes the tail of video and audio before returning direct links', async () => {
+  const probes = [], players = [];
+  const r = await withFetch(directMock({ probes, players }), () => worker.fetch(new Request('https://example.com/api/yt-hd?url=https://youtu.be/WeiM_vffWAw'), {}));
+  const b = await r.json();
+  assert.equal(r.status, 200);
+  assert.equal(b.ok, true);
+  assert.equal(b.directOk, true);
+  assert.equal(b.client, 'vr');
+  assert.deepEqual(players.map((p) => p.name), ['ANDROID_VR']);
+  assert.deepEqual(probes.map((p) => p.range).sort(), ['bytes=49998976-49999999', 'bytes=8998976-8999999']);
+  assert.ok(probes.every((p) => /oculus/.test(p.ua) && !p.cookie));
+});
+
+test('yt-hd: tail 403 on ANDROID_VR switches to TVHTML5 (before IOS), no cookie sent to anonymous clients', async () => {
+  const probes = [], players = [];
+  const r = await withFetch(directMock({ limitedFor: ['ANDROID_VR'], probes, players }), () => worker.fetch(new Request('https://example.com/api/yt-hd?url=WeiM_vffWAw'), {}));
+  const b = await r.json();
+  assert.equal(r.status, 200);
+  assert.equal(b.directOk, true);
+  assert.equal(b.client, 'tv');
+  assert.match(b.video.url, /TVHTML5/);
+  assert.match(b.audio.url, /TVHTML5/);
+  assert.deepEqual(players.map((p) => p.name), ['ANDROID_VR', 'TVHTML5']);
+  assert.ok(players.every((p) => !p.cookie));
+});
+
+test('yt-hd: every client tail-403s -> DIRECT_LIMITED with directOk:false, IOS tried last, serverMerge only with token', async () => {
+  const players = [];
+  const all = ['ANDROID_VR', 'TVHTML5', 'IOS', 'ANDROID'];
+  const r = await withFetch(directMock({ limitedFor: all, players }), () => worker.fetch(new Request('https://example.com/api/yt-hd?url=WeiM_vffWAw'), { YT_MERGE_TOKEN: 'local-test-token' }));
+  const b = await r.json();
+  assert.equal(r.status, 503);
+  assert.equal(b.ok, false);
+  assert.equal(b.directOk, false);
+  assert.equal(b.code, 'DIRECT_LIMITED');
+  assert.equal(b.error, DIRECT_LIMITED_MSG);
+  assert.equal(b.serverMerge, true);
+  assert.equal(b.video, undefined);
+  assert.deepEqual(players.map((p) => p.name), ['ANDROID_VR', 'TVHTML5', 'IOS']);
+  assert.ok(b.tried.includes('vr:direct403'));
+  assert.ok(b.tried.includes('ios:direct403'));
+  assert.equal(JSON.stringify(b).includes('local-test-token'), false);
+  const r2 = await withFetch(directMock({ limitedFor: all }), () => worker.fetch(new Request('https://example.com/api/yt-hd?url=WeiM_vffWAw'), {}));
+  const b2 = await r2.json();
+  assert.equal(b2.code, 'DIRECT_LIMITED');
+  assert.equal(b2.serverMerge, undefined);
+});
+
+test('yt-hd: probe network error, 5xx, 416 or timeout does not drop a working result', async () => {
+  for (const opts of [{ mediaThrow: true }, { mediaStatus: 500 }, { mediaStatus: 416, noSize: true }]) {
+    const players = [];
+    const r = await withFetch(directMock({ ...opts, players }), () => worker.fetch(new Request('https://example.com/api/yt-hd?url=WeiM_vffWAw'), {}));
+    const b = await r.json();
+    assert.equal(b.ok, true, JSON.stringify(opts));
+    assert.equal(b.directOk, true);
+    assert.deepEqual(players.map((p) => p.name), ['ANDROID_VR']);
+  }
+  const old = ytHdTiming.probeTimeoutMs;
+  ytHdTiming.probeTimeoutMs = 20;
+  try {
+    const t0 = Date.now();
+    const r = await withFetch(directMock({ hang: true }), () => worker.fetch(new Request('https://example.com/api/yt-hd?url=WeiM_vffWAw'), {}));
+    const b = await r.json();
+    assert.equal(b.ok, true);
+    assert.ok(Date.now() - t0 < 2000);
+  } finally {
+    ytHdTiming.probeTimeoutMs = old;
+  }
+});
+
+// ---- 前端：直链受限 / 403 自动改用服务器合并，不再让人「复制直链用 Safari 打开」 ----
+function frontendFns() {
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const grab = (name) => {
+    const i = html.indexOf('  function ' + name + '(');
+    assert.ok(i >= 0, name);
+    const j = html.indexOf('\n  }\n', i);
+    return html.slice(i, j + 4);
+  };
+  const started = [];
+  const nodes = {};
+  const ctx = {
+    started, nodes, hidden: 0,
+    resList: { firstChild: null, insertBefore(n) { this.firstChild = n; nodes[n.id] = n; } },
+    document: {
+      getElementById: (id) => nodes[id] || null,
+      createElement: () => ({ style: {}, innerHTML: '' }),
+    },
+    hideError() { ctx.hidden++; },
+    startServerMerge(url, q, mode, label, onStatus) { started.push({ url, q, mode, label }); onStatus('合并中…'); },
+  };
+  vm.createContext(ctx);
+  const constLine = /  var DIRECT_LIMITED_NOTE = [^\n]+\n/.exec(html)[0];
+  vm.runInContext(grab('isDirectLimited') + constLine + grab('autoServerMerge'), ctx);
+  return { html, ctx };
+}
+
+test('index.html: isDirectLimited recognises 403 / DIRECT_LIMITED, autoServerMerge starts a server merge with the note', () => {
+  const { ctx } = frontendFns();
+  const lim = (e) => vm.runInContext('isDirectLimited(' + JSON.stringify(e) + ')', ctx);
+  assert.equal(lim({ message: 'HTTP 403' }), true);
+  assert.equal(lim({ message: '直链失效（HTTP 403）。YouTube 限制了这条直链，请改用「服务器合并」。' }), true);
+  assert.equal(lim({ code: 'DIRECT_LIMITED', message: 'x' }), true);
+  assert.equal(lim({ message: 'HTTP 410' }), true);
+  assert.equal(lim({ message: 'HTTP 4030' }), false);
+  assert.equal(lim({ message: '网络错误' }), false);
+  assert.equal(lim({ message: 'HTTP 500' }), false);
+  assert.equal(vm.runInContext("autoServerMerge('', 1080)", ctx), false);
+  assert.equal(ctx.started.length, 0);
+  assert.equal(vm.runInContext("autoServerMerge('WeiM_vffWAw', 1080)", ctx), true);
+  assert.deepEqual(ctx.started[0], { url: 'https://youtu.be/WeiM_vffWAw', q: '1080', mode: 'merged', label: '1080P 含声音' });
+  assert.match(ctx.nodes.autoMergeNote.innerHTML, /直链受限，已自动改用服务器合并/);
+  assert.match(ctx.nodes.autoMergeNote.innerHTML, /合并中/);
+  vm.runInContext("autoServerMerge('abc', 360)", ctx);
+  assert.equal(ctx.started[1].q, '720');
+});
+
+test('index.html wires DIRECT_LIMITED and phone-merge 403 to server merge and drops the copy-link-to-Safari hints', () => {
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  assert.doesNotMatch(html, /复制直链」(粘贴到|用) ?Safari/);
+  assert.doesNotMatch(html, /请点(下方|下面的|右侧)?「(🔗 )?复制直链」/);
+  assert.match(html, /hdErr\.directLimited = !!\(h && \(h\.directOk === false \|\| h\.code === 'DIRECT_LIMITED'\)\)/);
+  assert.match(html, /e\.serverMerge && \(e\.directLimited \|\| code === 'DIRECT_LIMITED'\)\) \{\s*offerServerMerge\(hdSlot, d, best, '⚠️ ' \+ DIRECT_LIMITED_NOTE/);
+  assert.match(html, /if \(isDirectLimited\(e\) && autoServerMerge\(vid, v\.height \|\| resHeight\(v\)\)\) return;\s*showError\('合并下载失败：/);
+  assert.match(html, /if \(isDirectLimited\(e\) && spec && spec\.v && spec\.height > 0 && autoServerMerge\(spec\.v, spec\.height\)\) return;/);
+  // 复制直链按钮本身保留
+  assert.match(html, /copyBtn\.textContent = '🔗 复制直链'/);
 });

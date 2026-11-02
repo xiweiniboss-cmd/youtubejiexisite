@@ -281,10 +281,36 @@ var deviceId = (function(){
     if (/HTTP\s*40[13]|HTTP\s*410/.test(m)) return '直链失效（' + m + '），请重新解析后再试';
     return m;
   }
+  // 直链被 YouTube 限制（只给开头一段，往后 401/403/410）：手机里下载/合并没法继续，改走服务器合并。
+  function isDirectLimited(e){
+    if (e && e.code === 'DIRECT_LIMITED') return true;
+    var m = String((e && e.message) || e || '');
+    return /直链失效|直链受限|HTTP\s*(401|403|410)\b/.test(m);
+  }
+  var DIRECT_LIMITED_NOTE = '直链受限，已自动改用服务器合并';
+  // 自动改用服务器合并：在解析结果最上面放一条状态，进度也写在这里。没有视频 ID 时返回 false，由调用方显示原错误。
+  function autoServerMerge(vid, height){
+    if (!vid || typeof startServerMerge !== 'function') return false;
+    var q = (+height || 0) >= 1080 ? 1080 : 720;
+    var box = document.getElementById('autoMergeNote');
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'autoMergeNote';
+      box.className = 'hint';
+      box.style.cssText = 'color:#ffcf6b;font-weight:700;margin-top:10px';
+      resList.insertBefore(box, resList.firstChild);
+    }
+    var head = '⚠️ ' + DIRECT_LIMITED_NOTE + '（' + q + 'P 含声音，大约几分钟，页面不要关）。';
+    box.innerHTML = head;
+    hideError();
+    startServerMerge('https://youtu.be/' + vid, String(q), 'merged', q + 'P 含声音', function(html){ box.innerHTML = head + '<br>' + html; });
+    return true;
+  }
   function streamSpec(stream, vid, client){
     var itag = stream && (stream.itag || itagOf(stream));
     if (!vid || !itag) return null;
-    return { v: vid, itag: itag, client: client || '' };
+    // height 只给前端「直链受限→自动服务器合并」选清晰度用，/api/ytdl 不读它。
+    return { v: vid, itag: itag, client: client || '', height: (stream && (+stream.height || resHeight(stream))) || 0 };
   }
   function ytdlProxyUrl(url, filename, ua, spec){
     if (spec && spec.v && spec.itag) {
@@ -416,8 +442,9 @@ var deviceId = (function(){
     }).catch(function(e){
       resetParseBtn();
       hideDlProg();
-      showError('下载失败：' + formatDlError(e) +
-        '<br><br>💡 可点右侧「🔗 复制直链」粘贴到 Safari 直接打开播放。<br>💡 直链有时效，超时请重新解析。');
+      // 纯音频没有画面高度，不替它去合并视频。
+      if (isDirectLimited(e) && spec && spec.v && spec.height > 0 && autoServerMerge(spec.v, spec.height)) return;
+      showError('下载失败：' + formatDlError(e) + '<br><br>💡 直链有时效，超时请重新解析。');
     });
   }
 
@@ -490,7 +517,8 @@ var deviceId = (function(){
       __hkSave(out, fileName(title + '_' + (v.height || resHeight(v) || 'HD') + 'P', 'mp4'));
     }).catch(function(e){
       hideDlProg();
-      showError('合并下载失败：' + formatDlError(e) + '<br><br>💡 请点「复制直链」用 Safari 打开。手机里合并不了时，用「服务器合并」。');
+      if (isDirectLimited(e) && autoServerMerge(vid, v.height || resHeight(v))) return;
+      showError('合并下载失败：' + formatDlError(e) + '<br><br>💡 手机里合并不了时，用「服务器合并」。');
     }).then(function(){ _merging = false; btn.disabled = false; btn.textContent = old; });
   }
 
@@ -507,7 +535,7 @@ var deviceId = (function(){
     if (h >= 1080) return 1080;
     return 720;
   }
-  function offerServerMerge(slot, d, best){
+  function offerServerMerge(slot, d, best, note){
     slot.innerHTML = '';
     var q = serverMergeQuality(best);
     var hb = document.createElement('button');
@@ -516,7 +544,7 @@ var deviceId = (function(){
     hb.textContent = '⭐ 服务器合并 ' + q + 'P（含声音）';
     var ht = document.createElement('div');
     ht.className = 'hint';
-    ht.textContent = '这部视频触发了机器人校验，手机里一键合并经常返回 403。改为服务器下载并合并，大约几分钟。如果提示合并服务器连不上，请点下面的「复制直链」。';
+    ht.textContent = note || '这部视频触发了机器人校验，手机里一键合并经常返回 403。改为服务器下载并合并，大约几分钟。';
     hb.onclick = function(){
       if (hb.disabled) return;
       hb.disabled = true;
@@ -591,6 +619,7 @@ var deviceId = (function(){
             var hdErr = new Error((h && h.error) || '没拿到可下载的视频流');
             hdErr.code = h && h.code;
             hdErr.serverMerge = !!(h && h.serverMerge);
+            hdErr.directLimited = !!(h && (h.directOk === false || h.code === 'DIRECT_LIMITED'));
             throw hdErr;
           }
           if (best && resHeight(best) >= h.video.height && bestA) { hdSlot.innerHTML = ''; return; }
@@ -622,6 +651,13 @@ var deviceId = (function(){
           var mbOld = document.getElementById('redfoxMergeBtn'); if (mbOld) { mbOld.style.display = 'none'; if (mbOld.nextSibling) mbOld.nextSibling.style.display = 'none'; }
         }).catch(function(e){
           var code = String(e && e.code || '').replace(/[^A-Z0-9_]/g, '');
+          // 直链受限：手机里合并必然中途 403，一键按钮直接换成服务器合并，RedFox 直链也不再放在前面。
+          if (e && e.serverMerge && (e.directLimited || code === 'DIRECT_LIMITED')) {
+            offerServerMerge(hdSlot, d, best, '⚠️ ' + DIRECT_LIMITED_NOTE + '：YouTube 只给这条视频的开头一小段，手机里合并会中途失败。点上面按钮由服务器下载并合并，大约几分钟。');
+            var mbL = document.getElementById('redfoxMergeBtn');
+            if (mbL) { mbL.style.display = 'none'; if (mbL.nextSibling) mbL.nextSibling.style.display = 'none'; }
+            return;
+          }
           if (e && e.serverMerge && (code === 'BOT_CHECK' || code === 'UNAVAILABLE')) {
             var smBtn = offerServerMerge(hdSlot, d, best);
             if (best && isProgressive(best)) {
@@ -644,8 +680,7 @@ var deviceId = (function(){
             if (mbOld) { mbOld.style.display = 'none'; if (mbOld.nextSibling) mbOld.nextSibling.style.display = 'none'; }
             return;
           }
-          var tail = (code === 'BOT_CHECK' || code === 'UNAVAILABLE') ? '<br>请点下方「复制直链」用 Safari 打开。' : '';
-          hdSlot.innerHTML = '<div class="hint">⚠️ ' + hdFailText(e) + tail + '</div>';
+          hdSlot.innerHTML = '<div class="hint">⚠️ ' + hdFailText(e) + '</div>';
         });
       }
       if (best && bestA && window.YTMerge) {
@@ -955,7 +990,7 @@ var deviceId = (function(){
           var down = j.code === 'MERGE_ORIGIN_DOWN' || /连不上|内部出错/.test(j.error || '') || res.status >= 500;
           var tail = res.status === 429
             ? '（服务器一次只能合一个）'
-            : (down ? '<br>合并服务器连不上。请点「复制直链」用 Safari 打开。' : '<br>请点「复制直链」用 Safari 打开。');
+            : (down ? '<br>合并服务器连不上，请稍后再试。' : '');
           status('提交失败：' + (j.error || '服务器异常') + tail);
           return;
         }
@@ -982,7 +1017,7 @@ var deviceId = (function(){
                 clearInterval(mergeTimer); mergeTimer = null;
                 resetMergeBtn();
                 var down = s.code === 'MERGE_ORIGIN_DOWN' || /连不上|内部出错/.test(s.error || '');
-                status('查询失败：' + (s.error || '服务器异常') + (down ? '<br>合并服务器连不上。请点「复制直链」用 Safari 打开。' : '，请重新提交。'));
+                status('查询失败：' + (s.error || '服务器异常') + (down ? '<br>合并服务器连不上，请稍后再试。' : '，请重新提交。'));
                 return;
               }
               if(s.status === 'done'){
@@ -994,7 +1029,7 @@ var deviceId = (function(){
               } else if(s.status === 'error'){
                 clearInterval(mergeTimer); mergeTimer = null;
                 resetMergeBtn();
-                status('合并失败：' + (s.error || '服务器异常') + '。请点「复制直链」用 Safari 打开，或稍后重新提交。');
+                status('合并失败：' + (s.error || '服务器异常') + '。请稍后重新提交。');
               } else {
                 status('合并中…已等 ' + fmtElapsed(elapsed) + '（服务器正在下载并合并，页面不要关）。');
               }
@@ -1006,7 +1041,7 @@ var deviceId = (function(){
       })
       .catch(function(e){
         resetMergeBtn();
-        status('提交失败：' + (e.message || '网络错误') + '<br>若合并服务器连不上，请点「复制直链」用 Safari 打开。');
+        status('提交失败：' + (e.message || '网络错误') + '<br>合并服务器可能连不上，请稍后再试。');
       });
   }
   mergeBtn.onclick = function(){
