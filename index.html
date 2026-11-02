@@ -320,6 +320,20 @@ var deviceId = (function(){
   // 下载完成后保存：iPhone 的分享菜单必须由“点击”直接触发，下载几十秒后再自动调用会被系统静默拒绝，
   // 所以自动尝试一次，失败就亮出「点这里保存」按钮让用户再点一下（新的点击一定能弹出）。
   var _pendingFile = null;
+  // 微信 / QQ / 微博 / 抖音等内置浏览器：既不支持 navigator.share 文件，也不认 blob 下载，点了没反应，存不进相册。
+  var IN_APP_UA = /MicroMessenger|QQ\/|MQQBrowser.*QQ|Weibo|DingTalk|aweme|BytedanceWebview|AlipayClient|XiaoHongShu|Lark/i;
+  function isInAppBrowser(){ return IN_APP_UA.test(navigator.userAgent || ''); }
+  var IS_IOS = /iPhone|iPad|iPod/i.test(navigator.userAgent || '') || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  function showSaveFallbackHint(file){
+    if (/\.m4a$/i.test(file.name)) {
+      dlHint.innerHTML = '🎵 这是纯音频文件（m4a），相册只收视频，音频会存到「文件」/「下载」里。要带画面的请点上面的视频按钮。';
+    } else if (IS_IOS) {
+      dlHint.innerHTML = '📁 这个浏览器没弹出分享菜单，视频已存到「文件」App →「下载」。<br>打开「文件」App 找到 <b>' + file.name.replace(/[<>&"]/g, '') + '</b>，点左下角分享 →「存储视频」，就进相册了。<br>💡 用 Safari 打开本站可以直接弹出「存储视频」。';
+    } else {
+      dlHint.innerHTML = '📁 视频已下载到手机的「下载 / Download」文件夹，相册一般会自动出现；没出现就到「文件管理 → 下载」里打开。';
+    }
+    dlHint.style.display = 'block';
+  }
   function __hkMime(name, t){
     if (/\.m4a$/i.test(name)) return 'audio/mp4';
     if (/\.mp4$/i.test(name)) return 'video/mp4';
@@ -352,6 +366,7 @@ var deviceId = (function(){
       });
     }
     __hkLink(file);
+    showSaveFallbackHint(file);
     if (fromTap) __hkHideBtn(); else __hkShowBtn(file);
   }
   function __hkSave(blob, filename){
@@ -414,6 +429,8 @@ var deviceId = (function(){
     if (mime) return /^audio/i.test(mime);
     return /audio|m4a|mp3/i.test(String(r.type || ''));
   }
+  // 18/22/37/59 是画面+声音合在一起的 MP4（H.264 + AAC），手机相册直接认
+  function isProgressive(r){ return /^(18|22|37|59)$/.test(String(itagOf(r))); }
   function isMp4(r){ var mime = urlParam(r.url, 'mime'); return !mime || /mp4/i.test(mime); }
   function resHeight(r){
     var it = itagOf(r); if (ITAG_H[it]) return ITAG_H[it];
@@ -505,7 +522,7 @@ var deviceId = (function(){
     var label = String(r.type || '');
     if (isAudio(r)) return '🎵 纯音频';
     var hh = ITAG_H[itagOf(r)];
-    if (hh) return '🎬 ' + hh + 'P' + (!/^(18|22|37|59)$/.test(String(itagOf(r))) ? ' 无声' : '');
+    if (hh) return '🎬 ' + hh + 'P' + (isProgressive(r) ? '（含声音）' : ' 无声');
     if (/2160|4k/i.test(label)) return '🎬 4K 超清';
     if (/1440|2k/i.test(label)) return '🎬 2K 超清';
     if (/1080/.test(label)) return '🎬 1080P 高清';
@@ -521,6 +538,16 @@ var deviceId = (function(){
     mediaBox.innerHTML = '';
     resList.innerHTML = '';
     dlHint.style.display = 'none';
+    dlHint.innerHTML = dlHint.getAttribute('data-default') || dlHint.innerHTML;
+    if (!dlHint.getAttribute('data-default')) dlHint.setAttribute('data-default', dlHint.innerHTML);
+
+    if (isInAppBrowser()) {
+      var warn = document.createElement('div');
+      warn.className = 'hint';
+      warn.style.cssText = 'color:#ffcf6b;font-weight:700;margin-bottom:8px';
+      warn.textContent = '⚠️ 你现在在微信/QQ 等 App 的内置浏览器里，这里保存不了视频到相册。请点右上角「···」→「在浏览器打开」（iPhone 选 Safari）再下载。';
+      mediaBox.appendChild(warn);
+    }
 
     if (d.cover) {
       var img = document.createElement('img');
@@ -586,6 +613,23 @@ var deviceId = (function(){
           var code = String(e && e.code || '').replace(/[^A-Z0-9_]/g, '');
           if (e && e.serverMerge && (code === 'BOT_CHECK' || code === 'UNAVAILABLE')) {
             offerServerMerge(hdSlot, d, best);
+            if (best && isProgressive(best)) {
+              // 机器人墙时 RedFox 往往只给 360P 合流 MP4。它本身有声音、能直接存相册，放在最前面，
+              // 服务器合并（几分钟、不一定成功）作为「想要更清晰」的次选。
+              var ph = resHeight(best) || '';
+              var pb = document.createElement('button');
+              pb.className = 'btn';
+              pb.style.cssText = 'margin-top:10px;font-size:15px;font-weight:700';
+              pb.textContent = '⭐ 直接下载 ' + ph + 'P（含声音，可存相册）';
+              pb.onclick = function(){ downloadResource(best.url, fileName((d.title || 'youtube') + '_' + ph + 'P', 'mp4'), '', streamSpec(best, d.videoId || '', '')); };
+              var pt = document.createElement('div');
+              pt.className = 'hint';
+              pt.textContent = '这条视频高清流被 YouTube 拦了，目前能秒下的是 ' + ph + 'P（画面和声音都在一个 MP4 里）。想要更清晰的再点下面的「服务器合并」，要等几分钟。';
+              hdSlot.insertBefore(pt, hdSlot.firstChild);
+              hdSlot.insertBefore(pb, hdSlot.firstChild);
+              var smBtn = hdSlot.querySelector('button.btn:not(:first-child)');
+              if (smBtn) smBtn.className = 'btn ghost';
+            }
             var mbOld = document.getElementById('redfoxMergeBtn');
             if (mbOld) { mbOld.style.display = 'none'; if (mbOld.nextSibling) mbOld.nextSibling.style.display = 'none'; }
             return;
