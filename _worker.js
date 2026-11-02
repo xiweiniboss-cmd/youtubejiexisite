@@ -328,19 +328,19 @@ function ytdlFail(status, opts = {}) {
   if (opts.both) {
     return json({
       ok: false,
-      error: '直链失效' + http + '。重新签发和解析时的直链都失败了。请点「复制直链」用 Safari 打开；若是机器人校验，请改用「服务器合并」。',
+      error: '直链失效' + http + '。重新签发和解析时的直链都失败了，请改用「服务器合并」。',
     }, 502);
   }
   if (!code) {
     return json({
       ok: false,
-      error: '直链失效：没有拿到可下载的视频流。YouTube 可能把服务器当成了机器人。请点「复制直链」用 Safari 打开，或改用「服务器合并」。',
+      error: '直链失效：没有拿到可下载的视频流。YouTube 可能把服务器当成了机器人，请改用「服务器合并」。',
     }, 502);
   }
   if (code === 401 || code === 403 || code === 410) {
     return json({
       ok: false,
-      error: '直链失效（HTTP ' + code + '）。请点「复制直链」用 Safari 打开，或改用「服务器合并」。',
+      error: '直链失效（HTTP ' + code + '）。YouTube 限制了这条直链，请改用「服务器合并」。',
     }, 502);
   }
   return json({ ok: false, error: '下载失败（HTTP ' + code + '）' }, 502);
@@ -1357,6 +1357,7 @@ function hdSuccessJson(vid, client, j, pair) {
   const v = pair.video;
   const body = {
     ok: true,
+    directOk: true,
     videoId: vid,
     client: client.key,
     title: j?.videoDetails?.title || '',
@@ -1381,7 +1382,51 @@ function hdSuccessJson(vid, client, j, pair) {
 // Cookie 只发给 MWEB / TV / WEB。已经拿到 720P 就不会因为后面的 BOT_CHECK 把结果丢掉。
 export const ytHdTiming = {
   botRetryDelaysMs: [400, 1000],
+  probeTimeoutMs: 5000,
 };
+
+// ---- 直链尾部探测 ----
+// Worker 签发的 googlevideo 直链有时只给开头约 1 分钟的字节，再往后就 403（手机合并第一块 ~8MB 音频必失败）。
+// 返回直链前，对每条流按已知大小（contentLength）请求最后 1 KB；不知道大小就请求 8 MB 处的 1 KB。
+// 只有 401/403/410 算「受限」；网络错误、超时、416、5xx 都算「判断不了」，不拦（不让探测本身把能用的结果丢掉）。
+const DIRECT_PROBE_FALLBACK_OFFSET = 8 * 1024 * 1024;
+export function directProbeRange(size) {
+  const n = +size || 0;
+  if (n >= 2048) return 'bytes=' + (n - 1024) + '-' + (n - 1);
+  return 'bytes=' + DIRECT_PROBE_FALLBACK_OFFSET + '-' + (DIRECT_PROBE_FALLBACK_OFFSET + 1023);
+}
+async function probeDirectUrl(url, size, ua, cookie) {
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), ytHdTiming.probeTimeoutMs) : null;
+  try {
+    const headers = { 'User-Agent': ua || UA_PC, Accept: '*/*', Range: directProbeRange(size) };
+    if (cookie) {
+      headers.Cookie = cookie;
+      headers.Referer = 'https://www.youtube.com/';
+      headers.Origin = 'https://www.youtube.com';
+    }
+    const r = await fetch(url, { headers, signal: ctrl ? ctrl.signal : undefined });
+    try { if (r.body) await r.body.cancel(); } catch { /* ignore */ }
+    if (r.status === 401 || r.status === 403 || r.status === 410) return { limited: true, status: r.status };
+    return { limited: false, status: r.status };
+  } catch {
+    return { limited: false, status: 0 };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+// 画面和声音（若有）都探一遍；任一条受限就算这组直链受限。
+async function probeHdHit(hit, auth) {
+  const c = hit.client;
+  const cookie = YT_COOKIE_KEYS.has(c.key) && auth.cookie ? auth.cookie : '';
+  const streams = [hit.pair.video, hit.pair.audio].filter(Boolean);
+  const res = await Promise.all(streams.map((f) => probeDirectUrl(f.url, f.contentLength, c.ua, cookie)));
+  const bad = res.find((r) => r.limited);
+  return bad ? { ok: false, status: bad.status } : { ok: true };
+}
+// 受限时换不需要 PO token 的客户端（ANDROID_VR、TVHTML5）再签一次，IOS 放最后。
+const YT_DIRECT_FALLBACK_KEYS = ['vr', 'tv', 'ios'];
+export const DIRECT_LIMITED_MSG = 'YouTube 只让服务器拿到这条视频的开头一小段（直链受限），手机里合并会在中途 403。请改用「服务器合并」。';
 
 function sleepMs(ms) {
   if (!ms) return Promise.resolve();
@@ -1464,7 +1509,25 @@ async function handleYtHd(request, env) {
     });
     if (cookieBest) best = cookieBest;
   }
-  if (best) return hdSuccessJson(vid, best.client, best.j, best.pair);
+  if (best) {
+    const probe = await probeHdHit(best, auth);
+    if (probe.ok) return hdSuccessJson(vid, best.client, best.j, best.pair);
+    tried.push(best.client.key + ':direct' + probe.status);
+    for (const key of YT_DIRECT_FALLBACK_KEYS) {
+      if (key === best.client.key) continue;
+      const c = YT_CLIENT_BY_KEY[key];
+      // 匿名客户端绝不附带 Cookie；TV 有 Cookie 时带上（与 runClientList 的规则一致）。
+      const cAuth = YT_COOKIE_KEYS.has(key) && auth.cookie ? auth : anonAuth;
+      const hit = await ytHdOnce(vid, c, '', cAuth, tried, state);
+      if (!hit) continue;
+      const p2 = await probeHdHit(hit, auth);
+      if (p2.ok) return hdSuccessJson(vid, hit.client, hit.j, hit.pair);
+      tried.push(key + ':direct' + p2.status);
+    }
+    const limited = { ok: false, directOk: false, code: 'DIRECT_LIMITED', error: DIRECT_LIMITED_MSG, tried };
+    if ((env.YT_MERGE_TOKEN || '').trim()) limited.serverMerge = true;
+    return json(limited, 503);
+  }
   const body = ytHdFailureBody(state);
   body.tried = tried;
   // 机器人墙 / 不可播时，前端可以改走已配置的服务器合并，而不是死在手机里的 403。
@@ -1692,7 +1755,7 @@ async function mergePassthrough(resp) {
       return json({
         ok: false,
         code: 'MERGE_ORIGIN_DOWN',
-        error: '合并服务器连不上或内部出错（HTTP ' + resp.status + '）。请确认 EC2 上的合并服务进程正在运行（Pages 环境变量 YT_MERGE_BASE）。可以先点「复制直链」用 Safari 打开。',
+        error: '合并服务器连不上或内部出错（HTTP ' + resp.status + '）。请确认 EC2 上的合并服务进程正在运行（Pages 环境变量 YT_MERGE_BASE）。',
       }, 502);
     }
     return json({ ok: false, error: '合并服务返回异常（HTTP ' + resp.status + '）：' + text.slice(0, 200) }, resp.status >= 400 ? resp.status : 502);
