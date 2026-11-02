@@ -1310,21 +1310,26 @@ export function findFormatByItag(player, itag) {
   return null;
 }
 
-// 自适应 avc1+音频优先；没有分离音轨时退回渐进式 MP4（itag 18/22 这类，文件里已经有声音）。
+function isAacMp4(f) {
+  const mime = String(f?.mimeType || '');
+  // audio/mp4 里只有 AAC（mp4a）能进 iPhone 相册；ec-3 / ac-3 之类也排除。没写 codecs 的老格式按 AAC 处理。
+  return /^audio\/mp4/i.test(mime) && (/mp4a/i.test(mime) || !/codecs=/i.test(mime));
+}
+
+// 只配 avc1 + AAC：iPhone 相册不认 AV1 / VP9，也不认装在 MP4 里的 Opus。
+// 没有 AAC 分离音轨时不退回 webm/Opus，改用渐进式 MP4（itag 18/22 这类，H.264 + AAC 已经合好）。
 // 只要有直链就用，不要求 playabilityStatus 一定是 OK——有的响应带着可用流却标了别的状态。
 export function pickHdPair(j) {
   const adaptive = (j?.streamingData?.adaptiveFormats || []).filter((f) => f && f.url);
   const progressive = (j?.streamingData?.formats || []).filter((f) => f && f.url);
   const vids = adaptive.filter((f) => isAvcMp4(f) && fmtHeight(f) > 0 && fmtHeight(f) <= HD_TARGET)
     .sort((a, b) => fmtHeight(b) - fmtHeight(a) || (b.bitrate || 0) - (a.bitrate || 0));
-  const auds = adaptive.filter((f) => /^audio\/mp4/i.test(f.mimeType || ''))
-    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  const audsWebm = adaptive.filter((f) => /^audio\/webm/i.test(f.mimeType || ''))
+  const auds = adaptive.filter(isAacMp4)
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
   let adaptivePair = null;
-  if (vids.length && (auds.length || audsWebm.length)) {
+  if (vids.length && auds.length) {
     const video = vids[0];
-    adaptivePair = { video, audio: auds[0] || audsWebm[0], progressive: false, height: fmtHeight(video) };
+    adaptivePair = { video, audio: auds[0], progressive: false, height: fmtHeight(video) };
   }
   const prog = progressive.filter((f) => isAvcMp4(f) && fmtHeight(f) > 0 && fmtHeight(f) <= HD_TARGET)
     .sort((a, b) => fmtHeight(b) - fmtHeight(a) || (b.bitrate || 0) - (a.bitrate || 0));
@@ -1475,6 +1480,178 @@ async function handleYtHd(request, env) {
 /* 注意：Cloudflare Worker 不能直接按 IP 调后端（会被 1003 拦截），
    所以这里用 sslip.io 主机名（解析到同一 EC2 IP），不要改回裸 IP。 */
 const MERGE_BASE_DEFAULT = 'http://3-129-45-49.sslip.io:30002';
+// 给 EC2 yt-dlp 的格式串：只要 H.264(avc1) + AAC(mp4a)，没有就要已合好的 H.264 MP4，最后才放开。
+// iPhone 相册不认 AV1(398/399)、VP9，也不认 MP4 里的 Opus。EC2 要读 body.format 才生效（旧版会忽略这个字段）。
+export function mergeFormat(quality, mode) {
+  const q = +quality || 1080;
+  // 最后一段是退路：视频根本没有 H.264 时也要能出文件，不能直接 "Requested format is not available"；
+  // 退路产物不是 H.264+AAC 的话，由 status / file 接口识别出来给中文提示（见 mergeCompat）。
+  if (mode === 'silent') return `bv*[height<=${q}][vcodec^=avc1]/b[height<=${q}][ext=mp4][vcodec^=avc1]/bv*[height<=${q}]`;
+  return `bv*[height<=${q}][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<=${q}][ext=mp4][vcodec^=avc1]/b[ext=mp4]/bv*[height<=${q}]+ba/b`;
+}
+export const MERGE_NOT_IPHONE_MSG = '服务器合并出来的是 iPhone 相册存不了的格式（{fmt}）。请改点「360P（含声音）」直接下载，或用页面上的「一键下载」在手机里合并。';
+function notIphone(fmt) {
+  return { ok: false, code: 'MERGE_NOT_IPHONE', error: MERGE_NOT_IPHONE_MSG.replace('{fmt}', fmt) };
+}
+// EC2 status 里如果带了编码字段就直接用。没有字段返回 null（放行，交给 file 接口看文件头）。
+export function mergeCodecVerdict(s) {
+  if (!s || typeof s !== 'object') return null;
+  const v = String(s.vcodec || s.video_codec || '').toLowerCase();
+  const a = String(s.acodec || s.audio_codec || '').toLowerCase();
+  const ext = String(s.ext || s.container || '').toLowerCase();
+  if (!v && !a && !ext) return null;
+  const vOk = !v || /^(avc|h264)/.test(v);
+  const aOk = !a || a === 'none' || /^(mp4a|aac)/.test(a);
+  const eOk = !ext || /^(mp4|m4v|mov)$/.test(ext);
+  if (vOk && aOk && eOk) return { ok: true };
+  return { ok: false, fmt: [v, a, ext].filter(Boolean).join(' + ') };
+}
+function u32(buf, o) {
+  return (buf[o] << 24 | buf[o + 1] << 16 | buf[o + 2] << 8 | buf[o + 3]) >>> 0;
+}
+function fourcc(buf, o) {
+  return String.fromCharCode(buf[o], buf[o + 1], buf[o + 2], buf[o + 3]);
+}
+// 按 ISO BMFF 盒子结构遍历 [from, to) 内的直接子盒子。返回 {type, start, body, end, truncated}。
+// end 是盒子声明的结尾（可能超出已读到的 buf），truncated 表示没读全。
+function mp4Boxes(buf, from, to) {
+  const out = [];
+  let o = from;
+  while (o + 8 <= to) {
+    let size = u32(buf, o);
+    const type = fourcc(buf, o + 4);
+    let hdr = 8;
+    if (size === 1) {
+      if (o + 16 > to) break;
+      size = u32(buf, o + 8) * 4294967296 + u32(buf, o + 12);
+      hdr = 16;
+    } else if (size === 0) {
+      size = to - o; // 到父盒子 / 文件结尾
+    }
+    if (size < hdr) break; // 结构坏了，不再往下猜
+    const end = o + size;
+    out.push({ type, start: o, body: o + hdr, end, truncated: end > buf.length });
+    o = end;
+  }
+  return out;
+}
+const MP4_BAD_SAMPLE = { av01: 'AV1', vp09: 'VP9', vp08: 'VP8', Opus: 'Opus', fLaC: 'FLAC' };
+// hvc1（参数集在 sample entry 里）iPhone 相册可直接存；hev1（参数集在码流里）兼容性不稳，仍按「判断不了」放行不判 ok。
+const MP4_GOOD_VIDEO = new Set(['avc1', 'avc3', 'hvc1']);
+const MP4_GOOD_AUDIO = new Set(['mp4a']);
+// 只读 moov→trak→mdia→minf→stbl→stsd 里每个样本描述条目的格式 fourcc。
+// stsd 是 FullBox：盒子头之后（body，一般是起点 +8，64 位 largesize 时 +16）是版本/标志 4 字节、条目数 4 字节，
+// 再往后（body+8）是条目；每个条目 = size(4) + 格式(4) + …。
+// 标题、udta、mdat 里的文字（如「Chopin Opus 28」）都不会被读到。
+function mp4SampleFormats(buf, moov) {
+  const lim = Math.min(moov.end, buf.length);
+  const formats = [];
+  let complete = !moov.truncated;
+  const child = (box, type) => mp4Boxes(buf, box.body, Math.min(box.end, buf.length)).filter((b) => b.type === type);
+  for (const trak of child(moov, 'trak')) {
+    for (const mdia of child(trak, 'mdia')) {
+      for (const minf of child(mdia, 'minf')) {
+        for (const stbl of child(minf, 'stbl')) {
+          for (const stsd of child(stbl, 'stsd')) {
+            if (stsd.body + 8 > lim) { complete = false; continue; }
+            const count = u32(buf, stsd.body + 4);
+            if (count > 16) complete = false; // 只读前 16 个，后面没看到就不能说兼容
+            let e = stsd.body + 8;
+            for (let i = 0; i < count && i < 16; i++) {
+              if (e + 8 > Math.min(stsd.end, buf.length)) { complete = false; break; }
+              formats.push(fourcc(buf, e + 4));
+              const es = u32(buf, e);
+              if (es < 8) { complete = false; break; } // 条目大小坏了，后面的条目读不到
+              e += es;
+            }
+          }
+        }
+      }
+    }
+  }
+  return { formats, complete };
+}
+// 看成品开头（最多 512 KB，faststart 的 moov 一般都在里面）：
+//  - WebM/Matroska（EBML 头 1A 45 DF A3）→ 不兼容；
+//  - MP4：ftyp 兼容品牌里有 av01 → 不兼容；
+//    能读到 moov 时解析盒子结构，只看 stsd 样本格式：av01/vp09/vp08/Opus/fLaC → 不兼容；
+//    moov 读全了、有 avc1/avc3/hvc1、其余都是 avc1/avc3/hvc1/mp4a → 兼容；
+//  - ftyp 盒子本身坏了（size < 8、largesize 不对）→ unknown，放行；
+//  - moov 在文件尾（读不到）、没读全且没坏标记、或认不出 → unknown，放行。
+export function sniffMergedHead(buf) {
+  if (!buf || buf.length < 12) return { kind: 'unknown' };
+  if (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) return { kind: 'webm', ok: false, fmt: 'WebM' };
+  if (fourcc(buf, 4) !== 'ftyp') return { kind: 'unknown' };
+  const top = mp4Boxes(buf, 0, buf.length);
+  // ftyp 的 size < 8 或 largesize 不对时解析不出盒子：认不出就放行，别让 ftyp.end 抛错变成 502。
+  if (!top.length || top[0].type !== 'ftyp') return { kind: 'unknown' };
+  const ftyp = top[0];
+  const ftypEnd = Math.min(buf.length, ftyp.end);
+  for (let o = ftyp.body; o + 4 <= ftypEnd; o += 4) {
+    if (o === ftyp.body + 4) continue; // minor_version 不是品牌
+    if (fourcc(buf, o) === 'av01') return { kind: 'mp4', ok: false, fmt: 'AV1 MP4' };
+  }
+  const moov = top.find((b) => b.type === 'moov');
+  if (!moov) return { kind: 'mp4' };
+  const { formats, complete } = mp4SampleFormats(buf, moov);
+  const bad = [...new Set(formats.filter((f) => MP4_BAD_SAMPLE[f]).map((f) => MP4_BAD_SAMPLE[f]))];
+  if (bad.length) return { kind: 'mp4', ok: false, fmt: bad.join(' + ') + ' MP4' };
+  if (complete && formats.some((f) => MP4_GOOD_VIDEO.has(f)) && formats.every((f) => MP4_GOOD_VIDEO.has(f) || MP4_GOOD_AUDIO.has(f))) {
+    return { kind: 'mp4', ok: true };
+  }
+  return { kind: 'mp4' };
+}
+// RFC 5987：encodeURIComponent 不转义 ' ( ) *，在 filename* 里要转。
+export function rfc5987(s) {
+  return encodeURIComponent(s).replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+}
+// Content-Disposition 取文件名：优先 filename*（RFC 5987，UTF-8 百分号编码），再退到 filename。
+export function dispositionFilename(cd) {
+  const star = /filename\*\s*=\s*([\w-]+)'[^']*'([^;]+)/i.exec(cd);
+  if (star) {
+    const v = star[2].trim().replace(/^"|"$/g, '');
+    try { return /^utf-?8$/i.test(star[1]) ? decodeURIComponent(v) : unescape(v); } catch { /* 坏编码就退到 filename */ }
+  }
+  const q = /filename\s*=\s*"((?:[^"\\]|\\.)*)"/i.exec(cd);
+  if (q) return q[1].replace(/\\(.)/g, '$1');
+  const t = /filename\s*=\s*([^;]+)/i.exec(cd);
+  return t ? t[1].trim() : '';
+}
+// Workers 里用自建 ReadableStream 当响应体会丢掉 Content-Length（变成 chunked，前端没有百分比）。
+// 上游给了长度就经 FixedLengthStream 转接保留长度；本地/测试环境没有 FixedLengthStream 时原样返回。
+// 上游带 Content-Encoding（gzip/br 等）时 fetch 拿到的是解压后的字节，长度对不上，不套。
+export function withKnownLength(stream, contentLength, contentEncoding) {
+  const len = Number(contentLength);
+  if (contentEncoding && !/^\s*identity\s*$/i.test(contentEncoding)) return stream;
+  if (typeof FixedLengthStream !== 'function' || !Number.isSafeInteger(len) || len <= 0) return stream;
+  const { readable, writable } = new FixedLengthStream(len);
+  stream.pipeTo(writable).catch(() => { /* 客户端中断或上游断流，readable 端会报错 */ });
+  return readable;
+}
+// 先读够 limit 字节用于判断，再把读过的块和剩下的流原样接起来下发，不用整份缓存。
+async function peekStream(body, limit) {
+  const reader = body.getReader();
+  const chunks = [];
+  let got = 0, done = false;
+  while (got < limit) {
+    const r = await reader.read();
+    if (r.done) { done = true; break; }
+    chunks.push(r.value);
+    got += r.value.byteLength;
+  }
+  const head = new Uint8Array(got);
+  let o = 0;
+  for (const c of chunks) { head.set(c, o); o += c.byteLength; }
+  const stream = new ReadableStream({
+    start(ctrl) { for (const c of chunks) ctrl.enqueue(c); if (done) ctrl.close(); },
+    async pull(ctrl) {
+      const r = await reader.read();
+      if (r.done) ctrl.close(); else ctrl.enqueue(r.value);
+    },
+    cancel(reason) { return reader.cancel(reason); },
+  });
+  return { head, stream };
+}
 function mergeBase(env) {
   return (env.YT_MERGE_BASE || MERGE_BASE_DEFAULT).replace(/\/$/, '');
 }
@@ -1544,7 +1721,14 @@ async function handleYt1080Start(request, env) {
     const resp = await fetch(mergeBase(env) + '/yt1080-jobs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Merge-Token': token, 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', 'Accept': 'application/json' },
-      body: JSON.stringify({ url: ytUrl, quality: quality, mode: mode }),
+      body: JSON.stringify({
+        url: ytUrl,
+        quality: quality,
+        mode: mode,
+        format: mergeFormat(quality, mode),
+        format_sort: 'vcodec:h264,acodec:aac,res:' + quality + ',ext:mp4:m4a',
+        merge_output_format: 'mp4',
+      }),
     });
     return mergePassthrough(resp);
   } catch (e) {
@@ -1560,6 +1744,16 @@ async function handleYt1080Status(request, env) {
     const resp = await fetch(mergeBase(env) + '/yt1080-jobs/' + encodeURIComponent(id), {
       headers: { 'X-Merge-Token': token, 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', 'Accept': 'application/json' },
     });
+    if (resp.ok) {
+      const text = await resp.text();
+      let s = null;
+      try { s = JSON.parse(text); } catch { /* 交给 mergePassthrough 处理非 JSON */ }
+      if (s && s.status === 'done') {
+        const v = mergeCodecVerdict(s);
+        if (v && !v.ok) return json(notIphone(v.fmt));
+      }
+      return mergePassthrough(new Response(text, { status: resp.status, headers: resp.headers }));
+    }
     return mergePassthrough(resp);
   } catch (e) {
     return mergeConnectError(e);
@@ -1575,10 +1769,29 @@ async function handleYt1080File(request, env) {
       headers: { 'X-Merge-Token': token, 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', 'Accept': 'application/json' },
     });
     if (!resp.ok) return mergePassthrough(resp);
+    const upType = resp.headers.get('content-type') || '';
+    // 上游 200 却是 JSON/HTML（错误页）：原样下发，前端 __hkSave 靠 blob.type 识别成错误。
+    if (/json|html/i.test(upType) || !resp.body) return mergePassthrough(resp);
+    // 不靠后缀名：看文件开头。webm 或 AV1/Opus 的 MP4 → 中文错误；avc1 或判断不了 → 放行。
+    const { head, stream } = await peekStream(resp.body, 512 * 1024);
+    const sn = sniffMergedHead(head);
+    if (sn.ok === false) {
+      try { await stream.cancel(); } catch { /* ignore */ }
+      return json(notIphone(sn.fmt), 415);
+    }
     const headers = new Headers(resp.headers);
+    let fname = dispositionFilename(resp.headers.get('content-disposition') || '');
+    fname = fname.replace(/["\r\n\\/]/g, '').slice(0, 80);
+    // 只在没有上游文件名时补一个；确认是 MP4 才补 .mp4，不把别的容器改名成 .mp4。
+    if (!fname) fname = 'youtube_' + id.replace(/[^\w-]/g, '').slice(0, 24) + (sn.kind === 'mp4' ? '.mp4' : '');
+    const ascii = fname.replace(/[^\x20-\x7e]/g, '_');
+    if (sn.kind === 'mp4') headers.set('Content-Type', 'video/mp4');
+    else if (!upType) headers.set('Content-Type', 'application/octet-stream');
+    headers.set('Content-Disposition', 'attachment; filename="' + ascii + '"; filename*=UTF-8\'\'' + rfc5987(fname));
+    headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition');
     headers.set('Cache-Control', 'no-store');
     headers.set('Access-Control-Allow-Origin', '*');
-    return new Response(resp.body, { status: 200, headers });
+    return new Response(withKnownLength(stream, resp.headers.get('content-length'), resp.headers.get('content-encoding')), { status: 200, headers });
   } catch (e) {
     return mergeConnectError(e);
   }

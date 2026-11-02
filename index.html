@@ -228,6 +228,8 @@ var deviceId = (function(){
   var urlInput = $('urlInput'), parseBtn = $('parseBtn'), loading = $('loading'),
       errBox = $('err'), resultBox = $('result'), mediaBox = $('mediaBox'),
       resList = $('resList'), dlHint = $('dlHint');
+  // 页面一加载就记住提示的默认文案，后面任何地方改了 dlHint 都能在下次渲染时恢复。
+  if (dlHint && !dlHint.getAttribute('data-default')) dlHint.setAttribute('data-default', dlHint.innerHTML);
 
   // 一键粘贴：从剪贴板读取分享链接
   $('pasteBtn').onclick = function(){
@@ -266,7 +268,10 @@ var deviceId = (function(){
       try {
         var j = JSON.parse(t);
         if (j && j.error) msg = String(j.error);
-      } catch (e) {}
+        var err = new Error(msg);
+        if (j && j.code) err.code = j.code;
+        throw err;
+      } catch (e) { if (e && e.code) throw e; }
       throw new Error(msg);
     });
   }
@@ -320,6 +325,20 @@ var deviceId = (function(){
   // 下载完成后保存：iPhone 的分享菜单必须由“点击”直接触发，下载几十秒后再自动调用会被系统静默拒绝，
   // 所以自动尝试一次，失败就亮出「点这里保存」按钮让用户再点一下（新的点击一定能弹出）。
   var _pendingFile = null;
+  // 微信 / QQ / 微博 / 抖音等内置浏览器：既不支持 navigator.share 文件，也不认 blob 下载，点了没反应，存不进相册。
+  var IN_APP_UA = /MicroMessenger|QQ\/|MQQBrowser.*QQ|Weibo|DingTalk|aweme|BytedanceWebview|AlipayClient|XiaoHongShu|Lark/i;
+  function isInAppBrowser(){ return IN_APP_UA.test(navigator.userAgent || ''); }
+  var IS_IOS = /iPhone|iPad|iPod/i.test(navigator.userAgent || '') || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  function showSaveFallbackHint(file){
+    if (/\.m4a$/i.test(file.name)) {
+      dlHint.innerHTML = '🎵 这是纯音频文件（m4a），相册只收视频，音频会存到「文件」/「下载」里。要带画面的请点上面的视频按钮。';
+    } else if (IS_IOS) {
+      dlHint.innerHTML = '📁 这个浏览器没弹出分享菜单，视频已存到「文件」App →「下载」。<br>打开「文件」App 找到 <b>' + file.name.replace(/[<>&"]/g, '') + '</b>，点左下角分享 →「存储视频」，就进相册了。<br>💡 用 Safari 打开本站可以直接弹出「存储视频」。';
+    } else {
+      dlHint.innerHTML = '📁 视频已下载到手机的「下载 / Download」文件夹，相册一般会自动出现；没出现就到「文件管理 → 下载」里打开。';
+    }
+    dlHint.style.display = 'block';
+  }
   function __hkMime(name, t){
     if (/\.m4a$/i.test(name)) return 'audio/mp4';
     if (/\.mp4$/i.test(name)) return 'video/mp4';
@@ -352,6 +371,7 @@ var deviceId = (function(){
       });
     }
     __hkLink(file);
+    showSaveFallbackHint(file);
     if (fromTap) __hkHideBtn(); else __hkShowBtn(file);
   }
   function __hkSave(blob, filename){
@@ -414,6 +434,8 @@ var deviceId = (function(){
     if (mime) return /^audio/i.test(mime);
     return /audio|m4a|mp3/i.test(String(r.type || ''));
   }
+  // 18/22/37/59 是画面+声音合在一起的 MP4（H.264 + AAC），手机相册直接认
+  function isProgressive(r){ return /^(18|22|37|59)$/.test(String(itagOf(r))); }
   function isMp4(r){ var mime = urlParam(r.url, 'mime'); return !mime || /mp4/i.test(mime); }
   function resHeight(r){
     var it = itagOf(r); if (ITAG_H[it]) return ITAG_H[it];
@@ -422,16 +444,22 @@ var deviceId = (function(){
     if (/2k|1440/i.test(t)) return 1440;
     return m ? +m[1] : 0;
   }
-  // 选不超过 1080P 的最高画质；同清晰度优先 MP4(H.264)，iPhone 相册才认
+  // H.264(avc1) 的 itag。398/399/694-699 是 AV1，242-248/271/278/302/303/308/313/315 是 VP9：mime 也可能是 video/mp4，但 iPhone 相册不认。
+  var AVC_ITAG = {18:1,22:1,37:1,59:1,133:1,134:1,135:1,136:1,137:1,160:1,264:1,266:1,298:1,299:1};
+  function isAvc(r){
+    var it = itagOf(r); if (it) return !!AVC_ITAG[it];
+    return /avc1|h264/i.test(urlParam(r.url, 'mime') + ' ' + String(r.type || ''));
+  }
+  // 只在 H.264 里选不超过 1080P 的最高画质；没有 H.264 就不提供合并（合出来存不进相册）
   function pickBestVideo(vids){
-    var c = vids.filter(function(r){ var h = resHeight(r); return h && h <= 1080; });
-    if (!c.length) c = vids.slice();
+    var c = vids.filter(function(r){ var h = resHeight(r); return isAvc(r) && h && h <= 1080; });
+    if (!c.length) return null;
     c.sort(function(a, b){ return (resHeight(b) - resHeight(a)) || ((isMp4(b) ? 1 : 0) - (isMp4(a) ? 1 : 0)); });
     return c[0] || null;
   }
   function pickBestAudio(auds){
     var c = auds.slice();
-    c.sort(function(a, b){ return (isMp4(b) ? 1 : 0) - (isMp4(a) ? 1 : 0); });   // m4a 优先，MP4 容器兼容
+    c.sort(function(a, b){ return (isMp4(b) ? 1 : 0) - (isMp4(a) ? 1 : 0); });   // m4a(AAC) 优先；webm/Opus 只能在合并时转成 AAC
     return c[0] || null;
   }
   var _merging = false;
@@ -494,18 +522,19 @@ var deviceId = (function(){
       hb.disabled = true;
       startServerMerge('https://youtu.be/' + (d.videoId || ''), String(q), 'merged', q + 'P 含声音', function(html){
         ht.innerHTML = html;
-        if (/失败|连不上|超时|不可用/.test(String(html).replace(/<[^>]+>/g, ''))) hb.disabled = false;
+        if (/失败|连不上|超时|不可用|存不了/.test(String(html).replace(/<[^>]+>/g, ''))) hb.disabled = false;
       });
     };
     slot.appendChild(hb);
     slot.appendChild(ht);
+    return hb;
   }
 
   function resLabel(r, i){
     var label = String(r.type || '');
     if (isAudio(r)) return '🎵 纯音频';
     var hh = ITAG_H[itagOf(r)];
-    if (hh) return '🎬 ' + hh + 'P' + (!/^(18|22|37|59)$/.test(String(itagOf(r))) ? ' 无声' : '');
+    if (hh) return '🎬 ' + hh + 'P' + (isProgressive(r) ? '（含声音）' : ' 无声');
     if (/2160|4k/i.test(label)) return '🎬 4K 超清';
     if (/1440|2k/i.test(label)) return '🎬 2K 超清';
     if (/1080/.test(label)) return '🎬 1080P 高清';
@@ -521,6 +550,15 @@ var deviceId = (function(){
     mediaBox.innerHTML = '';
     resList.innerHTML = '';
     dlHint.style.display = 'none';
+    dlHint.innerHTML = dlHint.getAttribute('data-default') || dlHint.innerHTML;
+
+    if (isInAppBrowser()) {
+      var warn = document.createElement('div');
+      warn.className = 'hint';
+      warn.style.cssText = 'color:#ffcf6b;font-weight:700;margin-bottom:8px';
+      warn.textContent = '⚠️ 你现在在微信/QQ 等 App 的内置浏览器里，这里保存不了视频到相册。请点右上角「···」→「在浏览器打开」（iPhone 选 Safari）再下载。';
+      mediaBox.appendChild(warn);
+    }
 
     if (d.cover) {
       var img = document.createElement('img');
@@ -585,7 +623,23 @@ var deviceId = (function(){
         }).catch(function(e){
           var code = String(e && e.code || '').replace(/[^A-Z0-9_]/g, '');
           if (e && e.serverMerge && (code === 'BOT_CHECK' || code === 'UNAVAILABLE')) {
-            offerServerMerge(hdSlot, d, best);
+            var smBtn = offerServerMerge(hdSlot, d, best);
+            if (best && isProgressive(best)) {
+              // 机器人墙时 RedFox 往往只给 360P 合流 MP4。它本身有声音、能直接存相册，放在最前面，
+              // 服务器合并（几分钟、不一定成功）作为「想要更清晰」的次选。
+              var ph = resHeight(best) || '';
+              var pb = document.createElement('button');
+              pb.className = 'btn';
+              pb.style.cssText = 'margin-top:10px;font-size:15px;font-weight:700';
+              pb.textContent = '⭐ 直接下载 ' + ph + 'P（含声音，可存相册）';
+              pb.onclick = function(){ downloadResource(best.url, fileName((d.title || 'youtube') + '_' + ph + 'P', 'mp4'), '', streamSpec(best, d.videoId || '', '')); };
+              var pt = document.createElement('div');
+              pt.className = 'hint';
+              pt.textContent = '这条视频高清流被 YouTube 拦了，目前能秒下的是 ' + ph + 'P（画面和声音都在一个 MP4 里）。想要更清晰的再点下面的「服务器合并」，要等几分钟。';
+              hdSlot.insertBefore(pt, hdSlot.firstChild);
+              hdSlot.insertBefore(pb, hdSlot.firstChild);
+              if (smBtn) smBtn.className = 'btn ghost';
+            }
             var mbOld = document.getElementById('redfoxMergeBtn');
             if (mbOld) { mbOld.style.display = 'none'; if (mbOld.nextSibling) mbOld.nextSibling.style.display = 'none'; }
             return;
@@ -862,18 +916,26 @@ var deviceId = (function(){
     var m = Math.floor(s / 60), sec = s % 60;
     return m > 0 ? m + '分' + sec + '秒' : sec + '秒';
   }
-  function downloadMerged(jobId, filename){
+  // 成品文件名统一成 .mp4（服务器已确认不是 WebM/AV1/Opus，才会走到保存这一步）。
+  function mergedName(filename, blobType){
+    var n = String(filename || 'youtube_1080p').replace(/[\\/:*?"<>|]/g, '_');
+    if (/webm|matroska/i.test(blobType || '')) return n;
+    return /\.mp4$/i.test(n) ? n : n.replace(/\.(webm|mkv|m4v|mov)$/i, '') + '.mp4';
+  }
+  function downloadMerged(jobId, filename, onStatus){
+    var report = function(html){ setMergeStatus(html); if (typeof onStatus === 'function') onStatus(html); };
     setMergeBtn('正在下载成品…', true);
     resetDlProg();
     fetchBlobProgress('/api/yt1080-file?id=' + encodeURIComponent(jobId), setDlProg).then(function(blob){
       hideDlProg();
       resetMergeBtn();
-      setMergeStatus('✅ 合并完成，文件 ' + fmtMB(blob.size) + '，正在弹出保存…');
-      __hkSave(blob, filename || 'youtube_1080p.mp4');
+      report('✅ 合并完成，文件 ' + fmtMB(blob.size) + '，正在弹出保存…');
+      __hkSave(blob, mergedName(filename, blob.type));
     }).catch(function(e){
       resetMergeBtn();
       hideDlProg();
-      setMergeStatus('下载失败：' + (e.message || '网络错误') + '，成品在服务器上保留 1 小时，稍后可重新提交（若服务器空闲会重新合一份）。');
+      if (e && e.code === 'MERGE_NOT_IPHONE') { report('⚠️ ' + e.message); return; }
+      report('下载失败：' + (e.message || '网络错误') + '，成品在服务器上保留 1 小时，稍后可重新提交（若服务器空闲会重新合一份）。');
     });
   }
   function startServerMerge(ytUrl, quality, mode, label, onStatus){
@@ -910,6 +972,12 @@ var deviceId = (function(){
           fetch('/api/yt1080-status?id=' + encodeURIComponent(jobId))
             .then(function(r){ return r.text().then(function(t){ try { return JSON.parse(t); } catch(e){ throw new Error('服务器返回异常，请稍后重试'); } }); })
             .then(function(s){
+              if(!s.ok && s.code === 'MERGE_NOT_IPHONE'){
+                clearInterval(mergeTimer); mergeTimer = null;
+                resetMergeBtn();
+                status('⚠️ ' + s.error);
+                return;
+              }
               if(!s.ok){
                 clearInterval(mergeTimer); mergeTimer = null;
                 resetMergeBtn();
@@ -922,7 +990,7 @@ var deviceId = (function(){
                 filename = s.filename || 'youtube_1080p.mp4';
                 saveHistory({ jobId: jobId, filename: filename, size: s.size || 0, label: label, time: new Date().toLocaleString() });
                 status('✅ 合并完成（' + fmtMB(s.size || 0) + '），正在下载…已记入合并历史，1 小时内可从历史重下。');
-                downloadMerged(jobId, filename);
+                downloadMerged(jobId, filename, onStatus);
               } else if(s.status === 'error'){
                 clearInterval(mergeTimer); mergeTimer = null;
                 resetMergeBtn();
