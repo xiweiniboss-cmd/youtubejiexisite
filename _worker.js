@@ -5,6 +5,12 @@
 // 反馈系统：KV 绑定 FEEDBACK_KV、R2 绑定 FEEDBACK_BUCKET、环境变量 FEEDBACK_ADMIN_KEY
 //   （与小红书站/TikTok站/抖音站共用同一套 KV/R2/管理密码）
 // 人机验证：TURNSTILE_SITE_KEY（公开）+ TURNSTILE_SECRET_KEY（保密），各站共用同一套
+//   配了 TURNSTILE_SECRET_KEY 才校验（不配 = 跳过，并在日志里打一次警告）。
+//   受保护：/api/parse /api/yt-hd /api/ytdl /api/yt1080-start /api/yt-direct。
+//   前端带 ?turnstile=<token> 时 Worker 调 siteverify，通过后下发 30 分钟的签名通行证 Cookie yt_hp
+//   （HMAC-SHA256，密钥由 TURNSTILE_SECRET_KEY 派生，不需要新变量），之后的解析 / 高清 / 下载 / 合并凭 Cookie 放行。
+//   /api/yt1080-status、/api/yt1080-file 只认已有任务 id（任务只能经受保护的 yt1080-start 创建），不拦，
+//   这样「合并历史（保留 1 小时）」里的成品在通行证过期后也能下载。/api/ping /api/server-status /api/stats 等不拦。
 // 高清直连 /api/yt-hd（都不写进仓库，只在 Pages → Settings → Environment variables 配加密变量）：
 //   YT_COOKIES   已登录 youtube.com 的 Cookie（请求头 "a=b; c=d"，或 Netscape cookies.txt，或 [{name,value}] JSON）。别名 YT_COOKIE
 //   YT_PO_TOKEN  可选。InnerTube player 的 PO Token，放进 serviceIntegrityDimensions.poToken。别名 YT_POT
@@ -49,11 +55,13 @@ function json(data, status = 200) {
 
 // Cloudflare Turnstile 人机验证：secret 配了才校验，不配则跳过（向后兼容）
 async function verifyTurnstile(token, secret, ip) {
+  if (typeof token !== 'string' || !token || token.length > 2048) return false;
   try {
     const resp = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ secret, response: token, remoteip: ip || '' }),
+      signal: AbortSignal.timeout(10000),
     });
     const j = await resp.json();
     return j && j.success === true;
@@ -61,6 +69,119 @@ async function verifyTurnstile(token, secret, ip) {
     return false;
   }
 }
+
+// ---------- 人机验证通行证（一次 siteverify 通过后，30 分钟内的解析 / 高清 / 下载 / 合并都不用再点验证） ----------
+export const HUMAN_PASS_COOKIE = 'yt_hp';
+export const HUMAN_PASS_TTL_SECS = 30 * 60;
+export const HUMAN_PASS_MAX_AGE_SECS = 2 * 60 * 60; // 续期封顶：距第一次真验证最多 2 小时
+const HUMAN_PASS_RENEW_BELOW_SECS = 10 * 60; // 剩余不足 10 分钟时顺手续期（长下载 / 分段合并不会中途 403）
+export const HUMAN_PATHS = new Set(['/api/parse', '/api/yt-hd', '/api/ytdl', '/api/yt1080-start', '/api/yt-direct']);
+const HUMAN_MSG_REQUIRED = '请先完成人机验证';
+const HUMAN_MSG_FAILED = '人机验证未通过，请重试';
+let _humanUnsetWarned = false;
+
+function b64url(bytes) {
+  let s = '';
+  const a = new Uint8Array(bytes);
+  for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function b64urlDecode(str) {
+  if (!/^[A-Za-z0-9_-]*$/.test(str)) return null;
+  try {
+    const bin = atob(str.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((str.length + 3) % 4));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+}
+// 签名密钥由 TURNSTILE_SECRET_KEY 派生（HMAC(secret, 固定标签)），换 secret 后旧通行证自动作废
+async function humanPassKey(secret) {
+  const enc = new TextEncoder();
+  const root = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const derived = await crypto.subtle.sign('HMAC', root, enc.encode('youtubejiexi-human-pass-v1'));
+  return crypto.subtle.importKey('raw', derived, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+}
+// 通行证格式：v1.<过期秒>.<首次验证秒>.<随机数>.<签名>
+export async function signHumanPass(secret, nowSec, firstSec) {
+  const now = Math.floor(nowSec ?? Date.now() / 1000);
+  const first = Math.floor(firstSec ?? now);
+  const exp = Math.min(now + HUMAN_PASS_TTL_SECS, first + HUMAN_PASS_MAX_AGE_SECS);
+  const nonce = b64url(crypto.getRandomValues(new Uint8Array(9)));
+  const body = 'v1.' + exp + '.' + first + '.' + nonce;
+  const sig = await crypto.subtle.sign('HMAC', await humanPassKey(secret), new TextEncoder().encode(body));
+  return { value: body + '.' + b64url(sig), exp };
+}
+// 返回 { exp, first } 或 null（伪造 / 过期 / 格式不对）
+export async function verifyHumanPass(value, secret, nowSec) {
+  if (typeof value !== 'string' || value.length > 200) return null;
+  const parts = value.split('.');
+  if (parts.length !== 5 || parts[0] !== 'v1') return null;
+  const exp = Number(parts[1]), first = Number(parts[2]);
+  if (!Number.isSafeInteger(exp) || !Number.isSafeInteger(first)) return null;
+  const sig = b64urlDecode(parts[4]);
+  if (!sig || sig.length !== 32) return null;
+  const ok = await crypto.subtle.verify(
+    'HMAC',
+    await humanPassKey(secret),
+    sig,
+    new TextEncoder().encode(parts.slice(0, 4).join('.')),
+  );
+  if (!ok) return null;
+  const now = Math.floor(nowSec ?? Date.now() / 1000);
+  if (exp <= now || exp - first > HUMAN_PASS_MAX_AGE_SECS) return null;
+  return { exp, first };
+}
+function readCookie(request, name) {
+  const raw = request.headers.get('cookie') || '';
+  for (const part of raw.split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return '';
+}
+function humanPassCookie(value, exp, nowSec) {
+  const maxAge = Math.max(0, exp - Math.floor(nowSec ?? Date.now() / 1000));
+  return HUMAN_PASS_COOKIE + '=' + value + '; Path=/api/; Max-Age=' + maxAge + '; HttpOnly; Secure; SameSite=Lax';
+}
+function humanDenied(code, error) {
+  return json({ ok: false, code, error }, 403);
+}
+// 受保护接口的统一门禁。返回 { response }（拒绝）或 { setCookie }（放行，可能附带新/续期的通行证）
+export async function checkHuman(request, env) {
+  const secret = (env.TURNSTILE_SECRET_KEY || '').trim();
+  if (!secret) {
+    if (!_humanUnsetWarned) {
+      _humanUnsetWarned = true;
+      console.warn('[turnstile] 未配置 TURNSTILE_SECRET_KEY：解析接口暂不做人机验证（fail-open）');
+    }
+    return { setCookie: '' };
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const pass = await verifyHumanPass(readCookie(request, HUMAN_PASS_COOKIE), secret, now);
+  if (pass) {
+    if (pass.exp - now < HUMAN_PASS_RENEW_BELOW_SECS && pass.first + HUMAN_PASS_MAX_AGE_SECS > pass.exp) {
+      const renewed = await signHumanPass(secret, now, pass.first);
+      return { setCookie: humanPassCookie(renewed.value, renewed.exp, now) };
+    }
+    return { setCookie: '' };
+  }
+  const token = new URL(request.url).searchParams.get('turnstile') || '';
+  if (!token) return { response: humanDenied('HUMAN_REQUIRED', HUMAN_MSG_REQUIRED) };
+  const ok = await verifyTurnstile(token, secret, request.headers.get('cf-connecting-ip'));
+  if (!ok) return { response: humanDenied('HUMAN_FAILED', HUMAN_MSG_FAILED) };
+  const fresh = await signHumanPass(secret, now, now);
+  return { setCookie: humanPassCookie(fresh.value, fresh.exp, now) };
+}
+function withSetCookie(resp, cookie) {
+  if (!cookie || !resp) return resp;
+  const out = new Response(resp.body, resp);
+  out.headers.append('Set-Cookie', cookie);
+  return out;
+}
+export function _resetHumanWarn() { _humanUnsetWarned = false; }
 
 // ---------- RedFoxHub ----------
 async function redfoxPost(path, apiKey, body) {
@@ -227,14 +348,7 @@ async function handleParse(request, env) {
   if (!shareText.trim()) return json({ ok: false, error: '请先粘贴 YouTube 分享链接' }, 400);
   const debug = reqUrl.searchParams.get('debug') === '1';
 
-  // 解析接口人机验证（配了 TURNSTILE_SECRET_KEY 才生效）
-  const tsSecret = (env.TURNSTILE_SECRET_KEY || '').trim();
-  if (tsSecret) {
-    const tsToken = reqUrl.searchParams.get('turnstile') || '';
-    if (!tsToken) return json({ ok: false, error: '请先完成人机验证' }, 400);
-    const tsOk = await verifyTurnstile(tsToken, tsSecret, request.headers.get('cf-connecting-ip'));
-    if (!tsOk) return json({ ok: false, error: '人机验证未通过，请重试' }, 403);
-  }
+  // 人机验证在路由里统一做（checkHuman），这里不再重复
 
   // 解析冷却：同一 IP 60 秒内只能解析一次（防刷 API 烧积分）
   const PARSE_COOLDOWN_SECS = 60;
@@ -2123,6 +2237,14 @@ async function handleYtDirect(request, env) {
 }
 
 /* ================= 路由 ================= */
+function routeHumanGated(pathname, request, env) {
+  if (pathname === '/api/parse') return handleParse(request, env);
+  if (pathname === '/api/ytdl') return handleYtDl(request, env);
+  if (pathname === '/api/yt1080-start') return handleYt1080Start(request, env);
+  if (pathname === '/api/yt-direct') return handleYtDirect(request, env);
+  return handleYtHd(request, env); // /api/yt-hd
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -2130,13 +2252,14 @@ export default {
     if (url.pathname === '/api/ping') return handlePing();
     if (url.pathname === '/api/server-status') return handleServerStatus(request, env, ctx);
 
-    if (url.pathname === '/api/parse') return handleParse(request, env);
-    if (url.pathname === '/api/ytdl') return handleYtDl(request, env);
-    if (url.pathname === '/api/yt1080-start') return handleYt1080Start(request, env);
+    // 人机验证门禁（只拦解析类接口；状态 / 统计 / 静态文件不拦）
+    if (HUMAN_PATHS.has(url.pathname)) {
+      const gate = await checkHuman(request, env);
+      if (gate.response) return gate.response;
+      return withSetCookie(await routeHumanGated(url.pathname, request, env), gate.setCookie);
+    }
     if (url.pathname === '/api/yt1080-status') return handleYt1080Status(request, env);
     if (url.pathname === '/api/yt1080-file') return handleYt1080File(request, env);
-    if (url.pathname === '/api/yt-direct') return handleYtDirect(request, env);
-    if (url.pathname === '/api/yt-hd') return handleYtHd(request, env);
 
     if (url.pathname === '/api/diag')
       return json({

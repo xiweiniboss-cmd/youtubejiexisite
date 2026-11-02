@@ -95,6 +95,8 @@ header.topbar{ display:flex; align-items:center; gap:12px; text-align:left; marg
 .input-shell textarea{ background:transparent; border:none; min-height:58px; padding:2px; }
 .input-shell textarea:focus{ border-color:transparent; box-shadow:none; }
 .input-tools{ display:flex; gap:9px; margin-top:10px; }
+.ts-parse:not(:empty){ margin-top:10px; min-height:65px; }
+.ts-parse iframe{ max-width:100%; }
 .input-tools .btn{ width:auto; flex:none; margin-top:0; padding:8px 14px; border-radius:999px; font-size:13px; font-weight:500; }
 .steps{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:20px; }
 .step{ background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.07); border-radius:16px; padding:13px 10px; text-align:center; }
@@ -200,6 +202,8 @@ body{ background:transparent; }
       </div>
     </div>
     <button class="btn" id="parseBtn">开始解析</button>
+    <!-- 人机验证：配了 TURNSTILE_SITE_KEY 才显示；验证一次后 30 分钟内解析 / 合并不用再点 -->
+    <div id="tsParseWidget" class="ts-parse"></div>
     <!-- 服务器合并：清晰度 + 提交。地址和口令只在 Pages 环境变量 YT_MERGE_BASE / YT_MERGE_TOKEN，不进前端 -->
     <div id="mergeRow" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:center">
       <select id="mergeQuality" style="flex:1 1 180px;min-width:0;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,.15);background:rgba(0,0,0,.32);color:#f5f3ef;font-size:15px">
@@ -214,7 +218,6 @@ body{ background:transparent; }
     <div class="hint" id="merge1080Status" style="display:none"></div>
     <button class="btn ghost" id="mergeHistoryBtn" style="margin-top:10px">📥 合并历史（服务器保留 1 小时）</button>
     <div id="mergeHistoryPanel" style="display:none;margin-top:10px;text-align:left"></div>
-    <div id="tsParseWidget" style="margin-top:10px"></div>
     <div class="hint">📋 在 YouTube App 点「分享」→「复制链接」，粘贴到这里即可<br>🌐 下载需要开 VPN（YouTube 直链走境外）<br>🔒 仅解析公开视频，请勿用于侵权用途</div>
   </div>
 
@@ -668,6 +671,7 @@ var deviceId = (function(){
       if (window.YTMerge && (d.videoId || '')) {
         hdSlot.innerHTML = '<div class="hint">⏳ 正在获取可用画质…</div>';
         fetch('/api/yt-hd?url=' + encodeURIComponent('https://youtu.be/' + d.videoId)).then(function(r){ return r.json(); }).then(function(h){
+          if (typeof humanDone === 'function') humanDone('', h);
           var hasPair = h && h.ok && h.video && h.video.url && (h.audio || h.progressive);
           if (!hasPair) {
             var hdErr = new Error((h && h.error) || '没拿到可下载的视频流');
@@ -805,9 +809,36 @@ var deviceId = (function(){
     return _tsScriptPromise;
   }
   var tsParseWidgetId = null;
+  // 服务器验证通过后会下发 30 分钟的通行证 Cookie（HttpOnly，前端读不到），这里记个略短的本地时间：
+  // 有效期内解析 / 合并不再要新 token；服务器回 HUMAN_* 就清零重新验证。
+  var TS_PASS_MS = 25 * 60 * 1000, tsPassUntil = 0;
+  function resetParseTs(){ if (tsParseWidgetId !== null) { try { turnstile.reset(tsParseWidgetId); } catch(e){} } }
+  // 返回要拼到接口地址后的参数：'' = 不需要（未配置或通行证有效），null = 还没完成验证
+  function humanQuery(){
+    if (tsParseWidgetId === null || Date.now() < tsPassUntil) return '';
+    var t = '';
+    try { t = turnstile.getResponse(tsParseWidgetId) || ''; } catch(e){}
+    return t ? '&turnstile=' + encodeURIComponent(t) : null;
+  }
+  // 请求结束后调用：token 是一次性的，用过就重置；服务器没拒绝就说明通行证已发下来
+  function humanDone(q, body){
+    var rejected = !!(body && /^HUMAN_/.test(body.code || ''));
+    if (rejected) tsPassUntil = 0;
+    else if (q) tsPassUntil = Date.now() + TS_PASS_MS;
+    if (q || rejected) resetParseTs();
+    return rejected;
+  }
   ensureTurnstileScript().then(function(siteKey){
     try {
-      tsParseWidgetId = turnstile.render('#tsParseWidget', { sitekey: siteKey, theme: 'dark', language: 'zh-cn' });
+      var box = $('tsParseWidget');
+      tsParseWidgetId = turnstile.render('#tsParseWidget', {
+        sitekey: siteKey, theme: 'dark', language: 'zh-cn',
+        // 320 宽的手机放不下 300px 标准组件，改用紧凑版
+        size: (box && box.clientWidth && box.clientWidth < 300) ? 'compact' : 'flexible',
+        'expired-callback': function(){ resetParseTs(); },
+        'timeout-callback': function(){ resetParseTs(); },
+        'error-callback': function(){ showError('人机验证失败，请重试（刷新页面也可以）'); }
+      });
     } catch(e){}
   }).catch(function(){});
 
@@ -900,16 +931,13 @@ var deviceId = (function(){
     hideError();
     resultBox.style.display = 'none';
     if(!text){ showError('请先粘贴 YouTube 分享链接'); return; }
-    var tsToken = '';
-    if (tsParseWidgetId !== null) {
-      try { tsToken = turnstile.getResponse(tsParseWidgetId) || ''; } catch(e){}
-      if (!tsToken) { showError('请先完成人机验证'); return; }
-    }
+    var hq = humanQuery();
+    if (hq === null) { showError('请先完成人机验证'); return; }
     setParseBtn('解析中…', true);
     loading.style.display = 'block';
     var apiUrl = '/api/parse?url=' + encodeURIComponent(text);
     if (deviceId) apiUrl += '&deviceId=' + encodeURIComponent(deviceId);
-    if (tsToken) apiUrl += '&turnstile=' + encodeURIComponent(tsToken);
+    apiUrl += hq;
     fetch(apiUrl)
       .then(function(r){ return r.text().then(function(t){
         var ct = r.headers.get('content-type') || '';
@@ -919,7 +947,7 @@ var deviceId = (function(){
       .then(function(data){
         loading.style.display = 'none';
         resetParseBtn();
-        if (tsParseWidgetId !== null) { try { turnstile.reset(tsParseWidgetId); } catch(e){} }
+        humanDone(hq, data); hq = '';
         if(!data.ok) throw new Error(data.error || '解析失败');
         renderResult(data);
         try {
@@ -932,7 +960,7 @@ var deviceId = (function(){
       .catch(function(e){
         loading.style.display = 'none';
         resetParseBtn();
-        if (tsParseWidgetId !== null) { try { turnstile.reset(tsParseWidgetId); } catch(e){} }
+        if (hq) { resetParseTs(); hq = ''; }
         var msg = String(e.message || '解析失败');
         if(/did not match the expected pattern|Unexpected token/i.test(msg))
           msg = '服务暂时不可用，请稍后重试';
@@ -1033,12 +1061,16 @@ var deviceId = (function(){
       setMergeStatus(html);
       if (onStatus) onStatus(html);
     }
+    var hq = humanQuery();
+    if (hq === null) { status('请先完成人机验证'); return; }
     setMergeBtn('正在提交合并任务…', true);
     status('已提交，服务器正在解析 ' + label + '…请不要关闭页面，约几分钟。');
-    fetch('/api/yt1080-start?url=' + encodeURIComponent(ytUrl) + '&quality=' + encodeURIComponent(quality) + '&mode=' + encodeURIComponent(mode), { method: 'POST' })
-      .then(function(r){ return r.text().then(function(t){ var j; try { j = JSON.parse(t); } catch(e){ throw new Error('服务器返回异常（HTTP ' + r.status + '），请稍后重试'); } return { status: r.status, body: j }; }); })
+    fetch('/api/yt1080-start?url=' + encodeURIComponent(ytUrl) + '&quality=' + encodeURIComponent(quality) + '&mode=' + encodeURIComponent(mode) + hq, { method: 'POST' })
+      .then(function(r){ return r.text().then(function(t){ var j; try { j = JSON.parse(t); } catch(e){ if (hq) { resetParseTs(); hq = ''; } throw new Error('服务器返回异常（HTTP ' + r.status + '），请稍后重试'); } return { status: r.status, body: j }; }); })
       .then(function(res){
         var j = res.body || {};
+        if (humanDone(hq, j)) { hq = ''; resetMergeBtn(); status(j.error || '请先完成人机验证'); return; }
+        hq = '';
         if(!j.ok){
           resetMergeBtn();
           var down = j.code === 'MERGE_ORIGIN_DOWN' || /连不上|内部出错/.test(j.error || '') || res.status >= 500;
@@ -1095,6 +1127,7 @@ var deviceId = (function(){
       })
       .catch(function(e){
         resetMergeBtn();
+        if (hq) { resetParseTs(); hq = ''; }
         status('提交失败：' + (e.message || '网络错误') + '<br>合并服务器可能连不上，请稍后再试。');
       });
   }
