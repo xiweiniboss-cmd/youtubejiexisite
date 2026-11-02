@@ -16,6 +16,14 @@
 // 服务器合并 /api/yt1080-*（前端不持有口令，由 Worker 转发）：
 //   YT_MERGE_TOKEN  与 EC2 合并服务口令一致；不配则接口直接说明未配置
 //   YT_MERGE_BASE   EC2 根地址，默认 http://3-129-45-49.sslip.io:30002
+// 服务器状态 /api/server-status（前端「服务器状态」卡片）：Worker 请求 EC2 的
+//   GET {YT_MERGE_BASE}/status   请求头 X-Merge-Token: <YT_MERGE_TOKEN>（与 /yt1080-jobs 相同鉴权），超时 5 秒
+//   期望返回 200 JSON：
+//   {"ok":true,"mem":{"total":字节,"used":字节},"cpu":{"load1":f,"load5":f,"load15":f,"cores":n},
+//    "disk":{"total":字节,"used":字节},"uptimeSec":n,"jobs":{"running":n,"queued":n}}
+//   Worker 只取这些字段并转成数字，自己算百分比（CPU = load1/cores*100，封顶 100），口令不会回传。
+//   旧版 EC2 没有 /status 返回 404 时视为「在线但未提供详细状态」（statusSupported:false）。
+//   结果在边缘缓存约 15 秒。/api/ping 只给浏览器测「你→本站」延迟。
 // 年龄限制看 playabilityStatus.reason，不要只看 status：LOGIN_REQUIRED 也会是「Sign in to confirm you're not a bot」。
 
 const REDFOX_BASE = 'https://redfox.hk';
@@ -1860,6 +1868,122 @@ async function handleYt1080File(request, env) {
   }
 }
 
+/* ================= 服务器状态 /api/server-status、/api/ping ================= */
+// 前端「服务器状态」卡片用。Worker 带 X-Merge-Token 请求 EC2 的 GET /status（契约见文件顶部注释），
+// 只回传清洗过的数字，绝不回传口令或上游原文。结果在边缘缓存 SERVER_STATUS_TTL 秒，避免频繁打 EC2。
+export const SERVER_STATUS_TIMEOUT_MS = 5000;
+const SERVER_STATUS_TTL = 15;
+const serverStatusMemo = new Map(); // mergeBase -> { at, body }（同一 isolate 内的兜底缓存，pages.dev 上 Cache API 不生效）
+
+function statusNum(v) {
+  const n = typeof v === 'string' && v.trim() !== '' ? Number(v) : v;
+  return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : null;
+}
+function statusPct(used, total, given) {
+  let p = null;
+  if (used !== null && total !== null && total > 0) p = (used / total) * 100;
+  else if (given !== null) p = given;
+  if (p === null) return null;
+  return Math.round(Math.min(100, Math.max(0, p)) * 10) / 10;
+}
+function statusObj(v) {
+  return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+}
+// 把 EC2 /status 的 JSON 清洗成只含数字的固定结构（多余字段一律丢弃）
+export function sanitizeServerStatus(raw) {
+  const r = statusObj(raw);
+  const m = statusObj(r.mem), c = statusObj(r.cpu), d = statusObj(r.disk), j = statusObj(r.jobs);
+  const memTotal = statusNum(m.total), memUsed = statusNum(m.used);
+  const diskTotal = statusNum(d.total), diskUsed = statusNum(d.used);
+  const load1 = statusNum(c.load1), load5 = statusNum(c.load5), load15 = statusNum(c.load15);
+  const coresRaw = statusNum(c.cores);
+  const cores = coresRaw !== null && coresRaw >= 1 ? Math.floor(coresRaw) : null;
+  const cpuPct = load1 !== null && cores ? statusPct(load1, cores, null) : statusPct(null, null, statusNum(c.percent));
+  const running = statusNum(j.running), queued = statusNum(j.queued);
+  const uptime = statusNum(r.uptimeSec);
+  return {
+    mem: { total: memTotal, used: memUsed, percent: statusPct(memUsed, memTotal, statusNum(m.percent)) },
+    cpu: { load1, load5, load15, cores, percent: cpuPct },
+    disk: { total: diskTotal, used: diskUsed, percent: statusPct(diskUsed, diskTotal, statusNum(d.percent)) },
+    uptimeSec: uptime === null ? null : Math.floor(uptime),
+    jobs: { running: running === null ? null : Math.floor(running), queued: queued === null ? null : Math.floor(queued) },
+  };
+}
+
+// 实际探测 EC2。返回给前端的 body（不含口令）。opts.timeoutMs 仅供测试缩短超时。
+export async function fetchServerStatus(env, opts) {
+  const checkedAt = Date.now();
+  const token = mergeToken(env);
+  if (!token) return { ok: true, online: false, latencyMs: null, error: '未配置合并服务', checkedAt };
+  const timeoutMs = (opts && opts.timeoutMs) || SERVER_STATUS_TIMEOUT_MS;
+  const ctrl = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, timeoutMs);
+  const offline = (error) => ({ ok: true, online: false, latencyMs: null, error, checkedAt });
+  try {
+    const t0 = Date.now();
+    let resp;
+    try {
+      resp = await fetch(mergeBase(env) + '/status', {
+        method: 'GET',
+        headers: { 'X-Merge-Token': token, 'Accept': 'application/json', 'User-Agent': 'yt-site-status/1' },
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      if (timedOut || (e && e.name === 'AbortError')) return offline('连接超时');
+      return offline('无法连接服务器');
+    }
+    const latencyMs = Math.max(0, Date.now() - t0);
+    let text = '';
+    try { text = await resp.text(); } catch { if (timedOut) return offline('连接超时'); }
+    if (mergeOriginDown(resp.status, text)) return offline('服务器不可达');
+    if (resp.status === 404) return { ok: true, online: true, latencyMs, statusSupported: false, checkedAt };
+    if (resp.status === 401 || resp.status === 403) return offline('口令不匹配（HTTP ' + resp.status + '）');
+    if (resp.status !== 200) return offline('服务器异常（HTTP ' + resp.status + '）');
+    let raw;
+    try { raw = JSON.parse(text); } catch { return offline('服务器返回格式异常'); }
+    if (!raw || typeof raw !== 'object' || raw.ok === false) return offline('服务器返回格式异常');
+    return Object.assign({ ok: true, online: true, latencyMs, statusSupported: true }, sanitizeServerStatus(raw), { checkedAt });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export function _resetServerStatusCache() {
+  serverStatusMemo.clear();
+}
+
+async function handleServerStatus(request, env, ctx) {
+  const headers = {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Cache-Control': 'public, max-age=' + SERVER_STATUS_TTL,
+  };
+  const memoKey = mergeBase(env) + '|' + (mergeToken(env) ? '1' : '0');
+  const memo = serverStatusMemo.get(memoKey);
+  if (memo && Date.now() - memo.at < SERVER_STATUS_TTL * 1000) {
+    return new Response(JSON.stringify(memo.body), { status: 200, headers });
+  }
+  const cache = typeof caches !== 'undefined' && caches && caches.default ? caches.default : null;
+  const cacheKey = new Request(new URL('/api/server-status', request.url).toString(), { method: 'GET' });
+  if (cache) {
+    try {
+      const hit = await cache.match(cacheKey);
+      if (hit) return hit;
+    } catch {}
+  }
+  const body = await fetchServerStatus(env);
+  serverStatusMemo.set(memoKey, { at: Date.now(), body });
+  const resp = new Response(JSON.stringify(body), { status: 200, headers });
+  if (cache) {
+    try {
+      const p = cache.put(cacheKey, resp.clone());
+      if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(p); else await p;
+    } catch {}
+  }
+  return resp;
+}
+
 /* Experimental direct parse (no RedFox): Worker fetches YouTube InnerTube
    player API, returns only format metadata (no stream URLs) for testing. */
 async function handleYtDirect(request, env) {
@@ -1909,8 +2033,11 @@ async function handleYtDirect(request, env) {
 
 /* ================= 路由 ================= */
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    if (url.pathname === '/api/ping') return json({ ok: true, t: Date.now() });
+    if (url.pathname === '/api/server-status') return handleServerStatus(request, env, ctx);
 
     if (url.pathname === '/api/parse') return handleParse(request, env);
     if (url.pathname === '/api/ytdl') return handleYtDl(request, env);

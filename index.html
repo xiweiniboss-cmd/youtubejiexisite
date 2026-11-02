@@ -119,6 +119,30 @@ footer{ text-shadow:0 1px 8px rgba(0,0,0,.30); }
 /* ===== 背景层级修正（第四轮）：body 改透明，品牌渐变层真正显示 ===== */
 body{ background:transparent; }
 </style>
+<style>
+/* ===== 服务器状态卡片 ===== */
+.srv-card{ padding:14px 15px; margin-top:16px; }
+.srv-head{ display:flex; align-items:center; gap:8px; }
+.srv-title{ font-size:13.5px; font-weight:700; }
+.srv-pill{ margin-left:auto; display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--muted); border:1px solid var(--line); background:rgba(13,13,20,.30); padding:4px 10px; border-radius:999px; white-space:nowrap; }
+.srv-dot{ width:8px; height:8px; border-radius:50%; background:var(--faint); flex:none; }
+.srv-dot.on{ background:#2ecc71; box-shadow:0 0 0 3px rgba(46,204,113,.18); }
+.srv-dot.off{ background:var(--pink); box-shadow:0 0 0 3px rgba(255,0,0,.18); }
+.srv-lat{ display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:11px; }
+.srv-lat > div{ background:rgba(13,13,20,.30); border:1px solid rgba(255,255,255,.07); border-radius:12px; padding:8px 10px; }
+.srv-k{ font-size:11px; color:var(--faint); }
+.srv-v{ font-size:15px; font-weight:700; margin-top:2px; font-variant-numeric:tabular-nums; }
+.srv-v small{ font-size:11px; font-weight:500; color:var(--muted); margin-left:2px; }
+.srv-row{ display:flex; align-items:center; gap:8px; margin-top:9px; font-size:12px; }
+.srv-row .srv-k{ width:62px; flex:none; font-size:12px; white-space:nowrap; }
+.srv-bar{ flex:1; height:6px; border-radius:999px; background:rgba(255,255,255,.08); overflow:hidden; }
+.srv-bar i{ display:block; height:100%; width:0; border-radius:999px; background:linear-gradient(92deg,#ff7a45,#FF0000); -webkit-transition:width .4s; transition:width .4s; }
+.srv-row .srv-n{ min-width:104px; text-align:right; color:var(--muted); font-variant-numeric:tabular-nums; white-space:nowrap; }
+.srv-row .srv-n b{ color:var(--text); font-weight:600; }
+.srv-note{ margin-top:10px; font-size:12px; color:var(--faint); }
+.srv-jobs{ margin-top:10px; font-size:12px; color:var(--muted); }
+.srv-jobs b{ color:var(--pink); font-weight:700; }
+</style>
 </head>
 <body>
 <div class="bg"><div class="orb orb-a"></div><div class="orb orb-b"></div><div class="orb orb-c"></div></div><div class="grain"></div>
@@ -137,6 +161,25 @@ body{ background:transparent; }
     <p>在 YouTube 里点「分享 → 复制链接」，把链接粘到下面，剩下的交给我们。多种清晰度可选，也能只下音频。</p>
     <p class="hero-count">本站已解析 <b id="parseCount">-</b> 次</p>
   </section>
+
+  <!-- 服务器状态：数据来自 /api/server-status（Worker 代问 EC2，口令不进前端）与 /api/ping -->
+  <div class="card srv-card" id="srvCard">
+    <div class="srv-head">
+      <span class="srv-title">服务器状态</span>
+      <span class="srv-pill"><span class="srv-dot" id="srvDot"></span>合并服务器 <b id="srvOnline">-</b></span>
+    </div>
+    <div class="srv-lat">
+      <div><div class="srv-k">你→本站 延迟</div><div class="srv-v" id="srvPing">-</div></div>
+      <div><div class="srv-k">本站→服务器 延迟</div><div class="srv-v" id="srvLat">-</div></div>
+    </div>
+    <div id="srvBars">
+      <div class="srv-row"><span class="srv-k">内存</span><span class="srv-bar"><i id="srvMemBar"></i></span><span class="srv-n" id="srvMem">-</span></div>
+      <div class="srv-row"><span class="srv-k">CPU 负载</span><span class="srv-bar"><i id="srvCpuBar"></i></span><span class="srv-n" id="srvCpu">-</span></div>
+      <div class="srv-row"><span class="srv-k">硬盘</span><span class="srv-bar"><i id="srvDiskBar"></i></span><span class="srv-n" id="srvDisk">-</span></div>
+    </div>
+    <div class="srv-note" id="srvNote" style="display:none"></div>
+    <div class="srv-jobs">合并任务 运行 <b id="srvRun">-</b> / 排队 <b id="srvQueue">-</b></div>
+  </div>
 
   <div class="card">
     <div class="input-shell">
@@ -1119,6 +1162,84 @@ refreshQuota();
 })();
 </script>
 
+<script>
+/* 服务器状态卡片：每 30 秒刷新一次，页面在后台时暂停；任何失败都静默显示 "-" */
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  if (!$('srvCard')) return;
+  var timer = null, busy = false;
+  function now(){ return (window.performance && performance.now) ? performance.now() : Date.now(); }
+  function isNum(v){ return typeof v === 'number' && isFinite(v); }
+  function setText(id, s){ var el = $(id); if (el) el.textContent = s; }
+  function gb(b){ return (b / 1073741824).toFixed(b >= 10737418240 ? 0 : 1); }
+  function bar(id, pct){ var el = $(id); if (el) el.style.width = isNum(pct) ? Math.max(0, Math.min(100, pct)) + '%' : '0'; }
+  function pctText(p){ return isNum(p) ? (Math.round(p) + '%') : '-'; }
+  function msHtml(el, ms){ if (!el) return; if (isNum(ms)) { el.innerHTML = Math.round(ms) + '<small>ms</small>'; } else { el.textContent = '-'; } }
+  function getJson(url){
+    return fetch(url, { cache: 'no-store', credentials: 'same-origin' }).then(function(r){
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    });
+  }
+  // 你→本站：连测 3 次 /api/ping 取中位数
+  function measurePing(){
+    var times = [];
+    function once(){
+      var t0 = now();
+      return getJson('/api/ping?_=' + Date.now() + Math.random()).then(function(){ times.push(now() - t0); });
+    }
+    return once().then(once).then(once).then(function(){
+      times.sort(function(a, b){ return a - b; });
+      return times[1];
+    });
+  }
+  function renderOffline(){
+    var dot = $('srvDot'); if (dot) dot.className = 'srv-dot off';
+    setText('srvOnline', '离线');
+    msHtml($('srvLat'), null);
+    $('srvBars').style.display = '';
+    $('srvNote').style.display = 'none';
+    setText('srvMem', '-'); setText('srvCpu', '-'); setText('srvDisk', '-');
+    bar('srvMemBar', null); bar('srvCpuBar', null); bar('srvDiskBar', null);
+    setText('srvRun', '-'); setText('srvQueue', '-');
+  }
+  function render(s){
+    if (!s || !s.online) { renderOffline(); return; }
+    var dot = $('srvDot'); if (dot) dot.className = 'srv-dot on';
+    setText('srvOnline', '在线');
+    msHtml($('srvLat'), s.latencyMs);
+    if (s.statusSupported === false) {
+      $('srvBars').style.display = 'none';
+      $('srvNote').style.display = '';
+      setText('srvNote', '服务器暂未提供详细状态');
+      setText('srvRun', '-'); setText('srvQueue', '-');
+      return;
+    }
+    $('srvBars').style.display = '';
+    $('srvNote').style.display = 'none';
+    var m = s.mem || {}, c = s.cpu || {}, d = s.disk || {}, j = s.jobs || {};
+    bar('srvMemBar', m.percent); bar('srvCpuBar', c.percent); bar('srvDiskBar', d.percent);
+    $('srvMem').innerHTML = isNum(m.percent) ? '<b>' + pctText(m.percent) + '</b>' + (isNum(m.used) && isNum(m.total) ? ' · ' + gb(m.used) + '/' + gb(m.total) + ' GB' : '') : '-';
+    $('srvCpu').innerHTML = isNum(c.percent) ? '<b>' + pctText(c.percent) + '</b>' + (isNum(c.load1) && isNum(c.cores) ? ' · ' + c.load1.toFixed(2) + '/' + c.cores + '核' : '') : '-';
+    $('srvDisk').innerHTML = isNum(d.percent) ? '<b>' + pctText(d.percent) + '</b>' + (isNum(d.used) && isNum(d.total) ? ' · ' + gb(d.used) + '/' + gb(d.total) + ' GB' : '') : '-';
+    setText('srvRun', isNum(j.running) ? String(j.running) : '-');
+    setText('srvQueue', isNum(j.queued) ? String(j.queued) : '-');
+  }
+  function refresh(){
+    if (busy || document.hidden) return;
+    busy = true;
+    var p1 = measurePing().then(function(ms){ msHtml($('srvPing'), ms); }, function(){ msHtml($('srvPing'), null); });
+    var p2 = getJson('/api/server-status').then(render, function(){ renderOffline(); setText('srvOnline', '-'); var dot = $('srvDot'); if (dot) dot.className = 'srv-dot'; });
+    Promise.all([p1, p2]).then(function(){ busy = false; }, function(){ busy = false; });
+  }
+  function start(){ if (!timer) timer = setInterval(refresh, 30000); }
+  function stop(){ if (timer) { clearInterval(timer); timer = null; } }
+  document.addEventListener('visibilitychange', function(){
+    if (document.hidden) stop(); else { refresh(); start(); }
+  });
+  refresh(); start();
+})();
+</script>
 <script src="/ytmerge.js"></script>
 </body>
 </html>
