@@ -1058,3 +1058,73 @@ test('withKnownLength pipes through FixedLengthStream when present, and degrades
     delete globalThis.FixedLengthStream;
   }
 });
+
+// ---- 第三轮复核 ----
+// 自定 stsd：rawEntries 原样拼接，count 可与实际条目数不同；large=true 时用 64 位 largesize 头。
+function stsdRaw(count, rawEntries, large = false) {
+  const payload = Buffer.concat([Buffer.alloc(4), u32be(count), ...rawEntries]);
+  if (!large) return box('stsd', payload);
+  return Buffer.concat([u32be(1), Buffer.from('stsd', 'latin1'), u32be(0), u32be(16 + payload.length), payload]);
+}
+const trakWith = (stsdBox) => box('trak', box('mdia', box('minf', box('stbl', stsdBox))));
+const mp4With = (...traks) => Buffer.concat([ftyp('isomiso2mp41'), box('moov', box('mvhd', Buffer.alloc(100)), ...traks), mdat]);
+
+test('sniffMergedHead: broken ftyp (size < 8, bad largesize) → unknown, no TypeError', () => {
+  const tiny = new Uint8Array([0, 0, 0, 4, 102, 116, 121, 112, 105, 115, 111, 109, 0, 0, 0, 0, 0, 0, 0, 0]);
+  assert.deepEqual(sniffMergedHead(tiny), { kind: 'unknown' });
+  const badLarge = Buffer.concat([u32be(1), Buffer.from('ftyp'), u32be(0), u32be(8), Buffer.alloc(16)]);
+  assert.deepEqual(sniffMergedHead(badLarge), { kind: 'unknown' });
+  const shortLarge = Buffer.concat([u32be(1), Buffer.from('ftypisom')]); // largesize 字段都不全
+  assert.deepEqual(sniffMergedHead(shortLarge), { kind: 'unknown' });
+});
+
+test('yt1080-file: 20-byte upstream starting 00000004 ftyp passes through (not 502)', async () => {
+  const b = new Uint8Array([0, 0, 0, 4, 102, 116, 121, 112, 105, 115, 111, 109, 0, 0, 0, 0, 0, 0, 0, 0]);
+  const { f } = mergeEnvFetch(b, { 'content-type': 'video/mp4', 'content-length': '20' });
+  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+  assert.equal(r.status, 200);
+  assert.deepEqual(new Uint8Array(await r.arrayBuffer()), b);
+});
+
+test('sniffMergedHead: entry size < 8 or > 16 entries → not judged ok (but real bad formats still block)', () => {
+  const ok = mp4With(trakWith(stsdRaw(1, [box('avc1', Buffer.alloc(70))])), trakWith(stsdRaw(1, [box('mp4a', Buffer.alloc(20))])));
+  assert.deepEqual(sniffMergedHead(ok), { kind: 'mp4', ok: true });
+  // 第一个条目 size=4，第二个条目（Opus）读不到 → 不能说兼容
+  const tinyEntry = Buffer.concat([u32be(4), Buffer.from('avc1'), box('Opus', Buffer.alloc(20))]);
+  assert.deepEqual(sniffMergedHead(mp4With(trakWith(stsdRaw(2, [tinyEntry])), trakWith(stsdRaw(1, [box('mp4a', Buffer.alloc(20))])))), { kind: 'mp4' });
+  const many = Array.from({ length: 17 }, () => box('avc1', Buffer.alloc(8)));
+  assert.deepEqual(sniffMergedHead(mp4With(trakWith(stsdRaw(17, many)))), { kind: 'mp4' });
+  const manyBad = [...Array.from({ length: 15 }, () => box('avc1', Buffer.alloc(8))), box('vp09', Buffer.alloc(8)), box('avc1', Buffer.alloc(8))];
+  assert.deepEqual(sniffMergedHead(mp4With(trakWith(stsdRaw(17, manyBad)))), { kind: 'mp4', ok: false, fmt: 'VP9 MP4' });
+});
+
+test('sniffMergedHead: stsd with 64-bit largesize header is read at body+8', () => {
+  assert.deepEqual(sniffMergedHead(mp4With(trakWith(stsdRaw(1, [box('Opus', Buffer.alloc(20))], true)))), { kind: 'mp4', ok: false, fmt: 'Opus MP4' });
+  assert.deepEqual(sniffMergedHead(mp4With(trakWith(stsdRaw(1, [box('avc1', Buffer.alloc(70))], true)), trakWith(stsdRaw(1, [box('mp4a', Buffer.alloc(20))], true)))), { kind: 'mp4', ok: true });
+});
+
+test('sniffMergedHead: hvc1 is compatible, hev1 stays undecided', () => {
+  assert.deepEqual(sniffMergedHead(Buffer.concat([ftyp('isomiso2mp41'), moov('hvc1', 'mp4a'), mdat])), { kind: 'mp4', ok: true });
+  assert.deepEqual(sniffMergedHead(Buffer.concat([ftyp('isomiso2mp41'), moov('hev1', 'mp4a'), mdat])), { kind: 'mp4' });
+});
+
+test('withKnownLength skips FixedLengthStream when upstream has Content-Encoding', async () => {
+  const mk = () => new ReadableStream({ start(c) { c.enqueue(new Uint8Array([1, 2, 3])); c.close(); } });
+  let seen = null;
+  globalThis.FixedLengthStream = class extends TransformStream { constructor(n) { super(); seen = n; } };
+  try {
+    const s0 = mk();
+    assert.equal(withKnownLength(s0, '3', 'gzip'), s0);
+    assert.equal(withKnownLength(s0, '3', 'br'), s0);
+    assert.equal(seen, null);
+    withKnownLength(mk(), '3', 'identity');
+    assert.equal(seen, 3);
+    seen = null;
+    const { f } = mergeEnvFetch(MP4_H264_AAC, { 'content-type': 'video/mp4', 'content-length': '99', 'content-encoding': 'gzip' });
+    const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+    assert.equal(r.status, 200);
+    assert.equal(seen, null);
+  } finally {
+    delete globalThis.FixedLengthStream;
+  }
+});

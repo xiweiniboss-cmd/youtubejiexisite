@@ -1536,10 +1536,12 @@ function mp4Boxes(buf, from, to) {
   return out;
 }
 const MP4_BAD_SAMPLE = { av01: 'AV1', vp09: 'VP9', vp08: 'VP8', Opus: 'Opus', fLaC: 'FLAC' };
-const MP4_GOOD_VIDEO = new Set(['avc1', 'avc3']);
+// hvc1（参数集在 sample entry 里）iPhone 相册可直接存；hev1（参数集在码流里）兼容性不稳，仍按「判断不了」放行不判 ok。
+const MP4_GOOD_VIDEO = new Set(['avc1', 'avc3', 'hvc1']);
 const MP4_GOOD_AUDIO = new Set(['mp4a']);
 // 只读 moov→trak→mdia→minf→stbl→stsd 里每个样本描述条目的格式 fourcc。
-// stsd 是 FullBox：起点 +8 版本/标志，+12 条目数，+16 起是条目；每个条目 = size(4) + 格式(4) + …。
+// stsd 是 FullBox：盒子头之后（body，一般是起点 +8，64 位 largesize 时 +16）是版本/标志 4 字节、条目数 4 字节，
+// 再往后（body+8）是条目；每个条目 = size(4) + 格式(4) + …。
 // 标题、udta、mdat 里的文字（如「Chopin Opus 28」）都不会被读到。
 function mp4SampleFormats(buf, moov) {
   const lim = Math.min(moov.end, buf.length);
@@ -1551,14 +1553,15 @@ function mp4SampleFormats(buf, moov) {
       for (const minf of child(mdia, 'minf')) {
         for (const stbl of child(minf, 'stbl')) {
           for (const stsd of child(stbl, 'stsd')) {
-            if (stsd.start + 16 > lim) { complete = false; continue; }
-            const count = u32(buf, stsd.start + 12);
-            let e = stsd.start + 16;
+            if (stsd.body + 8 > lim) { complete = false; continue; }
+            const count = u32(buf, stsd.body + 4);
+            if (count > 16) complete = false; // 只读前 16 个，后面没看到就不能说兼容
+            let e = stsd.body + 8;
             for (let i = 0; i < count && i < 16; i++) {
               if (e + 8 > Math.min(stsd.end, buf.length)) { complete = false; break; }
               formats.push(fourcc(buf, e + 4));
               const es = u32(buf, e);
-              if (es < 8) break;
+              if (es < 8) { complete = false; break; } // 条目大小坏了，后面的条目读不到
               e += es;
             }
           }
@@ -1572,13 +1575,16 @@ function mp4SampleFormats(buf, moov) {
 //  - WebM/Matroska（EBML 头 1A 45 DF A3）→ 不兼容；
 //  - MP4：ftyp 兼容品牌里有 av01 → 不兼容；
 //    能读到 moov 时解析盒子结构，只看 stsd 样本格式：av01/vp09/vp08/Opus/fLaC → 不兼容；
-//    moov 读全了、有 avc1、其余都是 avc1/avc3/mp4a → 兼容；
+//    moov 读全了、有 avc1/avc3/hvc1、其余都是 avc1/avc3/hvc1/mp4a → 兼容；
+//  - ftyp 盒子本身坏了（size < 8、largesize 不对）→ unknown，放行；
 //  - moov 在文件尾（读不到）、没读全且没坏标记、或认不出 → unknown，放行。
 export function sniffMergedHead(buf) {
   if (!buf || buf.length < 12) return { kind: 'unknown' };
   if (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) return { kind: 'webm', ok: false, fmt: 'WebM' };
   if (fourcc(buf, 4) !== 'ftyp') return { kind: 'unknown' };
   const top = mp4Boxes(buf, 0, buf.length);
+  // ftyp 的 size < 8 或 largesize 不对时解析不出盒子：认不出就放行，别让 ftyp.end 抛错变成 502。
+  if (!top.length || top[0].type !== 'ftyp') return { kind: 'unknown' };
   const ftyp = top[0];
   const ftypEnd = Math.min(buf.length, ftyp.end);
   for (let o = ftyp.body; o + 4 <= ftypEnd; o += 4) {
@@ -1613,8 +1619,10 @@ export function dispositionFilename(cd) {
 }
 // Workers 里用自建 ReadableStream 当响应体会丢掉 Content-Length（变成 chunked，前端没有百分比）。
 // 上游给了长度就经 FixedLengthStream 转接保留长度；本地/测试环境没有 FixedLengthStream 时原样返回。
-export function withKnownLength(stream, contentLength) {
+// 上游带 Content-Encoding（gzip/br 等）时 fetch 拿到的是解压后的字节，长度对不上，不套。
+export function withKnownLength(stream, contentLength, contentEncoding) {
   const len = Number(contentLength);
+  if (contentEncoding && !/^\s*identity\s*$/i.test(contentEncoding)) return stream;
   if (typeof FixedLengthStream !== 'function' || !Number.isSafeInteger(len) || len <= 0) return stream;
   const { readable, writable } = new FixedLengthStream(len);
   stream.pipeTo(writable).catch(() => { /* 客户端中断或上游断流，readable 端会报错 */ });
@@ -1783,7 +1791,7 @@ async function handleYt1080File(request, env) {
     headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition');
     headers.set('Cache-Control', 'no-store');
     headers.set('Access-Control-Allow-Origin', '*');
-    return new Response(withKnownLength(stream, resp.headers.get('content-length')), { status: 200, headers });
+    return new Response(withKnownLength(stream, resp.headers.get('content-length'), resp.headers.get('content-encoding')), { status: 200, headers });
   } catch (e) {
     return mergeConnectError(e);
   }
