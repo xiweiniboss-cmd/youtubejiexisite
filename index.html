@@ -865,6 +865,12 @@ var deviceId = (function(){
     return rejected;
   }
   // HUMAN_* 拒绝时给用户看的话：组件没出来 → 加载失败；组件好好的 → 通行证过期（旧结果的下载 / 合并）；其余用服务器原文
+  // 本地还没拿到 token 就点了按钮：按组件状态给提示
+  function tsNeedMsg(){
+    if (tsState === 'rejected') return TS_MSG_REJECTED;
+    if (tsState === 'failed') return TS_MSG_LOAD_FAIL;
+    return '请先完成人机验证';
+  }
   function humanMsg(body){
     var code = (body && body.code) || '';
     if (code === 'HUMAN_REQUIRED') {
@@ -891,11 +897,13 @@ var deviceId = (function(){
         'unsupported-callback': function(){ tsSetState('failed'); },
         'expired-callback': function(){ resetParseTs(); },
         'timeout-callback': function(){ resetParseTs(); },
-        'error-callback': function(){
+        'error-callback': function(code){
           // 组件已经渲染出来（iframe 在封闭 shadow 里查不到，用隐藏的 cf-turnstile-response 判断）
           // 但 Turnstile 自己判失败（如域名没授权 110200）→ 不是网络问题
           var hasFrame = !!(box && box.querySelector('iframe, input[name="cf-turnstile-response"]'));
-          if (tsState !== 'ready') tsSetState(hasFrame ? 'rejected' : 'failed');
+          // 2005xx 是网络类错误（连不上 Cloudflare），归到加载失败
+          var netErr = /^2005/.test(String(code || ''));
+          if (tsState !== 'ready') tsSetState(hasFrame && !netErr ? 'rejected' : 'failed');
           else showError('人机验证失败，请重试（刷新页面也可以）');
         }
       });
@@ -996,7 +1004,7 @@ var deviceId = (function(){
     resultBox.style.display = 'none';
     if(!text){ showError('请先粘贴 YouTube 分享链接'); return; }
     var hq = humanQuery();
-    if (hq === null) { showError('请先完成人机验证'); return; }
+    if (hq === null) { showError(tsNeedMsg()); return; }
     setParseBtn('解析中…', true);
     loading.style.display = 'block';
     var apiUrl = '/api/parse?url=' + encodeURIComponent(text);
@@ -1127,7 +1135,7 @@ var deviceId = (function(){
       if (onStatus) onStatus(html);
     }
     var hq = humanQuery();
-    if (hq === null) { status('请先完成人机验证'); return; }
+    if (hq === null) { status(tsNeedMsg()); return; }
     setMergeBtn('正在提交合并任务…', true);
     status('已提交，服务器正在解析 ' + label + '…请不要关闭页面，约几分钟。');
     fetch('/api/yt1080-start?url=' + encodeURIComponent(ytUrl) + '&quality=' + encodeURIComponent(quality) + '&mode=' + encodeURIComponent(mode) + hq, { method: 'POST' })

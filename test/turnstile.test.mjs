@@ -269,7 +269,8 @@ test('index.html: widget sits right under 开始解析 and both parse and server
   const { html } = frontendHuman();
   assert.match(html, /id="parseBtn">开始解析<\/button>\n\s*<!--[^\n]*-->\n\s*<div id="tsParseWidget"/);
   assert.equal((html.match(/id="tsParseWidget"/g) || []).length, 1);
-  assert.match(html, /var hq = humanQuery\(\);\n\s*if \(hq === null\) \{ showError\('请先完成人机验证'\); return; \}/);
+  assert.match(html, /var hq = humanQuery\(\);\n\s*if \(hq === null\) \{ showError\(tsNeedMsg\(\)\); return; \}/);
+  assert.match(html, /if \(hq === null\) \{ status\(tsNeedMsg\(\)\); return; \}/);
   assert.match(html, /'\/api\/yt1080-start\?url=[^\n]+\+ hq, \{ method: 'POST' \}/);
   assert.match(html, /'expired-callback'/);
   assert.match(html, /language: 'zh-cn'/);
@@ -297,6 +298,18 @@ test('index.html: humanQuery / humanDone lifecycle (second parse works, rejectio
   assert.equal(run('humanDone("", { ok: false, code: "HUMAN_REQUIRED" })'), true);
   assert.equal(ctx.resets, 2);
   assert.equal(run('humanQuery()'), null);
+});
+
+test('index.html: tsNeedMsg — rejected / load failed / plain need-verify', () => {
+  const { run } = frontendHuman();
+  run('tsState = "rejected"');
+  assert.equal(run('tsNeedMsg()'), '人机验证未通过，请刷新页面重试');
+  run('tsState = "failed"');
+  assert.equal(run('tsNeedMsg()'), '人机验证组件加载失败，请检查网络或 VPN 后刷新');
+  run('tsState = "ready"');
+  assert.equal(run('tsNeedMsg()'), '请先完成人机验证');
+  run('tsState = "rejected"');
+  assert.equal(run('humanMsg({ code: "HUMAN_REQUIRED" })'), '人机验证未通过，请刷新页面重试');
 });
 
 test('index.html: humanMsg distinguishes load failure / still loading / expired pass / server text', () => {
