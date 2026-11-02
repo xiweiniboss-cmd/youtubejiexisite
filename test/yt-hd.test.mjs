@@ -17,6 +17,8 @@ import worker, {
   mergeCodecVerdict,
   sniffMergedHead,
   rfc5987,
+  dispositionFilename,
+  withKnownLength,
 } from '../_worker.js';
 import { spawnSync } from 'node:child_process';
 
@@ -864,13 +866,40 @@ function box(type, ...parts) {
   return Buffer.concat([h, payload]);
 }
 const ftyp = (brands) => box('ftyp', 'isom', Buffer.alloc(4), brands);
-const moov = (...entries) => box('moov', box('mvhd', Buffer.alloc(100)), ...entries.map((e) => box('trak', box('stsd', Buffer.alloc(8), box(e, Buffer.alloc(70))))));
+// 正经的 moov→trak→mdia→minf→stbl→stsd 结构；stsd = FullBox(版本/标志 4 字节 + 条目数 4 字节) + 条目。
+const u32be = (n) => { const b = Buffer.alloc(4); b.writeUInt32BE(n); return b; };
+const stsd = (...fmts) => box('stsd', Buffer.alloc(4), u32be(fmts.length), ...fmts.map((f) => box(f, Buffer.alloc(70))));
+const trak = (...fmts) => box('trak', box('tkhd', Buffer.alloc(84)), box('mdia', box('mdhd', Buffer.alloc(24)), box('minf', box('stbl', stsd(...fmts), box('stts', Buffer.alloc(8))))));
+const udtaTitle = (t) => box('udta', box('meta', Buffer.alloc(4), box('ilst', box('\u00a9nam', box('data', Buffer.alloc(8), t)))));
+const moov = (...entries) => box('moov', box('mvhd', Buffer.alloc(100)), ...entries.map((e) => trak(e)));
 const mdat = box('mdat', Buffer.alloc(4096, 7));
 const EBML = Buffer.concat([Buffer.from([0x1a, 0x45, 0xdf, 0xa3]), Buffer.alloc(4096, 1)]);
 const MP4_H264_AAC = Buffer.concat([ftyp('isomiso2avc1mp41'), moov('avc1', 'mp4a'), mdat]);
 const MP4_H264_OPUS = Buffer.concat([ftyp('isomiso2avc1mp41'), moov('avc1', 'Opus'), mdat]);
 const MP4_AV1_BRAND_TAIL = Buffer.concat([ftyp('isomav01iso2mp41'), mdat, moov('av01', 'Opus')]);
 const MP4_MOOV_AT_END = Buffer.concat([ftyp('isomiso2mp41'), mdat, moov('avc1', 'mp4a')]);
+
+test('sniffMergedHead: only stsd sample formats count — titles / udta / mdat text with Opus, av01 pass', () => {
+  const titled = Buffer.concat([
+    ftyp('isomiso2avc1mp41'),
+    box('moov', box('mvhd', Buffer.alloc(100)), trak('avc1'), trak('mp4a'), udtaTitle('Chopin Opus 28 av01 vp09 fLaC')),
+    box('mdat', 'Opus av01 vp09 fLaC', Buffer.alloc(2048, 5)),
+  ]);
+  assert.deepEqual(sniffMergedHead(titled), { kind: 'mp4', ok: true });
+  // moov 在尾、标题里有 Opus：读不到 moov 也只是 unknown，不拦
+  const tailTitled = Buffer.concat([ftyp('isomiso2mp41'), box('mdat', 'Chopin Opus 28', Buffer.alloc(2048, 5)), box('moov', trak('avc1'), udtaTitle('Opus'))]);
+  assert.notEqual(sniffMergedHead(tailTitled).ok, false);
+  // 真样本仍然拦
+  assert.deepEqual(sniffMergedHead(Buffer.concat([ftyp('isomiso2mp41'), moov('avc1', 'Opus'), mdat])), { kind: 'mp4', ok: false, fmt: 'Opus MP4' });
+  assert.deepEqual(sniffMergedHead(Buffer.concat([ftyp('isomiso2mp41'), moov('av01', 'mp4a'), mdat])), { kind: 'mp4', ok: false, fmt: 'AV1 MP4' });
+  assert.deepEqual(sniffMergedHead(Buffer.concat([ftyp('isomiso2mp41'), moov('vp09', 'Opus'), mdat])), { kind: 'mp4', ok: false, fmt: 'VP9 + Opus MP4' });
+  // 一个 stsd 里多个条目：依次读到第二个
+  const multi = Buffer.concat([ftyp('isomiso2mp41'), box('moov', box('trak', box('mdia', box('minf', box('stbl', stsd('mp4a', 'Opus')))))), mdat]);
+  assert.equal(sniffMergedHead(multi).ok, false);
+  // 64 位 largesize 的 mdat 在前、moov 在后也能走过去
+  const big = Buffer.concat([ftyp('isomiso2mp41'), Buffer.concat([u32be(1), Buffer.from('mdat'), u32be(0), u32be(16 + 64), Buffer.alloc(64)]), moov('avc1', 'mp4a')]);
+  assert.equal(sniffMergedHead(big).ok, true);
+});
 
 test('sniffMergedHead: EBML/AV1/Opus are rejected, avc1+mp4a passes, moov at the end is unknown', () => {
   assert.deepEqual(sniffMergedHead(EBML), { kind: 'webm', ok: false, fmt: 'WebM' });
@@ -990,4 +1019,42 @@ test('index.html shows MERGE_NOT_IPHONE, forces .mp4 on merged saves, and keeps 
   const mergeJs = readFileSync(new URL('../ytmerge.js', import.meta.url), 'utf8');
   assert.match(mergeJs, /finally \{[\s\S]*ff\.off\('progress', prog\)/);
   assert.doesNotMatch(mergeJs, /_sniffAudio/);
+});
+
+test('dispositionFilename prefers filename* (UTF-8) over the ASCII filename', () => {
+  assert.equal(dispositionFilename(`attachment; filename="____.mp4"; filename*=UTF-8''%E8%82%96%E9%82%A6%20Opus%2028.mp4`), '肖邦 Opus 28.mp4');
+  assert.equal(dispositionFilename(`attachment; filename*=utf-8'zh'%E4%B8%AD.mp4; filename="x.mp4"`), '中.mp4');
+  assert.equal(dispositionFilename('attachment; filename="a \\"b\\".mp4"'), 'a "b".mp4');
+  assert.equal(dispositionFilename('attachment; filename=plain.mp4'), 'plain.mp4');
+  assert.equal(dispositionFilename(`attachment; filename*=UTF-8''%E0%A4%A; filename="fallback.mp4"`), 'fallback.mp4');
+  assert.equal(dispositionFilename(''), '');
+});
+
+test('yt1080-file keeps the UTF-8 name from filename*', async () => {
+  const { f } = mergeEnvFetch(MP4_H264_AAC, { 'content-type': 'video/mp4', 'content-disposition': `attachment; filename="____.mp4"; filename*=UTF-8''%E8%82%96%E9%82%A6.mp4` });
+  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+  assert.match(r.headers.get('content-disposition'), /filename\*=UTF-8''%E8%82%96%E9%82%A6\.mp4$/);
+});
+
+test('withKnownLength pipes through FixedLengthStream when present, and degrades safely when not', async () => {
+  const mk = () => new ReadableStream({ start(c) { c.enqueue(new Uint8Array([1, 2, 3])); c.close(); } });
+  const plain = mk();
+  assert.equal(withKnownLength(plain, '3'), plain); // Node 里没有 FixedLengthStream
+  let seen = null;
+  globalThis.FixedLengthStream = class extends TransformStream { constructor(n) { super(); seen = n; } };
+  try {
+    const s0 = mk();
+    assert.equal(withKnownLength(s0, null), s0);
+    assert.equal(withKnownLength(s0, 'abc'), s0);
+    const out = withKnownLength(mk(), '3');
+    assert.equal(seen, 3);
+    assert.deepEqual([...new Uint8Array(await new Response(out).arrayBuffer())], [1, 2, 3]);
+    const { f } = mergeEnvFetch(MP4_H264_AAC, { 'content-type': 'video/mp4', 'content-length': String(MP4_H264_AAC.length) });
+    seen = null;
+    const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+    assert.equal(seen, MP4_H264_AAC.length);
+    assert.deepEqual(Buffer.from(await r.arrayBuffer()), MP4_H264_AAC);
+  } finally {
+    delete globalThis.FixedLengthStream;
+  }
 });

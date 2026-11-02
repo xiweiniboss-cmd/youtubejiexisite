@@ -1506,42 +1506,119 @@ export function mergeCodecVerdict(s) {
   if (vOk && aOk && eOk) return { ok: true };
   return { ok: false, fmt: [v, a, ext].filter(Boolean).join(' + ') };
 }
-function bytesIndexOf(buf, str, from = 0, to = buf.length) {
-  const c = [...str].map((ch) => ch.charCodeAt(0));
-  outer: for (let i = from; i <= to - c.length; i++) {
-    for (let j = 0; j < c.length; j++) if (buf[i + j] !== c[j]) continue outer;
-    return i;
+function u32(buf, o) {
+  return (buf[o] << 24 | buf[o + 1] << 16 | buf[o + 2] << 8 | buf[o + 3]) >>> 0;
+}
+function fourcc(buf, o) {
+  return String.fromCharCode(buf[o], buf[o + 1], buf[o + 2], buf[o + 3]);
+}
+// 按 ISO BMFF 盒子结构遍历 [from, to) 内的直接子盒子。返回 {type, start, body, end, truncated}。
+// end 是盒子声明的结尾（可能超出已读到的 buf），truncated 表示没读全。
+function mp4Boxes(buf, from, to) {
+  const out = [];
+  let o = from;
+  while (o + 8 <= to) {
+    let size = u32(buf, o);
+    const type = fourcc(buf, o + 4);
+    let hdr = 8;
+    if (size === 1) {
+      if (o + 16 > to) break;
+      size = u32(buf, o + 8) * 4294967296 + u32(buf, o + 12);
+      hdr = 16;
+    } else if (size === 0) {
+      size = to - o; // 到父盒子 / 文件结尾
+    }
+    if (size < hdr) break; // 结构坏了，不再往下猜
+    const end = o + size;
+    out.push({ type, start: o, body: o + hdr, end, truncated: end > buf.length });
+    o = end;
   }
-  return -1;
+  return out;
+}
+const MP4_BAD_SAMPLE = { av01: 'AV1', vp09: 'VP9', vp08: 'VP8', Opus: 'Opus', fLaC: 'FLAC' };
+const MP4_GOOD_VIDEO = new Set(['avc1', 'avc3']);
+const MP4_GOOD_AUDIO = new Set(['mp4a']);
+// 只读 moov→trak→mdia→minf→stbl→stsd 里每个样本描述条目的格式 fourcc。
+// stsd 是 FullBox：起点 +8 版本/标志，+12 条目数，+16 起是条目；每个条目 = size(4) + 格式(4) + …。
+// 标题、udta、mdat 里的文字（如「Chopin Opus 28」）都不会被读到。
+function mp4SampleFormats(buf, moov) {
+  const lim = Math.min(moov.end, buf.length);
+  const formats = [];
+  let complete = !moov.truncated;
+  const child = (box, type) => mp4Boxes(buf, box.body, Math.min(box.end, buf.length)).filter((b) => b.type === type);
+  for (const trak of child(moov, 'trak')) {
+    for (const mdia of child(trak, 'mdia')) {
+      for (const minf of child(mdia, 'minf')) {
+        for (const stbl of child(minf, 'stbl')) {
+          for (const stsd of child(stbl, 'stsd')) {
+            if (stsd.start + 16 > lim) { complete = false; continue; }
+            const count = u32(buf, stsd.start + 12);
+            let e = stsd.start + 16;
+            for (let i = 0; i < count && i < 16; i++) {
+              if (e + 8 > Math.min(stsd.end, buf.length)) { complete = false; break; }
+              formats.push(fourcc(buf, e + 4));
+              const es = u32(buf, e);
+              if (es < 8) break;
+              e += es;
+            }
+          }
+        }
+      }
+    }
+  }
+  return { formats, complete };
 }
 // 看成品开头（最多 512 KB，faststart 的 moov 一般都在里面）：
 //  - WebM/Matroska（EBML 头 1A 45 DF A3）→ 不兼容；
-//  - MP4：ftyp 兼容品牌里有 av01 → 不兼容；moov 在开头时，样本描述里有 av01/vp09/Opus → 不兼容，
-//    有 avc1 且（无音轨或 mp4a）→ 兼容；
-//  - moov 在文件尾（读不到）或认不出 → unknown，放行。
+//  - MP4：ftyp 兼容品牌里有 av01 → 不兼容；
+//    能读到 moov 时解析盒子结构，只看 stsd 样本格式：av01/vp09/vp08/Opus/fLaC → 不兼容；
+//    moov 读全了、有 avc1、其余都是 avc1/avc3/mp4a → 兼容；
+//  - moov 在文件尾（读不到）、没读全且没坏标记、或认不出 → unknown，放行。
 export function sniffMergedHead(buf) {
   if (!buf || buf.length < 12) return { kind: 'unknown' };
   if (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) return { kind: 'webm', ok: false, fmt: 'WebM' };
-  if (bytesIndexOf(buf, 'ftyp', 4, 8) !== 4) return { kind: 'unknown' };
-  const ftypSize = (buf[0] << 24 | buf[1] << 16 | buf[2] << 8 | buf[3]) >>> 0;
-  const ftypEnd = Math.min(buf.length, Math.max(8, ftypSize));
-  if (bytesIndexOf(buf, 'av01', 8, ftypEnd) >= 0) return { kind: 'mp4', ok: false, fmt: 'AV1 MP4' };
-  const moov = bytesIndexOf(buf, 'moov', ftypEnd);
-  if (moov < 4) return { kind: 'mp4' };
-  // moov 的盒子长度在 'moov' 前 4 字节；读到的头不够整个 moov 时，只认"坏"标记，不下"兼容"的结论。
-  const moovSize = (buf[moov - 4] << 24 | buf[moov - 3] << 16 | buf[moov - 2] << 8 | buf[moov - 1]) >>> 0;
-  const moovEnd = moov - 4 + moovSize;
-  const complete = moovSize >= 8 && moovEnd <= buf.length;
-  const end = complete ? moovEnd : buf.length;
-  const has = (t) => bytesIndexOf(buf, t, moov, end) >= 0;
-  const bad = ['av01', 'vp09', 'Opus', 'fLaC'].filter(has);
+  if (fourcc(buf, 4) !== 'ftyp') return { kind: 'unknown' };
+  const top = mp4Boxes(buf, 0, buf.length);
+  const ftyp = top[0];
+  const ftypEnd = Math.min(buf.length, ftyp.end);
+  for (let o = ftyp.body; o + 4 <= ftypEnd; o += 4) {
+    if (o === ftyp.body + 4) continue; // minor_version 不是品牌
+    if (fourcc(buf, o) === 'av01') return { kind: 'mp4', ok: false, fmt: 'AV1 MP4' };
+  }
+  const moov = top.find((b) => b.type === 'moov');
+  if (!moov) return { kind: 'mp4' };
+  const { formats, complete } = mp4SampleFormats(buf, moov);
+  const bad = [...new Set(formats.filter((f) => MP4_BAD_SAMPLE[f]).map((f) => MP4_BAD_SAMPLE[f]))];
   if (bad.length) return { kind: 'mp4', ok: false, fmt: bad.join(' + ') + ' MP4' };
-  if (complete && has('avc1')) return { kind: 'mp4', ok: true };
+  if (complete && formats.some((f) => MP4_GOOD_VIDEO.has(f)) && formats.every((f) => MP4_GOOD_VIDEO.has(f) || MP4_GOOD_AUDIO.has(f))) {
+    return { kind: 'mp4', ok: true };
+  }
   return { kind: 'mp4' };
 }
 // RFC 5987：encodeURIComponent 不转义 ' ( ) *，在 filename* 里要转。
 export function rfc5987(s) {
   return encodeURIComponent(s).replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+}
+// Content-Disposition 取文件名：优先 filename*（RFC 5987，UTF-8 百分号编码），再退到 filename。
+export function dispositionFilename(cd) {
+  const star = /filename\*\s*=\s*([\w-]+)'[^']*'([^;]+)/i.exec(cd);
+  if (star) {
+    const v = star[2].trim().replace(/^"|"$/g, '');
+    try { return /^utf-?8$/i.test(star[1]) ? decodeURIComponent(v) : unescape(v); } catch { /* 坏编码就退到 filename */ }
+  }
+  const q = /filename\s*=\s*"((?:[^"\\]|\\.)*)"/i.exec(cd);
+  if (q) return q[1].replace(/\\(.)/g, '$1');
+  const t = /filename\s*=\s*([^;]+)/i.exec(cd);
+  return t ? t[1].trim() : '';
+}
+// Workers 里用自建 ReadableStream 当响应体会丢掉 Content-Length（变成 chunked，前端没有百分比）。
+// 上游给了长度就经 FixedLengthStream 转接保留长度；本地/测试环境没有 FixedLengthStream 时原样返回。
+export function withKnownLength(stream, contentLength) {
+  const len = Number(contentLength);
+  if (typeof FixedLengthStream !== 'function' || !Number.isSafeInteger(len) || len <= 0) return stream;
+  const { readable, writable } = new FixedLengthStream(len);
+  stream.pipeTo(writable).catch(() => { /* 客户端中断或上游断流，readable 端会报错 */ });
+  return readable;
 }
 // 先读够 limit 字节用于判断，再把读过的块和剩下的流原样接起来下发，不用整份缓存。
 async function peekStream(body, limit) {
@@ -1695,9 +1772,7 @@ async function handleYt1080File(request, env) {
       return json(notIphone(sn.fmt), 415);
     }
     const headers = new Headers(resp.headers);
-    const upName = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(resp.headers.get('content-disposition') || '');
-    let fname = upName ? upName[1] : '';
-    try { fname = decodeURIComponent(fname); } catch { /* 保留原样 */ }
+    let fname = dispositionFilename(resp.headers.get('content-disposition') || '');
     fname = fname.replace(/["\r\n\\/]/g, '').slice(0, 80);
     // 只在没有上游文件名时补一个；确认是 MP4 才补 .mp4，不把别的容器改名成 .mp4。
     if (!fname) fname = 'youtube_' + id.replace(/[^\w-]/g, '').slice(0, 24) + (sn.kind === 'mp4' ? '.mp4' : '');
@@ -1708,7 +1783,7 @@ async function handleYt1080File(request, env) {
     headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition');
     headers.set('Cache-Control', 'no-store');
     headers.set('Access-Control-Allow-Origin', '*');
-    return new Response(stream, { status: 200, headers });
+    return new Response(withKnownLength(stream, resp.headers.get('content-length')), { status: 200, headers });
   } catch (e) {
     return mergeConnectError(e);
   }
