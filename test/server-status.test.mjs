@@ -36,7 +36,7 @@ test('server-status: online with full data, token sent as X-Merge-Token, percent
   }, async () => {
     const { resp, text, body } = await callRoute({ YT_MERGE_TOKEN: ' ' + TOKEN + ' ', YT_MERGE_BASE: 'http://ec2.example:30002/' });
     assert.equal(resp.status, 200);
-    assert.match(resp.headers.get('Cache-Control'), /max-age=15/);
+    assert.match(resp.headers.get('Cache-Control'), /max-age=4/);
     assert.equal(resp.headers.get('Access-Control-Allow-Origin'), null);
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, 'http://ec2.example:30002/status');
@@ -53,7 +53,7 @@ test('server-status: online with full data, token sent as X-Merge-Token, percent
     assert.equal(typeof body.checkedAt, 'number');
     assert.equal(body.secretEcho, undefined);
     assert.ok(!text.includes(TOKEN));
-    // 15 秒内第二次请求走缓存，不再打 EC2
+    // 4 秒内第二次请求走缓存，不再打 EC2
     await callRoute({ YT_MERGE_TOKEN: TOKEN, YT_MERGE_BASE: 'http://ec2.example:30002/' });
     assert.equal(calls.length, 1);
   });

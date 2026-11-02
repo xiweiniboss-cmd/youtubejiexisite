@@ -26,7 +26,7 @@
 //   401/403 视为在线但口令不匹配（authFailed:true）；500/501/503/505–519/531–599 视为在线但异常（degraded:true）；
 //   超时 / 连不上 / 502 / 504 / 520–530 / 带 server: cloudflare 的 5xx / 1016 视为离线（服务器不可达）。
 //   响应体最多读 16KB；200 但超出上限算在线但异常（degraded:true）。
-//   结果在边缘缓存约 15 秒，同一 isolate 内并发请求共用一次 EC2 请求（单飞）。
+//   结果在边缘缓存约 4 秒，同一 isolate 内并发请求共用一次 EC2 请求（单飞）。
 //   /api/ping 只给浏览器测「你→本站」延迟。两个接口都不加 CORS 头。
 // 年龄限制看 playabilityStatus.reason，不要只看 status：LOGIN_REQUIRED 也会是「Sign in to confirm you're not a bot」。
 
@@ -1878,8 +1878,8 @@ async function handleYt1080File(request, env) {
 // 这两个接口只给本站页面用，不加 Access-Control-Allow-Origin。
 export const SERVER_STATUS_TIMEOUT_MS = 5000;
 export const SERVER_STATUS_MAX_BODY = 16 * 1024;
-const SERVER_STATUS_TTL = 15;
-// mergeBase -> { done, at, promise }：同一 isolate 内单飞 + 15 秒兜底缓存（pages.dev 上 Cache API 不生效），
+const SERVER_STATUS_TTL = 4;
+// mergeBase -> { done, at, promise }：同一 isolate 内单飞 + 4 秒兜底缓存（pages.dev 上 Cache API 不生效），
 // 并发请求共用同一个进行中的 EC2 请求。
 const serverStatusMemo = new Map();
 
