@@ -119,6 +119,39 @@ footer{ text-shadow:0 1px 8px rgba(0,0,0,.30); }
 /* ===== 背景层级修正（第四轮）：body 改透明，品牌渐变层真正显示 ===== */
 body{ background:transparent; }
 </style>
+<style>
+/* ===== 服务器状态卡片（默认折叠成一行，点「详情」展开） ===== */
+/* 上下内边距只留 2px：折叠行本身 32px 高，好让「详情」按钮的点按区域撑满 32px，同时卡片总高不超过 40px */
+.srv-card{ padding:2px 6px 2px 12px; margin-top:10px; border-radius:14px; }
+.srv-card + .card{ margin-top:12px; }
+.srv-line{ display:flex; align-items:center; gap:7px; min-height:32px; font-size:11.5px; line-height:18px; white-space:nowrap; min-width:0; overflow:hidden; }
+.srv-dot{ width:7px; height:7px; border-radius:50%; background:var(--faint); flex:none; }
+.srv-dot.on{ background:#2ecc71; box-shadow:0 0 0 3px rgba(46,204,113,.18); }
+.srv-dot.warn{ background:#f5a623; box-shadow:0 0 0 3px rgba(245,166,35,.18); }
+.srv-dot.na{ background:#9a9aa6; box-shadow:0 0 0 3px rgba(154,154,166,.18); }
+.srv-dot.off{ background:var(--pink); box-shadow:0 0 0 3px rgba(255,0,0,.18); }
+.srv-state{ font-weight:700; color:var(--text); flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; }
+/* 窄屏上「在线 · 状态鉴权失败」这类长状态放不下两段延迟：折叠行只留 本站→服务器，你→本站 在详情里看 */
+@media (max-width:420px){ .srv-line.long .srv-me{ display:none; } }
+/* 更窄（如 320px）时由脚本实测：状态文字被截断就先藏 你→本站，还不够再藏 本站→服务器（两项在详情里都有） */
+.srv-line.fit1 .srv-me, .srv-line.fit2 .srv-lat{ display:none; }
+.srv-latd{ margin-top:8px; font-size:12px; color:var(--faint); }
+.srv-latd b{ color:var(--text); font-weight:600; }
+.srv-state.warn{ color:#f5a623; }
+.srv-lat{ color:var(--faint); flex:none; }
+.srv-lat b{ color:var(--text); font-weight:600; font-variant-numeric:tabular-nums; }
+.srv-toggle{ flex:none; height:32px; min-width:48px; background:none; border:none; color:var(--muted); font-size:11.5px; line-height:18px; font-family:inherit; padding:0 4px 0 12px; margin:0 0 0 auto; cursor:pointer; -webkit-appearance:none; appearance:none; -webkit-tap-highlight-color:transparent; }
+.srv-detail{ margin:1px 4px 0 0; padding:4px 0 7px; border-top:1px solid rgba(255,255,255,.07); }
+.srv-row{ display:flex; align-items:center; gap:8px; margin-top:8px; font-size:12px; }
+.srv-row .srv-k{ width:62px; flex:none; font-size:12px; color:var(--faint); white-space:nowrap; }
+.srv-bar{ flex:1; height:6px; border-radius:999px; background:rgba(255,255,255,.08); overflow:hidden; }
+.srv-bar i{ display:block; height:100%; width:0; border-radius:999px; background:linear-gradient(92deg,#ff7a45,#FF0000); -webkit-transition:width .4s; transition:width .4s; }
+.srv-row .srv-n{ min-width:104px; text-align:right; color:var(--muted); font-variant-numeric:tabular-nums; white-space:nowrap; }
+.srv-row .srv-n b{ color:var(--text); font-weight:600; }
+.srv-note{ margin-top:8px; font-size:12px; color:var(--faint); }
+.srv-jobs{ margin-top:9px; font-size:12px; color:var(--muted); }
+.srv-jobs b{ color:var(--pink); font-weight:700; }
+</style>
 </head>
 <body>
 <div class="bg"><div class="orb orb-a"></div><div class="orb orb-b"></div><div class="orb orb-c"></div></div><div class="grain"></div>
@@ -137,6 +170,27 @@ body{ background:transparent; }
     <p>在 YouTube 里点「分享 → 复制链接」，把链接粘到下面，剩下的交给我们。多种清晰度可选，也能只下音频。</p>
     <p class="hero-count">本站已解析 <b id="parseCount">-</b> 次</p>
   </section>
+
+  <!-- 服务器状态（合并服务器）：数据来自 /api/server-status（Worker 代问 EC2，口令不进前端）与 /api/ping。默认折叠成一行 -->
+  <div class="card srv-card" id="srvCard" title="合并服务器状态">
+    <div class="srv-line" id="srvLine">
+      <span class="srv-dot" id="srvDot"></span>
+      <span class="srv-state" id="srvOnline">-</span>
+      <span class="srv-lat srv-me">你→本站 <b id="srvPing">-</b></span>
+      <span class="srv-lat">本站→服务器 <b id="srvLat">-</b></span>
+      <button type="button" class="srv-toggle" id="srvToggle" aria-expanded="false" aria-controls="srvDetail">详情 ▾</button>
+    </div>
+    <div class="srv-detail" id="srvDetail" style="display:none">
+      <div class="srv-latd">延迟：你→本站 <b id="srvPing2">-</b> · 本站→服务器 <b id="srvLat2">-</b></div>
+      <div id="srvBars">
+        <div class="srv-row"><span class="srv-k">内存</span><span class="srv-bar"><i id="srvMemBar"></i></span><span class="srv-n" id="srvMem">-</span></div>
+        <div class="srv-row"><span class="srv-k">CPU 负载</span><span class="srv-bar"><i id="srvCpuBar"></i></span><span class="srv-n" id="srvCpu">-</span></div>
+        <div class="srv-row"><span class="srv-k">硬盘</span><span class="srv-bar"><i id="srvDiskBar"></i></span><span class="srv-n" id="srvDisk">-</span></div>
+      </div>
+      <div class="srv-note" id="srvNote" style="display:none"></div>
+      <div class="srv-jobs" id="srvJobs">合并任务 运行 <b id="srvRun">-</b> / 排队 <b id="srvQueue">-</b></div>
+    </div>
+  </div>
 
   <div class="card">
     <div class="input-shell">
@@ -1119,6 +1173,108 @@ refreshQuota();
 })();
 </script>
 
+<script>
+/* 服务器状态卡片：默认折叠；每 30 秒刷新一次，页面在后台时暂停；任何失败都静默显示 "-" */
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  if (!$('srvCard')) return;
+  var timer = null, busy = false;
+  function now(){ return (window.performance && performance.now) ? performance.now() : Date.now(); }
+  function isNum(v){ return typeof v === 'number' && isFinite(v); }
+  function setText(id, s){ var el = $(id); if (el) el.textContent = s; }
+  function show(id, on){ var el = $(id); if (el) el.style.display = on ? '' : 'none'; }
+  function gb(b){ return (b / 1073741824).toFixed(b >= 10737418240 ? 0 : 1); }
+  function bar(id, pct){ var el = $(id); if (el) el.style.width = isNum(pct) ? Math.max(0, Math.min(100, pct)) + '%' : '0'; }
+  function pctText(p){ return isNum(p) ? (Math.round(p) + '%') : '-'; }
+  function ms(id, v){ var t = isNum(v) ? Math.round(v) + 'ms' : '-'; setText(id, t); setText(id + '2', t); }
+  function getJson(url){
+    return fetch(url, { cache: 'no-store', credentials: 'same-origin' }).then(function(r){
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    });
+  }
+  // 中位数（偶数个取中间两个的平均）
+  function median(a){
+    if (!a.length) return null;
+    a = a.slice().sort(function(x, y){ return x - y; });
+    var h = Math.floor(a.length / 2);
+    return a.length % 2 ? a[h] : (a[h - 1] + a[h]) / 2;
+  }
+  // 你→本站：连测 3 次 /api/ping，取成功那几次的中位数；全失败才是 "-"
+  function measurePing(){
+    var times = [];
+    function once(){
+      var t0 = now();
+      return getJson('/api/ping?_=' + Date.now() + Math.random()).then(function(){ times.push(now() - t0); }, function(){});
+    }
+    return once().then(once).then(once).then(function(){ return median(times); });
+  }
+  // 状态：cls 为圆点颜色（on 绿 / warn 橙 / na 灰 / off 红），text 为折叠行文字
+  function setState(cls, text){
+    var dot = $('srvDot'); if (dot) dot.className = 'srv-dot' + (cls ? ' ' + cls : '');
+    var st = $('srvOnline'); if (st) { st.textContent = text; st.className = 'srv-state' + (cls === 'warn' ? ' warn' : ''); }
+    var line = $('srvLine'); if (line) line.className = 'srv-line' + (cls === 'warn' || cls === 'na' ? ' long' : '');
+    fit();
+  }
+  // 折叠行放不下时逐级隐藏延迟，保证「在线 · …」状态文字完整显示
+  function fit(){
+    var line = $('srvLine'), st = $('srvOnline');
+    if (!line || !st || !line.classList || typeof st.scrollWidth !== 'number') return;
+    line.classList.remove('fit1', 'fit2');
+    function cut(){ return st.scrollWidth > st.clientWidth + 1; }
+    if (cut()) { line.classList.add('fit1'); if (cut()) line.classList.add('fit2'); }
+  }
+  if (window.addEventListener) window.addEventListener('resize', fit);
+  function clearStats(){
+    setText('srvMem', '-'); setText('srvCpu', '-'); setText('srvDisk', '-');
+    bar('srvMemBar', null); bar('srvCpuBar', null); bar('srvDiskBar', null);
+    setText('srvRun', '-'); setText('srvQueue', '-');
+  }
+  function note(text){
+    show('srvBars', !text); show('srvJobs', false); show('srvNote', !!text); setText('srvNote', text || '');
+  }
+  function render(s){
+    if (!s || !s.online) {
+      setState('off', '离线'); ms('srvLat', null); clearStats(); note('');
+      return;
+    }
+    ms('srvLat', s.latencyMs);
+    if (s.authFailed) { setState('warn', '在线 · 状态鉴权失败'); clearStats(); note('服务器在线，但状态接口口令不匹配'); return; }
+    if (s.degraded) { setState('warn', '在线 · 异常'); clearStats(); note(s.error || '服务器在线，但状态接口出错'); return; }
+    if (s.statusSupported === false) { setState('na', '在线 · 无详情'); clearStats(); note('服务器暂未提供详细状态'); return; }
+    setState('on', '在线'); note('');
+    var m = s.mem || {}, c = s.cpu || {}, d = s.disk || {}, j = s.jobs || {};
+    bar('srvMemBar', m.percent); bar('srvCpuBar', c.percent); bar('srvDiskBar', d.percent);
+    $('srvMem').innerHTML = isNum(m.percent) ? '<b>' + pctText(m.percent) + '</b>' + (isNum(m.used) && isNum(m.total) ? ' · ' + gb(m.used) + '/' + gb(m.total) + ' GB' : '') : '-';
+    $('srvCpu').innerHTML = isNum(c.percent) ? '<b>' + pctText(c.percent) + '</b>' + (isNum(c.load1) && isNum(c.cores) ? ' · ' + c.load1.toFixed(2) + '/' + c.cores + '核' : '') : '-';
+    $('srvDisk').innerHTML = isNum(d.percent) ? '<b>' + pctText(d.percent) + '</b>' + (isNum(d.used) && isNum(d.total) ? ' · ' + gb(d.used) + '/' + gb(d.total) + ' GB' : '') : '-';
+    setText('srvRun', isNum(j.running) ? String(j.running) : '-');
+    setText('srvQueue', isNum(j.queued) ? String(j.queued) : '-');
+    show('srvJobs', isNum(j.running) || isNum(j.queued));
+  }
+  // 折叠 / 展开（每次进页面默认折叠，不记忆）
+  var toggle = $('srvToggle');
+  if (toggle) toggle.onclick = function(){
+    var open = $('srvDetail').style.display === 'none';
+    show('srvDetail', open);
+    toggle.textContent = open ? '收起 ▴' : '详情 ▾';
+    toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+  };
+  function refresh(){
+    if (busy || document.hidden) return;
+    busy = true;
+    var p1 = measurePing().then(function(v){ ms('srvPing', v); }, function(){ ms('srvPing', null); });
+    var p2 = getJson('/api/server-status').then(render, function(){ setState('', '-'); ms('srvLat', null); clearStats(); note(''); });
+    Promise.all([p1, p2]).then(function(){ busy = false; fit(); }, function(){ busy = false; fit(); });
+  }
+  function start(){ if (!timer) timer = setInterval(refresh, 30000); }
+  function stop(){ if (timer) { clearInterval(timer); timer = null; } }
+  document.addEventListener('visibilitychange', function(){
+    if (document.hidden) stop(); else { refresh(); start(); }
+  });
+  refresh(); start();
+})();
+</script>
 <script src="/ytmerge.js"></script>
 </body>
 </html>
