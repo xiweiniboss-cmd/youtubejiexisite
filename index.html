@@ -1240,7 +1240,7 @@ refreshQuota();
     }
     ms('srvLat', s.latencyMs);
     if (s.authFailed) { setState('warn', '在线 · 状态鉴权失败'); clearStats(); note('服务器在线，但状态接口口令不匹配'); return; }
-    if (s.degraded) { setState('warn', '在线 · 异常'); clearStats(); note('服务器在线，但状态接口出错'); return; }
+    if (s.degraded) { setState('warn', '在线 · 异常'); clearStats(); note(s.error || '服务器在线，但状态接口出错'); return; }
     if (s.statusSupported === false) { setState('na', '在线 · 无详情'); clearStats(); note('服务器暂未提供详细状态'); return; }
     setState('on', '在线'); note('');
     var m = s.mem || {}, c = s.cpu || {}, d = s.disk || {}, j = s.jobs || {};
@@ -1250,6 +1250,7 @@ refreshQuota();
     $('srvDisk').innerHTML = isNum(d.percent) ? '<b>' + pctText(d.percent) + '</b>' + (isNum(d.used) && isNum(d.total) ? ' · ' + gb(d.used) + '/' + gb(d.total) + ' GB' : '') : '-';
     setText('srvRun', isNum(j.running) ? String(j.running) : '-');
     setText('srvQueue', isNum(j.queued) ? String(j.queued) : '-');
+    show('srvJobs', isNum(j.running) || isNum(j.queued));
   }
   // 折叠 / 展开（每次进页面默认折叠，不记忆）
   var toggle = $('srvToggle');
