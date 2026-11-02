@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import worker, {
   HUMAN_PASS_COOKIE, HUMAN_PASS_TTL_SECS, HUMAN_PASS_MAX_AGE_SECS, HUMAN_PATHS,
+  HUMAN_PASS_REFRESH_NEAR_CAP_SECS, MERGE_JOB_ID_RE,
   signHumanPass, verifyHumanPass, _resetHumanWarn,
 } from '../_worker.js';
 
@@ -21,11 +22,14 @@ function fakeFetch(goodTokens = [], opts = {}) {
       const body = new URLSearchParams(String(init.body));
       calls.siteverify.push(Object.fromEntries(body));
       if (opts.throwOnVerify) throw new Error('network down');
+      if (opts.timeoutOnVerify) throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+      if (opts.verifyStatus) return new Response('upstream error', { status: opts.verifyStatus });
       const tok = body.get('response');
       const ok = body.get('secret') === SECRET && left.delete(tok);
       return new Response(JSON.stringify(ok ? { success: true, hostname: 'youtubejiexisite.pages.dev' } : { success: false, 'error-codes': ['timeout-or-duplicate'] }), { headers: { 'Content-Type': 'application/json' } });
     }
     calls.other.push(u);
+    if (opts.other) return opts.other(u, init);
     return new Response('{}', { status: 599 });
   };
   return { fn, calls };
@@ -179,7 +183,7 @@ test('turnstile: pass close to expiry is renewed (sliding) but keeps the origina
   });
 });
 
-test('turnstile: siteverify failure or network error -> 403, no pass', async () => {
+test('turnstile: siteverify failure -> 403 HUMAN_FAILED; unreachable/timeout/non-2xx -> 503 HUMAN_UNAVAILABLE', async () => {
   const bad = fakeFetch([]);
   await withFetch(bad.fn, async () => {
     const r = await call(PARSE + '&turnstile=wrong');
@@ -187,12 +191,18 @@ test('turnstile: siteverify failure or network error -> 403, no pass', async () 
     assert.equal(r.body.error, '人机验证未通过，请重试');
     assert.equal(r.setCookie, '');
   });
-  const down = fakeFetch(['tok'], { throwOnVerify: true });
-  await withFetch(down.fn, async () => {
-    const r = await call(PARSE + '&turnstile=tok');
-    assert.equal(r.resp.status, 403);
-    assert.equal(r.body.code, 'HUMAN_FAILED');
-  });
+  // siteverify 连不上 / 超时 / 非 2xx：不是用户的错 → 503 HUMAN_UNAVAILABLE（前端提示稍后再试并重置组件）
+  for (const opts of [{ throwOnVerify: true }, { timeoutOnVerify: true }, { verifyStatus: 502 }, { verifyStatus: 429 }]) {
+    const down = fakeFetch(['tok'], opts);
+    await withFetch(down.fn, async () => {
+      const r = await call(PARSE + '&turnstile=tok');
+      assert.equal(r.resp.status, 503, JSON.stringify(opts));
+      assert.equal(r.body.code, 'HUMAN_UNAVAILABLE');
+      assert.equal(r.body.error, '验证服务暂时连不上，请稍后再试');
+      assert.equal(r.setCookie, '');
+      assert.equal(down.calls.other.length, 0, 'handler not reached');
+    });
+  }
   const huge = fakeFetch();
   await withFetch(huge.fn, async () => {
     const r = await call(PARSE + '&turnstile=' + 'x'.repeat(3000));
@@ -229,11 +239,12 @@ test('turnstile: status / ping / stats / key / merge status+file are not gated',
     const env = { ...ENV, TURNSTILE_SITE_KEY: ' 0x4AAAA-public ' };
     assert.equal((await call('/api/ping', env)).resp.status, 200);
     assert.equal((await call('/api/stats', env)).body.ok, true);
-    assert.deepEqual((await call('/api/turnstile-key', env)).body, { ok: true, siteKey: '0x4AAAA-public' });
+    assert.deepEqual((await call('/api/turnstile-key', env)).body, { ok: true, siteKey: '0x4AAAA-public', required: true });
+    assert.deepEqual((await call('/api/turnstile-key', {})).body, { ok: true, siteKey: '', required: false });
     assert.notEqual((await call('/api/server-status', env)).resp.status, 403);
-    const st = await call('/api/yt1080-status?id=x', env);
+    const st = await call('/api/yt1080-status?id=job-0001', env);
     assert.equal(st.resp.status, 500); // 没配 YT_MERGE_TOKEN，但不是 403
-    assert.equal((await call('/api/yt1080-file?id=x', env)).resp.status, 500);
+    assert.equal((await call('/api/yt1080-file?id=job-0001', env)).resp.status, 500);
     assert.equal(f.calls.siteverify.length, 0);
   });
 });
@@ -244,10 +255,13 @@ function frontendHuman() {
   const i = html.indexOf('  var TS_PASS_MS');
   const j = html.indexOf('  ensureTurnstileScript().then(function(siteKey){\n    try {\n      var box');
   assert.ok(i > 0 && j > i);
+  const k = html.indexOf('  var TS_MSG_LOADING');
+  const l = html.indexOf('  function tsSetState');
+  assert.ok(k > 0 && l > k);
   const ctx = { resets: 0, token: '', now: 1000, Date: { now: () => ctx.now } };
   ctx.turnstile = { reset() { ctx.resets++; ctx.token = ''; }, getResponse() { return ctx.token; } };
   vm.createContext(ctx);
-  vm.runInContext('var tsParseWidgetId = null;\n' + html.slice(i, j), ctx);
+  vm.runInContext(html.slice(k, l) + '\nvar tsParseWidgetId = null;\n' + html.slice(i, j), ctx);
   return { html, ctx, run: (c) => vm.runInContext(c, ctx) };
 }
 
@@ -269,7 +283,11 @@ test('index.html: humanQuery / humanDone lifecycle (second parse works, rejectio
   ctx.token = 'abc';
   const q = run('humanQuery()');
   assert.equal(q, '&turnstile=abc');
-  assert.equal(run('humanDone("&turnstile=abc", { ok: true })'), false);
+  // 服务器有通行证、没用这个 token（无 X-Human-Token: used）→ 不 reset，token 留着下次再带
+  assert.equal(run('humanDone("&turnstile=abc", { ok: true }, false)'), false);
+  assert.equal(ctx.resets, 0, 'unused token is kept');
+  assert.equal(run('humanQuery()'), '&turnstile=abc', 'token is always sent while the widget has one');
+  assert.equal(run('humanDone("&turnstile=abc", { ok: true }, true)'), false);
   assert.equal(ctx.resets, 1, 'used token is reset');
   assert.equal(run('humanQuery()'), '', 'second parse rides on the pass');
   ctx.now += 26 * 60 * 1000;
@@ -279,4 +297,156 @@ test('index.html: humanQuery / humanDone lifecycle (second parse works, rejectio
   assert.equal(run('humanDone("", { ok: false, code: "HUMAN_REQUIRED" })'), true);
   assert.equal(ctx.resets, 2);
   assert.equal(run('humanQuery()'), null);
+});
+
+test('index.html: humanMsg distinguishes load failure / still loading / expired pass / server text', () => {
+  const { run } = frontendHuman();
+  const LOAD_FAIL = '人机验证组件加载失败，请检查网络或 VPN 后刷新';
+  // 组件没出来（脚本挂了 / site key 缺失 / 8 秒没渲染）
+  run('tsState = "failed"; tsParseWidgetId = null');
+  assert.equal(run('humanMsg({ code: "HUMAN_REQUIRED", error: "请先完成人机验证" })'), LOAD_FAIL);
+  run('tsState = "idle"');
+  assert.equal(run('humanMsg({ code: "HUMAN_REQUIRED" })'), LOAD_FAIL);
+  run('tsState = "loading"');
+  assert.match(run('humanMsg({ code: "HUMAN_REQUIRED" })'), /^人机验证加载中…/);
+  // 组件好好的：旧结果的下载 / 合并因为通行证过期被拦
+  run('tsState = "ready"; tsParseWidgetId = 1');
+  assert.equal(run('humanMsg({ code: "HUMAN_REQUIRED" })'), '验证已过期，请重新点开始解析');
+  assert.equal(run('humanMsg({ code: "HUMAN_UNAVAILABLE", error: "验证服务暂时连不上，请稍后再试" })'), '验证服务暂时连不上，请稍后再试');
+  assert.equal(run('humanMsg({ code: "HUMAN_FAILED", error: "人机验证未通过，请重试" })'), '人机验证未通过，请重试');
+  // HUMAN_UNAVAILABLE 也算拒绝 → 重置组件
+  run('resets = 0');
+  assert.equal(run('humanDone("&turnstile=x", { ok: false, code: "HUMAN_UNAVAILABLE" }, false)'), true);
+  assert.equal(run('resets'), 1);
+});
+
+test('index.html: load-state UI strings, 8s timeout, compact widget centered, download errors use humanMsg', () => {
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  assert.match(html, /<div id="tsParseWidget" class="ts-parse"><\/div>\n\s*<div id="tsParseState"/);
+  assert.match(html, /var TS_RENDER_TIMEOUT_MS = 8000;/);
+  assert.match(html, /\.ts-parse\.ts-compact\{ display:flex; justify-content:center; \}/);
+  assert.match(html, /if \(compact\) box\.className \+= ' ts-compact';/);
+  assert.ok(!/\}\)\.catch\(function\(\)\{\}\);\n\n\s*\/\* 反馈表单/.test(html), 'widget load failure is no longer swallowed');
+  assert.match(html, /if \(humanDone\('', e\)\) \{ showError\('下载失败：' \+ humanMsg\(e\)\); return; \}/);
+  assert.match(html, /if \(humanDone\('', e\)\) \{ showError\('合并下载失败：' \+ humanMsg\(e\)\); return; \}/);
+  assert.match(html, /status\('⚠️ ' \+ humanMsg\(j\)\)/);
+  const ym = readFileSync(new URL('../ytmerge.js', import.meta.url), 'utf8');
+  assert.match(ym, /if \(code\) e2\.code = code;/, 'chunked downloads keep the HUMAN_* code');
+});
+
+// ---- 合并任务 id 白名单 ----
+test('yt1080-status / yt1080-file: bad job ids -> 400 Chinese error, EC2 never contacted', async () => {
+  const f = fakeFetch([], { other: () => new Response(JSON.stringify({ ok: true, status: 'running' }), { headers: { 'content-type': 'application/json' } }) });
+  const env = { ...ENV, YT_MERGE_TOKEN: 'merge-token-not-echoed', YT_MERGE_BASE: 'https://merge.example.com' };
+  const bad = ['', '.', '..', '%2e', '%2e%2e', '%252e%252e', 'abc', 'abcde', 'a'.repeat(65), 'job/../x', 'job%2F..%2Fx', 'job.0001', 'job 0001', 'jöb-0001', 'job-0001%00'];
+  await withFetch(f.fn, async () => {
+    for (const p of ['/api/yt1080-status', '/api/yt1080-file']) {
+      for (const id of bad) {
+        const r = await call(p + '?id=' + id, env);
+        assert.equal(r.resp.status, 400, p + ' id=' + JSON.stringify(id));
+        assert.equal(r.body.ok, false);
+        assert.equal(r.body.code, 'BAD_JOB_ID');
+        assert.match(r.body.error, /任务编号/);
+        assert.ok(!r.text.includes('merge-token-not-echoed'));
+      }
+      const noParam = await call(p, env);
+      assert.equal(noParam.resp.status, 400);
+    }
+    assert.equal(f.calls.other.length, 0, 'EC2 not contacted for any bad id');
+    // 合法 id（6 位、64 位、带 _ -）照常转发
+    for (const id of ['abc123', 'a'.repeat(64), 'Job_ID-0001']) {
+      const r = await call('/api/yt1080-status?id=' + id, env);
+      assert.equal(r.resp.status, 200, id);
+    }
+    assert.equal(f.calls.other.length, 3);
+    assert.ok(f.calls.other.every((u) => u.startsWith('https://merge.example.com/yt1080-jobs/')));
+  });
+  assert.ok(MERGE_JOB_ID_RE.test('abc123') && !MERGE_JOB_ID_RE.test('..'));
+});
+
+// ---- secret 配了但 site key 缺失：每个路径只 console.error 一次，不泄露值 ----
+test('turnstile: secret set but site key missing -> console.error once per path, no key values logged', async () => {
+  const f = fakeFetch();
+  const errs = [];
+  const origErr = console.error;
+  console.error = (...a) => errs.push(a.join(' '));
+  _resetHumanWarn();
+  try {
+    await withFetch(f.fn, async () => {
+      for (let i = 0; i < 3; i++) {
+        assert.equal((await call(PARSE)).body.code, 'HUMAN_REQUIRED');
+        assert.equal((await call('/api/ytdl?url=x')).body.code, 'HUMAN_REQUIRED');
+      }
+      // 配了 site key 就不报
+      await call('/api/yt-hd?url=x', { ...ENV, TURNSTILE_SITE_KEY: '0x4AAAA-public' });
+    });
+  } finally { console.error = origErr; _resetHumanWarn(); }
+  assert.equal(errs.length, 2, errs.join('\n'));
+  assert.match(errs[0], /TURNSTILE_SITE_KEY/);
+  assert.match(errs[0], /\/api\/parse/);
+  assert.match(errs[1], /\/api\/ytdl/);
+  assert.ok(errs.every((e) => !e.includes(SECRET)));
+});
+
+// ---- 通行证接近 2 小时封顶 + 带了新 token：真验一次并换全新通行证；平常路径不调 siteverify ----
+test('turnstile: valid pass + token, far from cap -> siteverify NOT called, token not consumed', async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const pass = await signHumanPass(SECRET, now, now - 60 * 60); // 首次验证 1 小时前，离封顶还有 1 小时
+  const f = fakeFetch(['tok-keep']);
+  await withFetch(f.fn, async () => {
+    const r = await call(PARSE + '&turnstile=tok-keep', ENV, { cookie: HUMAN_PASS_COOKIE + '=' + pass.value });
+    assert.ok(reachedParse(r), r.text);
+    assert.equal(f.calls.siteverify.length, 0);
+    assert.equal(r.setCookie, '');
+    assert.equal(r.resp.headers.get('x-human-token'), null);
+    // 没有 token 的常规请求也一样
+    const r2 = await call('/api/ytdl?url=notaurl', ENV, { cookie: HUMAN_PASS_COOKIE + '=' + pass.value });
+    assert.equal(r2.resp.status, 400);
+    assert.equal(f.calls.siteverify.length, 0);
+  });
+});
+
+test('turnstile: valid pass near 2h cap + fresh token -> siteverify once, brand-new pass with new first-verify time', async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const first = now - HUMAN_PASS_MAX_AGE_SECS + 10 * 60; // 离封顶只剩 10 分钟（< 15 分钟）
+  const pass = await signHumanPass(SECRET, now - 5 * 60, first);
+  const before = await verifyHumanPass(pass.value, SECRET, now);
+  assert.ok(before && before.first === first);
+  assert.ok(HUMAN_PASS_REFRESH_NEAR_CAP_SECS >= 10 * 60);
+  const f = fakeFetch(['tok-new']);
+  await withFetch(f.fn, async () => {
+    // 没 token：照常凭旧通行证放行，不调 siteverify
+    const plain = await call(PARSE, ENV, { cookie: HUMAN_PASS_COOKIE + '=' + pass.value });
+    assert.ok(reachedParse(plain));
+    assert.equal(f.calls.siteverify.length, 0);
+    // 带 token：真验一次，换全新通行证
+    const r = await call(PARSE + '&turnstile=tok-new', ENV, { cookie: HUMAN_PASS_COOKIE + '=' + pass.value });
+    assert.ok(reachedParse(r), r.text);
+    assert.equal(f.calls.siteverify.length, 1);
+    assert.equal(r.resp.headers.get('x-human-token'), 'used');
+    const fresh = await verifyHumanPass(passOf(r.setCookie), SECRET);
+    assert.ok(fresh);
+    assert.ok(fresh.first >= now, 'first-verify time restarted');
+    assert.ok(fresh.exp > before.exp);
+    assert.match(r.setCookie, new RegExp('Max-Age=' + HUMAN_PASS_TTL_SECS + '\\b'));
+  });
+});
+
+test('turnstile: near cap with a bad token or siteverify down -> old pass still honoured, no new first-verify time', async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const first = now - HUMAN_PASS_MAX_AGE_SECS + 10 * 60;
+  const pass = await signHumanPass(SECRET, now - 25 * 60, first); // 剩 5 分钟 → 也会滑动续期（但不超过封顶）
+  for (const opts of [{}, { throwOnVerify: true }]) {
+    const f = fakeFetch([], opts);
+    await withFetch(f.fn, async () => {
+      const r = await call(PARSE + '&turnstile=bad', ENV, { cookie: HUMAN_PASS_COOKIE + '=' + pass.value });
+      assert.ok(reachedParse(r), r.text);
+      assert.equal(f.calls.siteverify.length, 1);
+      assert.equal(r.resp.headers.get('x-human-token'), 'used');
+      const renewed = await verifyHumanPass(passOf(r.setCookie), SECRET);
+      assert.ok(renewed);
+      assert.equal(renewed.first, first, 'cap unchanged');
+      assert.ok(renewed.exp <= first + HUMAN_PASS_MAX_AGE_SECS);
+    });
+  }
 });
