@@ -5,6 +5,15 @@
 // 反馈系统：KV 绑定 FEEDBACK_KV、R2 绑定 FEEDBACK_BUCKET、环境变量 FEEDBACK_ADMIN_KEY
 //   （与小红书站/TikTok站/抖音站共用同一套 KV/R2/管理密码）
 // 人机验证：TURNSTILE_SITE_KEY（公开）+ TURNSTILE_SECRET_KEY（保密），各站共用同一套
+//   配了 TURNSTILE_SECRET_KEY 才校验（不配 = 跳过，并在日志里打一次警告）。
+//   受保护：/api/parse /api/yt-hd /api/ytdl /api/yt1080-start /api/yt-direct。
+//   前端带 ?turnstile=<token> 时 Worker 调 siteverify，通过后下发 30 分钟的签名通行证 Cookie yt_hp
+//   （HMAC-SHA256，密钥由 TURNSTILE_SECRET_KEY 派生，不需要新变量），之后的解析 / 高清 / 下载 / 合并凭 Cookie 放行。
+//   /api/yt1080-status、/api/yt1080-file 只认已有任务 id（任务只能经受保护的 yt1080-start 创建），不拦，
+//   这样「合并历史（保留 1 小时）」里的成品在通行证过期后也能下载；任务 id 必须是 6–64 位 [A-Za-z0-9_-]，否则 400 不转发。
+//   通行证有效时不调 siteverify；只有距 2 小时封顶不足 15 分钟且请求带了新 token 时才真验一次并换全新通行证。
+//   siteverify 连不上 / 超时 / 非 2xx → 503 HUMAN_UNAVAILABLE；token 无效 → 403 HUMAN_FAILED；没 token 没通行证 → 403 HUMAN_REQUIRED。
+//   /api/ping /api/server-status /api/stats 等不拦。
 // 高清直连 /api/yt-hd（都不写进仓库，只在 Pages → Settings → Environment variables 配加密变量）：
 //   YT_COOKIES   已登录 youtube.com 的 Cookie（请求头 "a=b; c=d"，或 Netscape cookies.txt，或 [{name,value}] JSON）。别名 YT_COOKIE
 //   YT_PO_TOKEN  可选。InnerTube player 的 PO Token，放进 serviceIntegrityDimensions.poToken。别名 YT_POT
@@ -48,19 +57,182 @@ function json(data, status = 200) {
 }
 
 // Cloudflare Turnstile 人机验证：secret 配了才校验，不配则跳过（向后兼容）
-async function verifyTurnstile(token, secret, ip) {
+// 返回 'ok' | 'fail'（token 无效 / 过期 / 重复）| 'unavailable'（siteverify 连不上、超时、非 2xx、回的不是 JSON）
+async function verifyTurnstileResult(token, secret, ip) {
+  if (typeof token !== 'string' || !token || token.length > 2048) return 'fail';
+  let resp;
   try {
-    const resp = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+    resp = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ secret, response: token, remoteip: ip || '' }),
+      signal: AbortSignal.timeout(10000),
     });
+  } catch {
+    return 'unavailable';
+  }
+  if (!resp.ok) return 'unavailable';
+  try {
     const j = await resp.json();
-    return j && j.success === true;
+    return j && j.success === true ? 'ok' : 'fail';
+  } catch {
+    return 'unavailable';
+  }
+}
+async function verifyTurnstile(token, secret, ip) {
+  try {
+    return (await verifyTurnstileResult(token, secret, ip)) === 'ok';
   } catch {
     return false;
   }
 }
+
+// ---------- 人机验证通行证（一次 siteverify 通过后，30 分钟内的解析 / 高清 / 下载 / 合并都不用再点验证） ----------
+export const HUMAN_PASS_COOKIE = 'yt_hp';
+export const HUMAN_PASS_TTL_SECS = 30 * 60;
+export const HUMAN_PASS_MAX_AGE_SECS = 2 * 60 * 60; // 续期封顶：距第一次真验证最多 2 小时
+const HUMAN_PASS_RENEW_BELOW_SECS = 10 * 60; // 剩余不足 10 分钟时顺手续期（长下载 / 分段合并不会中途 403）
+// 距 2 小时封顶不足 15 分钟时，如果请求里正好带了新的 Turnstile token，就真验一次并换一张全新通行证（重新计 2 小时）
+export const HUMAN_PASS_REFRESH_NEAR_CAP_SECS = 15 * 60;
+export const HUMAN_PATHS = new Set(['/api/parse', '/api/yt-hd', '/api/ytdl', '/api/yt1080-start', '/api/yt-direct']);
+const HUMAN_MSG_REQUIRED = '请先完成人机验证';
+const HUMAN_MSG_FAILED = '人机验证未通过，请重试';
+const HUMAN_MSG_UNAVAILABLE = '验证服务暂时连不上，请稍后再试';
+let _humanUnsetWarned = false;
+const _humanNoSiteKeyLogged = new Set(); // 配了 secret 却没配 site key：每个接口路径只报一次错
+
+function b64url(bytes) {
+  let s = '';
+  const a = new Uint8Array(bytes);
+  for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function b64urlDecode(str) {
+  if (!/^[A-Za-z0-9_-]*$/.test(str)) return null;
+  try {
+    const bin = atob(str.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((str.length + 3) % 4));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+}
+// 签名密钥由 TURNSTILE_SECRET_KEY 派生（HMAC(secret, 固定标签)），换 secret 后旧通行证自动作废
+async function humanPassKey(secret) {
+  const enc = new TextEncoder();
+  const root = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const derived = await crypto.subtle.sign('HMAC', root, enc.encode('youtubejiexi-human-pass-v1'));
+  return crypto.subtle.importKey('raw', derived, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+}
+// 通行证格式：v1.<过期秒>.<首次验证秒>.<随机数>.<签名>
+export async function signHumanPass(secret, nowSec, firstSec) {
+  const now = Math.floor(nowSec ?? Date.now() / 1000);
+  const first = Math.floor(firstSec ?? now);
+  const exp = Math.min(now + HUMAN_PASS_TTL_SECS, first + HUMAN_PASS_MAX_AGE_SECS);
+  const nonce = b64url(crypto.getRandomValues(new Uint8Array(9)));
+  const body = 'v1.' + exp + '.' + first + '.' + nonce;
+  const sig = await crypto.subtle.sign('HMAC', await humanPassKey(secret), new TextEncoder().encode(body));
+  return { value: body + '.' + b64url(sig), exp };
+}
+// 返回 { exp, first } 或 null（伪造 / 过期 / 格式不对）
+export async function verifyHumanPass(value, secret, nowSec) {
+  if (typeof value !== 'string' || value.length > 200) return null;
+  const parts = value.split('.');
+  if (parts.length !== 5 || parts[0] !== 'v1') return null;
+  const exp = Number(parts[1]), first = Number(parts[2]);
+  if (!Number.isSafeInteger(exp) || !Number.isSafeInteger(first)) return null;
+  const sig = b64urlDecode(parts[4]);
+  if (!sig || sig.length !== 32) return null;
+  const ok = await crypto.subtle.verify(
+    'HMAC',
+    await humanPassKey(secret),
+    sig,
+    new TextEncoder().encode(parts.slice(0, 4).join('.')),
+  );
+  if (!ok) return null;
+  const now = Math.floor(nowSec ?? Date.now() / 1000);
+  if (exp <= now || exp - first > HUMAN_PASS_MAX_AGE_SECS) return null;
+  return { exp, first };
+}
+function readCookie(request, name) {
+  const raw = request.headers.get('cookie') || '';
+  for (const part of raw.split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return '';
+}
+function humanPassCookie(value, exp, nowSec) {
+  const maxAge = Math.max(0, exp - Math.floor(nowSec ?? Date.now() / 1000));
+  return HUMAN_PASS_COOKIE + '=' + value + '; Path=/api/; Max-Age=' + maxAge + '; HttpOnly; Secure; SameSite=Lax';
+}
+function humanDenied(code, error, status = 403) {
+  return json({ ok: false, code, error }, status);
+}
+// 配了 TURNSTILE_SECRET_KEY 但没配 TURNSTILE_SITE_KEY：前端渲染不出组件，所有受保护接口都会被拦。只打日志，不输出任何 key 的值。
+function warnMissingSiteKey(env, pathname) {
+  if ((env.TURNSTILE_SITE_KEY || '').trim()) return;
+  const p = String(pathname || '');
+  if (_humanNoSiteKeyLogged.has(p)) return;
+  _humanNoSiteKeyLogged.add(p);
+  console.error('[turnstile] 已配置 TURNSTILE_SECRET_KEY 但缺少 TURNSTILE_SITE_KEY：前端无法显示人机验证组件，' + p + ' 会一直返回 HUMAN_REQUIRED');
+}
+// 受保护接口的统一门禁。返回 { response }（拒绝）或 { setCookie, tokenUsed }（放行，可能附带新/续期的通行证；
+// tokenUsed = 这次调用了 siteverify，前端据此重置组件拿新 token）
+export async function checkHuman(request, env) {
+  const secret = (env.TURNSTILE_SECRET_KEY || '').trim();
+  if (!secret) {
+    if (!_humanUnsetWarned) {
+      _humanUnsetWarned = true;
+      console.warn('[turnstile] 未配置 TURNSTILE_SECRET_KEY：解析接口暂不做人机验证（fail-open）');
+    }
+    return { setCookie: '', tokenUsed: false };
+  }
+  const reqUrl = new URL(request.url);
+  warnMissingSiteKey(env, reqUrl.pathname);
+  const now = Math.floor(Date.now() / 1000);
+  const pass = await verifyHumanPass(readCookie(request, HUMAN_PASS_COOKIE), secret, now);
+  const token = reqUrl.searchParams.get('turnstile') || '';
+  const ip = request.headers.get('cf-connecting-ip');
+  if (pass) {
+    const cap = pass.first + HUMAN_PASS_MAX_AGE_SECS;
+    // 快到 2 小时封顶又带了新 token：真验一次，通过就换全新通行证；没通过 / 验证服务连不上时旧通行证仍有效，照常放行
+    if (token && cap - now < HUMAN_PASS_REFRESH_NEAR_CAP_SECS) {
+      const r = await verifyTurnstileResult(token, secret, ip);
+      if (r === 'ok') {
+        const fresh = await signHumanPass(secret, now, now);
+        return { setCookie: humanPassCookie(fresh.value, fresh.exp, now), tokenUsed: true };
+      }
+      if (pass.exp - now < HUMAN_PASS_RENEW_BELOW_SECS && cap > pass.exp) {
+        const renewed = await signHumanPass(secret, now, pass.first);
+        return { setCookie: humanPassCookie(renewed.value, renewed.exp, now), tokenUsed: true };
+      }
+      return { setCookie: '', tokenUsed: true };
+    }
+    // 常规路径：通行证有效就放行，不调 siteverify（不浪费前端的 token）
+    if (pass.exp - now < HUMAN_PASS_RENEW_BELOW_SECS && cap > pass.exp) {
+      const renewed = await signHumanPass(secret, now, pass.first);
+      return { setCookie: humanPassCookie(renewed.value, renewed.exp, now), tokenUsed: false };
+    }
+    return { setCookie: '', tokenUsed: false };
+  }
+  if (!token) return { response: humanDenied('HUMAN_REQUIRED', HUMAN_MSG_REQUIRED) };
+  const r = await verifyTurnstileResult(token, secret, ip);
+  if (r === 'unavailable') return { response: humanDenied('HUMAN_UNAVAILABLE', HUMAN_MSG_UNAVAILABLE, 503) };
+  if (r !== 'ok') return { response: humanDenied('HUMAN_FAILED', HUMAN_MSG_FAILED) };
+  const fresh = await signHumanPass(secret, now, now);
+  return { setCookie: humanPassCookie(fresh.value, fresh.exp, now), tokenUsed: true };
+}
+function withSetCookie(resp, cookie, tokenUsed) {
+  if ((!cookie && !tokenUsed) || !resp) return resp;
+  const out = new Response(resp.body, resp);
+  if (cookie) out.headers.append('Set-Cookie', cookie);
+  // 告诉前端这次用掉了 Turnstile token（一次性），需要 reset 组件
+  if (tokenUsed) out.headers.set('X-Human-Token', 'used');
+  return out;
+}
+export function _resetHumanWarn() { _humanUnsetWarned = false; _humanNoSiteKeyLogged.clear(); }
 
 // ---------- RedFoxHub ----------
 async function redfoxPost(path, apiKey, body) {
@@ -227,14 +399,7 @@ async function handleParse(request, env) {
   if (!shareText.trim()) return json({ ok: false, error: '请先粘贴 YouTube 分享链接' }, 400);
   const debug = reqUrl.searchParams.get('debug') === '1';
 
-  // 解析接口人机验证（配了 TURNSTILE_SECRET_KEY 才生效）
-  const tsSecret = (env.TURNSTILE_SECRET_KEY || '').trim();
-  if (tsSecret) {
-    const tsToken = reqUrl.searchParams.get('turnstile') || '';
-    if (!tsToken) return json({ ok: false, error: '请先完成人机验证' }, 400);
-    const tsOk = await verifyTurnstile(tsToken, tsSecret, request.headers.get('cf-connecting-ip'));
-    if (!tsOk) return json({ ok: false, error: '人机验证未通过，请重试' }, 403);
-  }
+  // 人机验证在路由里统一做（checkHuman），这里不再重复
 
   // 解析冷却：同一 IP 60 秒内只能解析一次（防刷 API 烧积分）
   const PARSE_COOLDOWN_SECS = 60;
@@ -1810,11 +1975,19 @@ async function handleYt1080Start(request, env) {
     return mergeConnectError(e);
   }
 }
+// 合并任务 id 只允许 6–64 位字母数字 _ -：挡掉 '.'、'..'、%2e、斜杠等，非法 id 不转发给 EC2
+export const MERGE_JOB_ID_RE = /^[A-Za-z0-9_-]{6,64}$/;
+function badJobId(id) {
+  if (!id) return json({ ok: false, code: 'BAD_JOB_ID', error: '缺少任务编号' }, 400);
+  if (!MERGE_JOB_ID_RE.test(id)) return json({ ok: false, code: 'BAD_JOB_ID', error: '任务编号无效' }, 400);
+  return null;
+}
 async function handleYt1080Status(request, env) {
+  const id = new URL(request.url).searchParams.get('id') || '';
+  const bad = badJobId(id);
+  if (bad) return bad;
   const token = mergeToken(env);
   if (!token) return json({ ok: false, error: '未配置合并服务口令' }, 500);
-  const id = new URL(request.url).searchParams.get('id') || '';
-  if (!id) return json({ ok: false, error: '缺少任务 id' }, 400);
   try {
     const resp = await fetch(mergeBase(env) + '/yt1080-jobs/' + encodeURIComponent(id), {
       headers: { 'X-Merge-Token': token, 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', 'Accept': 'application/json' },
@@ -1835,10 +2008,11 @@ async function handleYt1080Status(request, env) {
   }
 }
 async function handleYt1080File(request, env) {
+  const id = new URL(request.url).searchParams.get('id') || '';
+  const bad = badJobId(id);
+  if (bad) return bad;
   const token = mergeToken(env);
   if (!token) return json({ ok: false, error: '未配置合并服务口令' }, 500);
-  const id = new URL(request.url).searchParams.get('id') || '';
-  if (!id) return json({ ok: false, error: '缺少任务 id' }, 400);
   try {
     const resp = await fetch(mergeBase(env) + '/yt1080-jobs/' + encodeURIComponent(id) + '/file', {
       headers: { 'X-Merge-Token': token, 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', 'Accept': 'application/json' },
@@ -2123,6 +2297,14 @@ async function handleYtDirect(request, env) {
 }
 
 /* ================= 路由 ================= */
+function routeHumanGated(pathname, request, env) {
+  if (pathname === '/api/parse') return handleParse(request, env);
+  if (pathname === '/api/ytdl') return handleYtDl(request, env);
+  if (pathname === '/api/yt1080-start') return handleYt1080Start(request, env);
+  if (pathname === '/api/yt-direct') return handleYtDirect(request, env);
+  return handleYtHd(request, env); // /api/yt-hd
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -2130,13 +2312,14 @@ export default {
     if (url.pathname === '/api/ping') return handlePing();
     if (url.pathname === '/api/server-status') return handleServerStatus(request, env, ctx);
 
-    if (url.pathname === '/api/parse') return handleParse(request, env);
-    if (url.pathname === '/api/ytdl') return handleYtDl(request, env);
-    if (url.pathname === '/api/yt1080-start') return handleYt1080Start(request, env);
+    // 人机验证门禁（只拦解析类接口；状态 / 统计 / 静态文件不拦）
+    if (HUMAN_PATHS.has(url.pathname)) {
+      const gate = await checkHuman(request, env);
+      if (gate.response) return gate.response;
+      return withSetCookie(await routeHumanGated(url.pathname, request, env), gate.setCookie, gate.tokenUsed);
+    }
     if (url.pathname === '/api/yt1080-status') return handleYt1080Status(request, env);
     if (url.pathname === '/api/yt1080-file') return handleYt1080File(request, env);
-    if (url.pathname === '/api/yt-direct') return handleYtDirect(request, env);
-    if (url.pathname === '/api/yt-hd') return handleYtHd(request, env);
 
     if (url.pathname === '/api/diag')
       return json({
@@ -2150,7 +2333,8 @@ export default {
 
     // Turnstile 公开 site key 下发
     if (url.pathname === '/api/turnstile-key')
-      return json({ ok: true, siteKey: (env.TURNSTILE_SITE_KEY || '').trim() });
+      // required：服务器是否要求人机验证（只是布尔值，不含任何密钥）。前端据此区分「没配置」和「配了但 site key 缺失」
+      return json({ ok: true, siteKey: (env.TURNSTILE_SITE_KEY || '').trim(), required: !!(env.TURNSTILE_SECRET_KEY || '').trim() });
 
     // 本站解析次数
     if (url.pathname === '/api/stats') {

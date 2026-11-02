@@ -934,7 +934,7 @@ function mergeEnvFetch(fileBody, fileHeaders, statusBody) {
   const sent = {};
   const f = async (url, init) => {
     const u = String(url);
-    if (u.endsWith('/yt1080-jobs')) { sent.start = JSON.parse(init.body); return new Response(JSON.stringify({ ok: true, job_id: 'j1' }), { headers: { 'content-type': 'application/json' } }); }
+    if (u.endsWith('/yt1080-jobs')) { sent.start = JSON.parse(init.body); return new Response(JSON.stringify({ ok: true, job_id: 'job-0001' }), { headers: { 'content-type': 'application/json' } }); }
     if (u.endsWith('/file')) return new Response(fileBody, { status: 200, headers: fileHeaders });
     return new Response(JSON.stringify(statusBody || { ok: true, status: 'done', filename: 'x.mp4' }), { headers: { 'content-type': 'application/json' } });
   };
@@ -955,7 +955,7 @@ test('yt1080-start forwards the H.264/AAC format with its fallback', async () =>
 
 test('yt1080-file: a webm is not renamed to .mp4 — it becomes a Chinese MERGE_NOT_IPHONE error', async () => {
   const { f } = mergeEnvFetch(EBML, { 'content-type': 'application/octet-stream', 'content-disposition': 'attachment; filename="NEFFEX Statement.webm"' });
-  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001'), ENV));
   assert.equal(r.status, 415);
   const j = await r.json();
   assert.equal(j.code, 'MERGE_NOT_IPHONE');
@@ -965,14 +965,14 @@ test('yt1080-file: a webm is not renamed to .mp4 — it becomes a Chinese MERGE_
 
 test('yt1080-file: AV1/Opus mp4 (the WeiM_vffWAw file) is rejected even though it is named .mp4', async () => {
   const { f } = mergeEnvFetch(MP4_AV1_BRAND_TAIL, { 'content-type': 'video/mp4', 'content-disposition': 'attachment; filename="a.mp4"' });
-  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001'), ENV));
   assert.equal(r.status, 415);
   assert.equal((await r.json()).code, 'MERGE_NOT_IPHONE');
 });
 
 test('yt1080-file: H.264+AAC streams through unchanged as a video/mp4 attachment', async () => {
   const { f } = mergeEnvFetch(MP4_H264_AAC, { 'content-type': 'application/octet-stream', 'content-disposition': "attachment; filename=\"NEFFEX (Statement).mp4\"" });
-  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001'), ENV));
   assert.equal(r.status, 200);
   assert.equal(r.headers.get('content-type'), 'video/mp4');
   assert.match(r.headers.get('content-disposition'), /^attachment; filename="NEFFEX \(Statement\)\.mp4"; filename\*=UTF-8''NEFFEX%20%28Statement%29\.mp4$/);
@@ -982,32 +982,32 @@ test('yt1080-file: H.264+AAC streams through unchanged as a video/mp4 attachment
 test('yt1080-file: undecidable file passes through with its real type and name (no rename)', async () => {
   const body = Buffer.concat([Buffer.from('RIFF....AVI LIST'), Buffer.alloc(2048, 3)]);
   const { f } = mergeEnvFetch(body, { 'content-type': 'video/x-msvideo', 'content-disposition': 'attachment; filename="clip.avi"' });
-  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001'), ENV));
   assert.equal(r.status, 200);
   assert.equal(r.headers.get('content-type'), 'video/x-msvideo');
   assert.match(r.headers.get('content-disposition'), /filename="clip\.avi"/);
   assert.equal(Buffer.from(await r.arrayBuffer()).length, body.length);
   // moov 在文件尾的 mp4：放行
   const t = mergeEnvFetch(MP4_MOOV_AT_END, { 'content-type': 'video/mp4' });
-  const r2 = await withFetch(t.f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+  const r2 = await withFetch(t.f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001'), ENV));
   assert.equal(r2.status, 200);
-  assert.match(r2.headers.get('content-disposition'), /filename="youtube_j1\.mp4"/);
+  assert.match(r2.headers.get('content-disposition'), /filename="youtube_job-0001\.mp4"/);
 });
 
 test('yt1080-file: upstream 200 JSON is not labelled video/mp4', async () => {
   const { f } = mergeEnvFetch(JSON.stringify({ ok: false, error: 'job not ready' }), { 'content-type': 'application/json' });
-  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001'), ENV));
   assert.match(r.headers.get('content-type'), /json/);
 });
 
 test('yt1080-status: done with AV1/Opus codecs becomes MERGE_NOT_IPHONE; without codec fields it passes', async () => {
   const bad = mergeEnvFetch(null, null, { ok: true, status: 'done', vcodec: 'av01.0.05M.08', acodec: 'opus', filename: 'a.mp4' });
-  const r = await withFetch(bad.f, () => worker.fetch(new Request('https://example.com/api/yt1080-status?id=j1'), ENV));
+  const r = await withFetch(bad.f, () => worker.fetch(new Request('https://example.com/api/yt1080-status?id=job-0001'), ENV));
   const j = await r.json();
   assert.equal(j.ok, false);
   assert.equal(j.code, 'MERGE_NOT_IPHONE');
   const plain = mergeEnvFetch(null, null, { ok: true, status: 'done', filename: 'a.mp4', size: 10 });
-  const r2 = await withFetch(plain.f, () => worker.fetch(new Request('https://example.com/api/yt1080-status?id=j1'), ENV));
+  const r2 = await withFetch(plain.f, () => worker.fetch(new Request('https://example.com/api/yt1080-status?id=job-0001'), ENV));
   assert.deepEqual(await r2.json(), { ok: true, status: 'done', filename: 'a.mp4', size: 10 });
 });
 
@@ -1035,7 +1035,7 @@ test('dispositionFilename prefers filename* (UTF-8) over the ASCII filename', ()
 
 test('yt1080-file keeps the UTF-8 name from filename*', async () => {
   const { f } = mergeEnvFetch(MP4_H264_AAC, { 'content-type': 'video/mp4', 'content-disposition': `attachment; filename="____.mp4"; filename*=UTF-8''%E8%82%96%E9%82%A6.mp4` });
-  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001'), ENV));
   assert.match(r.headers.get('content-disposition'), /filename\*=UTF-8''%E8%82%96%E9%82%A6\.mp4$/);
 });
 
@@ -1054,7 +1054,7 @@ test('withKnownLength pipes through FixedLengthStream when present, and degrades
     assert.deepEqual([...new Uint8Array(await new Response(out).arrayBuffer())], [1, 2, 3]);
     const { f } = mergeEnvFetch(MP4_H264_AAC, { 'content-type': 'video/mp4', 'content-length': String(MP4_H264_AAC.length) });
     seen = null;
-    const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+    const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001'), ENV));
     assert.equal(seen, MP4_H264_AAC.length);
     assert.deepEqual(Buffer.from(await r.arrayBuffer()), MP4_H264_AAC);
   } finally {
@@ -1084,7 +1084,7 @@ test('sniffMergedHead: broken ftyp (size < 8, bad largesize) → unknown, no Typ
 test('yt1080-file: 20-byte upstream starting 00000004 ftyp passes through (not 502)', async () => {
   const b = new Uint8Array([0, 0, 0, 4, 102, 116, 121, 112, 105, 115, 111, 109, 0, 0, 0, 0, 0, 0, 0, 0]);
   const { f } = mergeEnvFetch(b, { 'content-type': 'video/mp4', 'content-length': '20' });
-  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+  const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001'), ENV));
   assert.equal(r.status, 200);
   assert.deepEqual(new Uint8Array(await r.arrayBuffer()), b);
 });
@@ -1124,7 +1124,7 @@ test('withKnownLength skips FixedLengthStream when upstream has Content-Encoding
     assert.equal(seen, 3);
     seen = null;
     const { f } = mergeEnvFetch(MP4_H264_AAC, { 'content-type': 'video/mp4', 'content-length': '99', 'content-encoding': 'gzip' });
-    const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), ENV));
+    const r = await withFetch(f, () => worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001'), ENV));
     assert.equal(r.status, 200);
     assert.equal(seen, null);
   } finally {

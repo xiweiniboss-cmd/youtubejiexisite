@@ -88,13 +88,16 @@ window.YTFetch = (function(){
   async function getRange(proxyUrl, s, e){
     var res = await fetch(proxyUrl, { headers: { Range: 'bytes=' + s + '-' + e } });
     if (!(res.status === 206 || res.status === 200)) {
-      var msg = 'HTTP ' + res.status;
+      var msg = 'HTTP ' + res.status, code = '';
       try {
         var t = await res.text();
         var j = JSON.parse(t);
         if (j && j.error) msg = String(j.error);
+        if (j && j.code) code = String(j.code);
       } catch (err) {}
-      throw new Error(msg);
+      var e2 = new Error(msg);
+      if (code) e2.code = code;
+      throw e2;
     }
     return res;
   }
@@ -127,7 +130,7 @@ window.YTFetch = (function(){
         for(;;){
           var mine = 0;
           try { var res = await getRange(proxyUrl, j.s, j.e); slots[j.k] = await readAll(res, function(n){ mine += n; got += n; onProg(got, total); }); break; }
-          catch (err) { got -= mine; if (++tries >= 3) throw err; await new Promise(function(r){ setTimeout(r, 800 * tries); }); }
+          catch (err) { got -= mine; if (/^HUMAN_/.test(err.code || '') || ++tries >= 3) throw err; await new Promise(function(r){ setTimeout(r, 800 * tries); }); }
         }
       }
     }
