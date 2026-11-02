@@ -121,9 +121,10 @@ body{ background:transparent; }
 </style>
 <style>
 /* ===== 服务器状态卡片（默认折叠成一行，点「详情」展开） ===== */
-.srv-card{ padding:8px 10px 8px 12px; margin-top:10px; border-radius:14px; }
+/* 上下内边距只留 2px：折叠行本身 32px 高，好让「详情」按钮的点按区域撑满 32px，同时卡片总高不超过 40px */
+.srv-card{ padding:2px 6px 2px 12px; margin-top:10px; border-radius:14px; }
 .srv-card + .card{ margin-top:12px; }
-.srv-line{ display:flex; align-items:center; gap:7px; font-size:11.5px; line-height:18px; white-space:nowrap; min-width:0; overflow:hidden; }
+.srv-line{ display:flex; align-items:center; gap:7px; min-height:32px; font-size:11.5px; line-height:18px; white-space:nowrap; min-width:0; overflow:hidden; }
 .srv-dot{ width:7px; height:7px; border-radius:50%; background:var(--faint); flex:none; }
 .srv-dot.on{ background:#2ecc71; box-shadow:0 0 0 3px rgba(46,204,113,.18); }
 .srv-dot.warn{ background:#f5a623; box-shadow:0 0 0 3px rgba(245,166,35,.18); }
@@ -132,13 +133,15 @@ body{ background:transparent; }
 .srv-state{ font-weight:700; color:var(--text); flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; }
 /* 窄屏上「在线 · 状态鉴权失败」这类长状态放不下两段延迟：折叠行只留 本站→服务器，你→本站 在详情里看 */
 @media (max-width:420px){ .srv-line.long .srv-me{ display:none; } }
+/* 更窄（如 320px）时由脚本实测：状态文字被截断就先藏 你→本站，还不够再藏 本站→服务器（两项在详情里都有） */
+.srv-line.fit1 .srv-me, .srv-line.fit2 .srv-lat{ display:none; }
 .srv-latd{ margin-top:8px; font-size:12px; color:var(--faint); }
 .srv-latd b{ color:var(--text); font-weight:600; }
 .srv-state.warn{ color:#f5a623; }
 .srv-lat{ color:var(--faint); flex:none; }
 .srv-lat b{ color:var(--text); font-weight:600; font-variant-numeric:tabular-nums; }
-.srv-toggle{ margin-left:auto; flex:none; background:none; border:none; color:var(--muted); font-size:11.5px; line-height:18px; font-family:inherit; padding:0 0 0 4px; margin-top:0; margin-bottom:0; cursor:pointer; -webkit-appearance:none; appearance:none; }
-.srv-detail{ margin-top:8px; padding-top:4px; border-top:1px solid rgba(255,255,255,.07); }
+.srv-toggle{ flex:none; height:32px; min-width:48px; background:none; border:none; color:var(--muted); font-size:11.5px; line-height:18px; font-family:inherit; padding:0 4px 0 12px; margin:0 0 0 auto; cursor:pointer; -webkit-appearance:none; appearance:none; -webkit-tap-highlight-color:transparent; }
+.srv-detail{ margin:1px 4px 0 0; padding:4px 0 7px; border-top:1px solid rgba(255,255,255,.07); }
 .srv-row{ display:flex; align-items:center; gap:8px; margin-top:8px; font-size:12px; }
 .srv-row .srv-k{ width:62px; flex:none; font-size:12px; color:var(--faint); white-space:nowrap; }
 .srv-bar{ flex:1; height:6px; border-radius:999px; background:rgba(255,255,255,.08); overflow:hidden; }
@@ -1211,7 +1214,17 @@ refreshQuota();
     var dot = $('srvDot'); if (dot) dot.className = 'srv-dot' + (cls ? ' ' + cls : '');
     var st = $('srvOnline'); if (st) { st.textContent = text; st.className = 'srv-state' + (cls === 'warn' ? ' warn' : ''); }
     var line = $('srvLine'); if (line) line.className = 'srv-line' + (cls === 'warn' || cls === 'na' ? ' long' : '');
+    fit();
   }
+  // 折叠行放不下时逐级隐藏延迟，保证「在线 · …」状态文字完整显示
+  function fit(){
+    var line = $('srvLine'), st = $('srvOnline');
+    if (!line || !st || !line.classList || typeof st.scrollWidth !== 'number') return;
+    line.classList.remove('fit1', 'fit2');
+    function cut(){ return st.scrollWidth > st.clientWidth + 1; }
+    if (cut()) { line.classList.add('fit1'); if (cut()) line.classList.add('fit2'); }
+  }
+  if (window.addEventListener) window.addEventListener('resize', fit);
   function clearStats(){
     setText('srvMem', '-'); setText('srvCpu', '-'); setText('srvDisk', '-');
     bar('srvMemBar', null); bar('srvCpuBar', null); bar('srvDiskBar', null);
@@ -1228,7 +1241,7 @@ refreshQuota();
     ms('srvLat', s.latencyMs);
     if (s.authFailed) { setState('warn', '在线 · 状态鉴权失败'); clearStats(); note('服务器在线，但状态接口口令不匹配'); return; }
     if (s.degraded) { setState('warn', '在线 · 异常'); clearStats(); note('服务器在线，但状态接口出错'); return; }
-    if (s.statusSupported === false) { setState('na', '在线 · 未提供详细状态'); clearStats(); note('服务器暂未提供详细状态'); return; }
+    if (s.statusSupported === false) { setState('na', '在线 · 无详情'); clearStats(); note('服务器暂未提供详细状态'); return; }
     setState('on', '在线'); note('');
     var m = s.mem || {}, c = s.cpu || {}, d = s.disk || {}, j = s.jobs || {};
     bar('srvMemBar', m.percent); bar('srvCpuBar', c.percent); bar('srvDiskBar', d.percent);
@@ -1251,7 +1264,7 @@ refreshQuota();
     busy = true;
     var p1 = measurePing().then(function(v){ ms('srvPing', v); }, function(){ ms('srvPing', null); });
     var p2 = getJson('/api/server-status').then(render, function(){ setState('', '-'); ms('srvLat', null); clearStats(); note(''); });
-    Promise.all([p1, p2]).then(function(){ busy = false; }, function(){ busy = false; });
+    Promise.all([p1, p2]).then(function(){ busy = false; fit(); }, function(){ busy = false; fit(); });
   }
   function start(){ if (!timer) timer = setInterval(refresh, 30000); }
   function stop(){ if (timer) { clearInterval(timer); timer = null; } }

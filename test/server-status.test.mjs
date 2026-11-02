@@ -152,20 +152,56 @@ test('server-status: EC2 401/403 -> online:true, authFailed:true, no stats', asy
   }
 });
 
-test('server-status: EC2 5xx -> online:true, degraded:true; 530/1016 stays offline', async () => {
-  for (const st of [500, 502, 503]) {
-    await withFetch(async () => new Response('boom', { status: st }), async () => {
-      const { body } = await callRoute({ YT_MERGE_TOKEN: TOKEN });
-      assert.equal(body.online, true);
-      assert.equal(body.degraded, true);
+test('server-status: non-gateway 5xx (500/501/503/505/519/531/599) -> online:true, degraded:true', async () => {
+  for (const st of [500, 501, 503, 505, 519, 531, 599]) {
+    await withFetch(async () => new Response('boom ' + TOKEN, { status: st, headers: { server: 'nginx' } }), async () => {
+      const { body, text } = await callRoute({ YT_MERGE_TOKEN: TOKEN });
+      assert.equal(body.online, true, 'HTTP ' + st);
+      assert.equal(body.degraded, true, 'HTTP ' + st);
       assert.equal(body.error, '服务器异常（HTTP ' + st + '）');
       assert.equal(body.cpu, undefined);
+      assert.ok(!text.includes(TOKEN));
     });
   }
-  await withFetch(async () => new Response('<h1>Error 1016</h1> Origin DNS error', { status: 502 }), async () => {
+});
+
+test('server-status: gateway 5xx (502/504/520-530) -> online:false 服务器不可达', async () => {
+  const codes = [502, 504];
+  for (let c = 520; c <= 530; c++) codes.push(c);
+  for (const st of codes) {
+    await withFetch(async () => new Response('gateway ' + TOKEN, { status: st }), async () => {
+      const { body, text } = await callRoute({ YT_MERGE_TOKEN: TOKEN });
+      assert.equal(body.online, false, 'HTTP ' + st);
+      assert.equal(body.degraded, undefined, 'HTTP ' + st);
+      assert.equal(body.error, '服务器不可达');
+      assert.ok(!text.includes(TOKEN));
+    });
+  }
+  // 1016 错误页不管状态码都算离线
+  await withFetch(async () => new Response('<h1>Error 1016</h1> Origin DNS error', { status: 500 }), async () => {
     const { body } = await callRoute({ YT_MERGE_TOKEN: TOKEN });
     assert.equal(body.online, false);
     assert.equal(body.error, '服务器不可达');
+  });
+});
+
+test('server-status: any 5xx with `server: cloudflare` -> offline; non-5xx with that header unaffected', async () => {
+  for (const st of [500, 503, 505, 599]) {
+    await withFetch(async () => new Response('cf error page', { status: st, headers: { Server: 'cloudflare' } }), async () => {
+      const { body } = await callRoute({ YT_MERGE_TOKEN: TOKEN });
+      assert.equal(body.online, false, 'HTTP ' + st);
+      assert.equal(body.error, '服务器不可达');
+    });
+  }
+  await withFetch(async () => new Response('nope', { status: 403, headers: { server: 'cloudflare' } }), async () => {
+    const { body } = await callRoute({ YT_MERGE_TOKEN: TOKEN });
+    assert.equal(body.online, true);
+    assert.equal(body.authFailed, true);
+  });
+  await withFetch(async () => new Response(JSON.stringify(FULL), { status: 200, headers: { server: 'cloudflare' } }), async () => {
+    const { body } = await callRoute({ YT_MERGE_TOKEN: TOKEN });
+    assert.equal(body.online, true);
+    assert.equal(body.statusSupported, true);
   });
 });
 
@@ -191,7 +227,7 @@ test('server-status: single-flight — 50 concurrent requests share one EC2 fetc
   });
 });
 
-test('server-status: body over 16KB -> 服务器返回格式异常 and the stream is not fully read', async () => {
+test('server-status: 200 body over 16KB -> online:true degraded (服务器返回内容过大), stream not fully read', async () => {
   let pulled = 0;
   await withFetch(async () => {
     const chunk = new TextEncoder().encode('{"ok":true,"pad":"' + 'x'.repeat(4096));
@@ -201,8 +237,10 @@ test('server-status: body over 16KB -> 服务器返回格式异常 and the strea
     return new Response(stream, { status: 200 });
   }, async () => {
     const body = await fetchServerStatus({ YT_MERGE_TOKEN: TOKEN });
-    assert.equal(body.online, false);
-    assert.equal(body.error, '服务器返回格式异常');
+    assert.equal(body.online, true);
+    assert.equal(body.degraded, true);
+    assert.equal(body.error, '服务器返回内容过大');
+    assert.equal(body.mem, undefined);
     assert.ok(pulled < 20, 'pulled ' + pulled);
   });
   // 刚好 16KB 以内的正常 JSON 不受影响
@@ -286,7 +324,7 @@ test('index.html: card is collapsed by default; online / auth / 5xx / 404 / offl
   assert.equal(e.srvDot.className, 'srv-dot warn');
 
   e = await run({ ok: true, online: true, statusSupported: false, latencyMs: 30 });
-  assert.equal(e.srvOnline.textContent, '在线 · 未提供详细状态');
+  assert.equal(e.srvOnline.textContent, '在线 · 无详情');
   assert.equal(e.srvDot.className, 'srv-dot na');
   assert.equal(e.srvBars.style.display, 'none');
   assert.equal(e.srvNote.textContent, '服务器暂未提供详细状态');

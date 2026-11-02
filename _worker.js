@@ -23,8 +23,9 @@
 //    "disk":{"total":字节,"used":字节},"uptimeSec":n,"jobs":{"running":n,"queued":n}}
 //   Worker 只取这些字段并转成数字，自己算百分比（CPU = load1/cores*100，封顶 100），口令不会回传。
 //   旧版 EC2 没有 /status 返回 404 时视为「在线但未提供详细状态」（statusSupported:false）；
-//   401/403 视为在线但口令不匹配（authFailed:true）；5xx 视为在线但异常（degraded:true）；
-//   超时 / 连不上 / Cloudflare 530·1016 视为离线。响应体最多读 16KB，超出按格式异常处理。
+//   401/403 视为在线但口令不匹配（authFailed:true）；500/501/503/505–519/531–599 视为在线但异常（degraded:true）；
+//   超时 / 连不上 / 502 / 504 / 520–530 / 带 server: cloudflare 的 5xx / 1016 视为离线（服务器不可达）。
+//   响应体最多读 16KB；200 但超出上限算在线但异常（degraded:true）。
 //   结果在边缘缓存约 15 秒，同一 isolate 内并发请求共用一次 EC2 请求（单飞）。
 //   /api/ping 只给浏览器测「你→本站」延迟。两个接口都不加 CORS 头。
 // 年龄限制看 playabilityStatus.reason，不要只看 status：LOGIN_REQUIRED 也会是「Sign in to confirm you're not a bot」。
@@ -1948,10 +1949,25 @@ function concatBytes(chunks) {
   return out;
 }
 
+// /status 专用的「源站不可达」判断（比 mergeOriginDown 更宽，只用于状态卡片）：
+//   502 / 504 / 520–530 —— 网关或 Cloudflare 连不上源站；
+//   任何带 `server: cloudflare` 的 5xx —— 是 Cloudflare 边缘替源站回的错误页；
+//   以及原有的 530·1016 / Origin DNS error 页面。
+// 其余 5xx（500、501、503、505–519、531–599）说明 EC2 进程自己在回话，算在线但异常。
+export function statusOriginUnreachable(status, headers, text) {
+  if (mergeOriginDown(status, text)) return true;
+  if (status === 502 || status === 504 || (status >= 520 && status <= 530)) return true;
+  if (status >= 500 && status <= 599) {
+    const server = headers && typeof headers.get === 'function' ? String(headers.get('server') || '') : '';
+    if (/^\s*cloudflare\b/i.test(server)) return true;
+  }
+  return false;
+}
+
 // 实际探测 EC2。返回给前端的 body（不含口令）。opts.timeoutMs 仅供测试缩短超时。
-// online:false  —— 未配置口令 / 超时 / 连不上 / Cloudflare 530·1016 等源站不可达 / 其它非预期状态 / 格式异常
+// online:false  —— 未配置口令 / 超时 / 连不上 / 网关类 5xx（502/504/520–530/Cloudflare 错误页）/ 其它非预期状态 / 格式异常
 // online:true   —— 200 正常（statusSupported:true）；404 旧版无 /status（statusSupported:false）；
-//                  401/403 口令不匹配（authFailed:true）；5xx 服务在但出错（degraded:true）。后三种不带统计数据。
+//                  401/403 口令不匹配（authFailed:true）；非网关类 5xx 或 200 但响应体超 16KB（degraded:true）。后三种不带统计数据。
 export async function fetchServerStatus(env, opts) {
   const checkedAt = Date.now();
   const token = mergeToken(env);
@@ -1983,13 +1999,14 @@ export async function fetchServerStatus(env, opts) {
       body = { text: '', over: false };
     }
     const st = resp.status;
-    if (mergeOriginDown(st, body.text)) return offline('服务器不可达');
+    if (statusOriginUnreachable(st, resp.headers, body.text)) return offline('服务器不可达');
     const onlineBut = (extra) => Object.assign({ ok: true, online: true, latencyMs }, extra, { checkedAt });
     if (st === 404) return onlineBut({ statusSupported: false });
     if (st === 401 || st === 403) return onlineBut({ authFailed: true, error: '状态鉴权失败（HTTP ' + st + '）' });
     if (st >= 500 && st <= 599) return onlineBut({ degraded: true, error: '服务器异常（HTTP ' + st + '）' });
     if (st !== 200) return offline('服务器异常（HTTP ' + st + '）');
-    if (body.over) return offline('服务器返回格式异常');
+    // 200 但响应体超过 16KB：服务进程在回话，只是内容不对，算「在线 · 异常」。
+    if (body.over) return onlineBut({ degraded: true, error: '服务器返回内容过大' });
     let raw;
     try { raw = JSON.parse(body.text); } catch { return offline('服务器返回格式异常'); }
     if (!raw || typeof raw !== 'object' || raw.ok === false) return offline('服务器返回格式异常');
