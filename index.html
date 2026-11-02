@@ -1174,7 +1174,7 @@ refreshQuota();
 </script>
 
 <script>
-/* 服务器状态卡片：默认折叠；每 30 秒刷新一次，页面在后台时暂停；任何失败都静默显示 "-" */
+/* 服务器状态卡片：默认折叠；每 5 秒刷新一次，页面在后台时暂停；任何失败都静默显示 "-" */
 (function(){
   var $ = function(id){ return document.getElementById(id); };
   if (!$('srvCard')) return;
@@ -1267,7 +1267,7 @@ refreshQuota();
     var p2 = getJson('/api/server-status').then(render, function(){ setState('', '-'); ms('srvLat', null); clearStats(); note(''); });
     Promise.all([p1, p2]).then(function(){ busy = false; fit(); }, function(){ busy = false; fit(); });
   }
-  function start(){ if (!timer) timer = setInterval(refresh, 30000); }
+  function start(){ if (!timer) timer = setInterval(refresh, 5000); }
   function stop(){ if (timer) { clearInterval(timer); timer = null; } }
   document.addEventListener('visibilitychange', function(){
     if (document.hidden) stop(); else { refresh(); start(); }
