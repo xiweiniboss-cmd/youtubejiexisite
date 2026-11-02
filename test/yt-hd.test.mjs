@@ -13,6 +13,7 @@ import worker, {
   pickHdPair,
   findFormatByItag,
   ytHdTiming,
+  mergeFormat,
 } from '../_worker.js';
 
 if (!globalThis.crypto?.subtle) globalThis.crypto = webcrypto;
@@ -786,6 +787,56 @@ test('non-JSON merge 500 becomes a Chinese origin-down error', async () => {
     assert.match(body.error, /HTTP 500/);
     assert.match(body.error, /复制直链/);
     assert.equal(JSON.stringify(body).includes('local-test-token'), false);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+
+// ---- iPhone 相册兼容：只要 H.264 + AAC ----
+const avAdaptive = [
+  { itag: 137, url: 'https://v/137', mimeType: 'video/mp4; codecs="avc1.640028"', height: 1080, bitrate: 4e6 },
+  { itag: 136, url: 'https://v/136', mimeType: 'video/mp4; codecs="avc1.4D401F"', height: 720, bitrate: 2e6 },
+  { itag: 398, url: 'https://v/398', mimeType: 'video/mp4; codecs="av01.0.05M.08"', height: 720, bitrate: 1.5e6 },
+  { itag: 247, url: 'https://v/247', mimeType: 'video/webm; codecs="vp9"', height: 720, bitrate: 1.5e6 },
+  { itag: 251, url: 'https://v/251', mimeType: 'audio/webm; codecs="opus"', bitrate: 160000 },
+];
+const aac140 = { itag: 140, url: 'https://v/140', mimeType: 'audio/mp4; codecs="mp4a.40.2"', bitrate: 128000 };
+const prog18 = { itag: 18, url: 'https://v/18', mimeType: 'video/mp4; codecs="avc1.42001E, mp4a.40.2"', height: 360, bitrate: 6e5 };
+
+test('pickHdPair pairs avc1 only with AAC, never with Opus', () => {
+  const r = pickHdPair({ streamingData: { formats: [prog18], adaptiveFormats: [...avAdaptive, aac140] } });
+  assert.equal(r.video.itag, 137);
+  assert.equal(r.audio.itag, 140);
+  const noAac = pickHdPair({ streamingData: { formats: [prog18], adaptiveFormats: avAdaptive } });
+  assert.ok(!noAac || !noAac.audio || noAac.audio.itag !== 251, 'must not fall back to Opus');
+  if (noAac) assert.equal(noAac.video.itag, 18);
+  const nothing = pickHdPair({ streamingData: { formats: [], adaptiveFormats: avAdaptive } });
+  assert.equal(nothing, null);
+});
+
+test('mergeFormat asks EC2 yt-dlp for avc1 + mp4a only', () => {
+  assert.equal(mergeFormat(720, 'merged'), 'bv*[height<=720][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<=720][ext=mp4][vcodec^=avc1]/b[ext=mp4]');
+  assert.match(mergeFormat(1080, 'merged'), /^bv\*\[height<=1080\]\[vcodec\^=avc1\]\+ba\[acodec\^=mp4a\]/);
+  assert.doesNotMatch(mergeFormat(720, 'silent'), /\+ba/);
+});
+
+test('yt1080-start forwards the H.264/AAC format; yt1080-file is a video/mp4 attachment', async () => {
+  const orig = globalThis.fetch;
+  let sent;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).endsWith('/yt1080-jobs')) { sent = JSON.parse(init.body); return new Response(JSON.stringify({ ok: true, job_id: 'j1' }), { headers: { 'content-type': 'application/json' } }); }
+    return new Response('xx', { status: 200, headers: { 'content-type': 'application/octet-stream', 'content-disposition': 'inline; filename="NEFFEX Statement.webm"' } });
+  };
+  try {
+    const env = { YT_MERGE_TOKEN: 'local-test-token' };
+    await worker.fetch(new Request('https://example.com/api/yt1080-start?url=https://youtu.be/WeiM_vffWAw&quality=720', { method: 'POST' }), env);
+    assert.equal(sent.format, mergeFormat(720, sent.mode || 'merged'));
+    assert.equal(sent.merge_output_format, 'mp4');
+    const f = await worker.fetch(new Request('https://example.com/api/yt1080-file?id=j1'), env);
+    assert.equal(f.headers.get('content-type'), 'video/mp4');
+    assert.match(f.headers.get('content-disposition'), /^attachment; filename="NEFFEX Statement\.mp4"/);
+    assert.equal(await f.text(), 'xx');
   } finally {
     globalThis.fetch = orig;
   }

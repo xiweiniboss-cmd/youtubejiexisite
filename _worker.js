@@ -1310,21 +1310,26 @@ export function findFormatByItag(player, itag) {
   return null;
 }
 
-// 自适应 avc1+音频优先；没有分离音轨时退回渐进式 MP4（itag 18/22 这类，文件里已经有声音）。
+function isAacMp4(f) {
+  const mime = String(f?.mimeType || '');
+  // audio/mp4 里只有 AAC（mp4a）能进 iPhone 相册；ec-3 / ac-3 之类也排除。没写 codecs 的老格式按 AAC 处理。
+  return /^audio\/mp4/i.test(mime) && (/mp4a/i.test(mime) || !/codecs=/i.test(mime));
+}
+
+// 只配 avc1 + AAC：iPhone 相册不认 AV1 / VP9，也不认装在 MP4 里的 Opus。
+// 没有 AAC 分离音轨时不退回 webm/Opus，改用渐进式 MP4（itag 18/22 这类，H.264 + AAC 已经合好）。
 // 只要有直链就用，不要求 playabilityStatus 一定是 OK——有的响应带着可用流却标了别的状态。
 export function pickHdPair(j) {
   const adaptive = (j?.streamingData?.adaptiveFormats || []).filter((f) => f && f.url);
   const progressive = (j?.streamingData?.formats || []).filter((f) => f && f.url);
   const vids = adaptive.filter((f) => isAvcMp4(f) && fmtHeight(f) > 0 && fmtHeight(f) <= HD_TARGET)
     .sort((a, b) => fmtHeight(b) - fmtHeight(a) || (b.bitrate || 0) - (a.bitrate || 0));
-  const auds = adaptive.filter((f) => /^audio\/mp4/i.test(f.mimeType || ''))
-    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  const audsWebm = adaptive.filter((f) => /^audio\/webm/i.test(f.mimeType || ''))
+  const auds = adaptive.filter(isAacMp4)
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
   let adaptivePair = null;
-  if (vids.length && (auds.length || audsWebm.length)) {
+  if (vids.length && auds.length) {
     const video = vids[0];
-    adaptivePair = { video, audio: auds[0] || audsWebm[0], progressive: false, height: fmtHeight(video) };
+    adaptivePair = { video, audio: auds[0], progressive: false, height: fmtHeight(video) };
   }
   const prog = progressive.filter((f) => isAvcMp4(f) && fmtHeight(f) > 0 && fmtHeight(f) <= HD_TARGET)
     .sort((a, b) => fmtHeight(b) - fmtHeight(a) || (b.bitrate || 0) - (a.bitrate || 0));
@@ -1475,6 +1480,13 @@ async function handleYtHd(request, env) {
 /* 注意：Cloudflare Worker 不能直接按 IP 调后端（会被 1003 拦截），
    所以这里用 sslip.io 主机名（解析到同一 EC2 IP），不要改回裸 IP。 */
 const MERGE_BASE_DEFAULT = 'http://3-129-45-49.sslip.io:30002';
+// 给 EC2 yt-dlp 的格式串：只要 H.264(avc1) + AAC(mp4a)，没有就要已合好的 H.264 MP4，最后才放开。
+// iPhone 相册不认 AV1(398/399)、VP9，也不认 MP4 里的 Opus。EC2 要读 body.format 才生效（旧版会忽略这个字段）。
+export function mergeFormat(quality, mode) {
+  const q = +quality || 1080;
+  if (mode === 'silent') return `bv*[height<=${q}][vcodec^=avc1]/b[height<=${q}][ext=mp4][vcodec^=avc1]`;
+  return `bv*[height<=${q}][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<=${q}][ext=mp4][vcodec^=avc1]/b[ext=mp4]`;
+}
 function mergeBase(env) {
   return (env.YT_MERGE_BASE || MERGE_BASE_DEFAULT).replace(/\/$/, '');
 }
@@ -1544,7 +1556,14 @@ async function handleYt1080Start(request, env) {
     const resp = await fetch(mergeBase(env) + '/yt1080-jobs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Merge-Token': token, 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', 'Accept': 'application/json' },
-      body: JSON.stringify({ url: ytUrl, quality: quality, mode: mode }),
+      body: JSON.stringify({
+        url: ytUrl,
+        quality: quality,
+        mode: mode,
+        format: mergeFormat(quality, mode),
+        format_sort: 'vcodec:h264,acodec:aac,res:' + quality + ',ext:mp4:m4a',
+        merge_output_format: 'mp4',
+      }),
     });
     return mergePassthrough(resp);
   } catch (e) {
@@ -1576,6 +1595,16 @@ async function handleYt1080File(request, env) {
     });
     if (!resp.ok) return mergePassthrough(resp);
     const headers = new Headers(resp.headers);
+    // 成品一律按 MP4 附件下发：手机浏览器才会走下载/存储，而不是当网页或在线播放打开。
+    const upName = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(resp.headers.get('content-disposition') || '');
+    let fname = upName ? upName[1] : '';
+    try { fname = decodeURIComponent(fname); } catch { /* 保留原样 */ }
+    fname = fname.replace(/["\r\n\\/]/g, '').slice(0, 80);
+    if (!/\.mp4$/i.test(fname)) fname = (fname.replace(/\.[a-z0-9]{2,4}$/i, '') || 'youtube_' + id.replace(/[^\w-]/g, '').slice(0, 24)) + '.mp4';
+    const ascii = fname.replace(/[^\x20-\x7e]/g, '_');
+    headers.set('Content-Type', 'video/mp4');
+    headers.set('Content-Disposition', 'attachment; filename="' + ascii + '"; filename*=UTF-8\'\'' + encodeURIComponent(fname));
+    headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition');
     headers.set('Cache-Control', 'no-store');
     headers.set('Access-Control-Allow-Origin', '*');
     return new Response(resp.body, { status: 200, headers });

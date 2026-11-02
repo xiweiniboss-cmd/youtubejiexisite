@@ -439,16 +439,22 @@ var deviceId = (function(){
     if (/2k|1440/i.test(t)) return 1440;
     return m ? +m[1] : 0;
   }
-  // 选不超过 1080P 的最高画质；同清晰度优先 MP4(H.264)，iPhone 相册才认
+  // H.264(avc1) 的 itag。398/399/694-699 是 AV1，242-248/271/278/302/303/308/313/315 是 VP9：mime 也可能是 video/mp4，但 iPhone 相册不认。
+  var AVC_ITAG = {18:1,22:1,37:1,59:1,133:1,134:1,135:1,136:1,137:1,160:1,264:1,266:1,298:1,299:1};
+  function isAvc(r){
+    var it = itagOf(r); if (it) return !!AVC_ITAG[it];
+    return /avc1|h264/i.test(urlParam(r.url, 'mime') + ' ' + String(r.type || ''));
+  }
+  // 只在 H.264 里选不超过 1080P 的最高画质；没有 H.264 就不提供合并（合出来存不进相册）
   function pickBestVideo(vids){
-    var c = vids.filter(function(r){ var h = resHeight(r); return h && h <= 1080; });
-    if (!c.length) c = vids.slice();
+    var c = vids.filter(function(r){ var h = resHeight(r); return isAvc(r) && h && h <= 1080; });
+    if (!c.length) return null;
     c.sort(function(a, b){ return (resHeight(b) - resHeight(a)) || ((isMp4(b) ? 1 : 0) - (isMp4(a) ? 1 : 0)); });
     return c[0] || null;
   }
   function pickBestAudio(auds){
     var c = auds.slice();
-    c.sort(function(a, b){ return (isMp4(b) ? 1 : 0) - (isMp4(a) ? 1 : 0); });   // m4a 优先，MP4 容器兼容
+    c.sort(function(a, b){ return (isMp4(b) ? 1 : 0) - (isMp4(a) ? 1 : 0); });   // m4a(AAC) 优先；webm/Opus 只能在合并时转成 AAC
     return c[0] || null;
   }
   var _merging = false;

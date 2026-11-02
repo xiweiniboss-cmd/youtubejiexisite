@@ -1,4 +1,5 @@
-// 浏览器内合并：ffmpeg.wasm 只做 -c copy 封装，不重新编码
+// 浏览器内合并：画面始终 -c copy；音频是 AAC 就 copy，不是（Opus/Vorbis 等）就只把音频转成 AAC。
+// iPhone 相册不认 MP4 里的 Opus，只转音频很快（3 分钟歌大约几秒）。
 window.YTMerge = (function(){
   var CORE_VER = '0.12.10', FF_BASE = window.YT_FF_BASE || '/ffmpeg/';
   var CDNS = window.YT_FF_CDNS || ['https://cdn.jsdelivr.net/npm/', 'https://unpkg.com/'];
@@ -28,16 +29,32 @@ window.YTMerge = (function(){
     }
     throw lastErr || new Error('合并组件加载失败');
   }
+  // 看文件头判断音频是不是 AAC：调用方传进来的 type 不可信（YTFetch 一律标 audio/mp4）。
+  // WebM/Matroska（EBML 头）、Ogg、或 MP4 里出现 Opus/fLaC/ac-3/ec-3 样本描述，都当非 AAC。
+  async function sniffAudio(blob){
+    var head = new Uint8Array(await blob.slice(0, 256 * 1024).arrayBuffer());
+    if (head[0] === 0x1A && head[1] === 0x45 && head[2] === 0xDF && head[3] === 0xA3) return { ext: 'webm', aac: false };
+    if (head[0] === 0x4F && head[1] === 0x67 && head[2] === 0x67 && head[3] === 0x53) return { ext: 'ogg', aac: false };
+    var txt = ''; for (var i = 0; i < head.length; i++) txt += String.fromCharCode(head[i]);
+    if (/Opus|fLaC|ac-3|ec-3/.test(txt)) return { ext: 'm4a', aac: false };
+    return { ext: 'm4a', aac: true };
+  }
+  async function sniffVideoExt(blob){
+    var head = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
+    return (head[0] === 0x1A && head[1] === 0x45 && head[2] === 0xDF && head[3] === 0xA3) ? 'webm' : 'mp4';
+  }
   // video, audio: Blob；返回合并后的 mp4 Blob
   async function merge(video, audio, onStage){
     var ff = await getFF(onStage);
-    onStage && onStage('正在合并音视频…');
-    var vExt = /webm/i.test(video.type) ? 'webm' : 'mp4', aExt = /webm|opus/i.test(audio.type) ? 'webm' : 'm4a';
+    var ai = await sniffAudio(audio);
+    onStage && onStage(ai.aac ? '正在合并音视频…' : '正在合并音视频（声音转成 AAC）…');
+    var vExt = await sniffVideoExt(video), aExt = ai.ext;
     await ff.writeFile('v.' + vExt, new Uint8Array(await video.arrayBuffer()));
     await ff.writeFile('a.' + aExt, new Uint8Array(await audio.arrayBuffer()));
     var prog = function(e){ onStage && onStage('正在合并音视频… ' + Math.max(0, Math.min(100, Math.round(e.progress * 100))) + '%'); };
     ff.on('progress', prog);
-    var code = await ff.exec(['-i', 'v.' + vExt, '-i', 'a.' + aExt, '-map', '0:v:0', '-map', '1:a:0', '-c', 'copy', '-movflags', '+faststart', 'out.mp4']);
+    var aArgs = ai.aac ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '160k', '-ac', '2'];
+    var code = await ff.exec(['-i', 'v.' + vExt, '-i', 'a.' + aExt, '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy'].concat(aArgs, ['-movflags', '+faststart', 'out.mp4']));
     ff.off('progress', prog);
     try { await ff.deleteFile('v.' + vExt); await ff.deleteFile('a.' + aExt); } catch (e) {}
     if (code !== 0) throw new Error('合并失败（ffmpeg ' + code + '）');
@@ -45,7 +62,7 @@ window.YTMerge = (function(){
     try { await ff.deleteFile('out.mp4'); } catch (e) {}
     return new Blob([data.buffer], { type: 'video/mp4' });
   }
-  return { merge: merge, preload: getFF };
+  return { merge: merge, preload: getFF, _sniffAudio: sniffAudio };
 })();
 
 // 分段下载（经 /api/ytdl 代理 + Range）：googlevideo 对无声 1080P 整段下载会限速，分段并发快很多。
