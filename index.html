@@ -158,6 +158,40 @@ body{ background:transparent; }
 .srv-jobs{ margin-top:9px; font-size:12px; color:var(--muted); }
 .srv-jobs b{ color:var(--pink); font-weight:700; }
 </style>
+<style>
+.jxh{ --jxh-accent:#ff3b30; --jxh-accent2:#ff7a45; }
+/* ===== 历史解析（仅存本机浏览器 localStorage，各站独立 key） ===== */
+.jxh, .jxh *{ box-sizing:border-box; }
+.jxh-list{ grid-template-columns:minmax(0,1fr); }
+.jxh-item{ min-width:0; }
+.jxh{ margin-top:16px; background:rgba(13,13,20,.55); border:1px solid rgba(255,255,255,.11); border-radius:20px; padding:4px 14px; color:#f5f3ef; box-shadow:0 24px 50px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.07); backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px); text-align:left; }
+.jxh-head{ display:flex; align-items:center; gap:8px; min-height:46px; }
+.jxh-toggle{ flex:1; min-width:0; display:flex; align-items:center; gap:8px; background:none; border:none; padding:10px 0; margin:0; color:#f5f3ef; font:inherit; font-size:14.5px; font-weight:700; cursor:pointer; text-align:left; -webkit-appearance:none; appearance:none; }
+.jxh-toggle .jxh-count{ font-size:11.5px; font-weight:600; color:var(--jxh-accent); background:rgba(255,255,255,.07); border:1px solid rgba(255,255,255,.1); border-radius:999px; padding:1px 8px; }
+.jxh-toggle .jxh-caret{ margin-left:auto; font-size:12px; font-weight:500; color:rgba(245,243,239,.62); transition:transform .2s; }
+.jxh.open .jxh-caret{ transform:rotate(180deg); }
+.jxh-clear{ flex:none; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.11); color:rgba(245,243,239,.62); font:inherit; font-size:12px; border-radius:999px; padding:6px 12px; margin:0; width:auto; height:auto; cursor:pointer; box-shadow:none; -webkit-appearance:none; appearance:none; }
+.jxh-clear.armed{ color:#fff; border-color:transparent; background:linear-gradient(92deg,var(--jxh-accent2),var(--jxh-accent)); }
+.jxh-clear[hidden], .jxh-body[hidden], .jxh-empty[hidden], .jxh-note-warn[hidden]{ display:none; }
+.jxh-body{ padding:0 0 12px; border-top:1px solid rgba(255,255,255,.07); }
+.jxh-note{ margin:10px 0 0; font-size:11.5px; line-height:1.6; color:rgba(245,243,239,.45); }
+.jxh-note-warn{ color:#ffcf6b; }
+.jxh-list{ list-style:none; margin:10px 0 0; padding:0; display:grid; gap:8px; }
+.jxh-item{ display:flex; gap:11px; padding:10px; border-radius:14px; background:rgba(255,255,255,.045); border:1px solid rgba(255,255,255,.07); }
+.jxh-cover{ flex:none; width:58px; height:58px; border-radius:10px; overflow:hidden; background:rgba(255,255,255,.07); display:grid; place-items:center; font-size:20px; color:rgba(245,243,239,.38); position:relative; }
+.jxh-cover img{ position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+.jxh-main{ flex:1; min-width:0; }
+.jxh-title{ font-size:13.5px; font-weight:600; line-height:1.45; color:#f5f3ef; overflow:hidden; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; word-break:break-all; }
+.jxh-url{ margin-top:3px; font-size:11px; color:rgba(245,243,239,.38); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.jxh-meta{ margin-top:2px; font-size:11px; color:rgba(245,243,239,.38); }
+.jxh-acts{ display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+.jxh-acts button, .jxh-acts a{ display:inline-flex; align-items:center; width:auto; height:auto; margin:0; padding:5px 10px; border-radius:999px; font:inherit; font-size:12px; line-height:1.3; text-decoration:none; cursor:pointer; color:rgba(245,243,239,.78); background:rgba(255,255,255,.07); border:1px solid rgba(255,255,255,.1); box-shadow:none; -webkit-appearance:none; appearance:none; }
+.jxh-acts .jxh-re{ color:#fff; border-color:transparent; background:linear-gradient(92deg,var(--jxh-accent2),var(--jxh-accent)); font-weight:600; }
+.jxh-acts .jxh-del{ color:rgba(245,243,239,.5); }
+.jxh-empty{ margin-top:12px; padding:16px 0 6px; text-align:center; font-size:12.5px; color:rgba(245,243,239,.38); }
+.jxh-msg{ font-size:12px; color:var(--jxh-accent); text-align:center; min-height:0; }
+.jxh-msg:not(:empty){ padding:0 0 10px; }
+</style>
 </head>
 <body>
 <div class="bg"><div class="orb orb-a"></div><div class="orb orb-b"></div><div class="orb orb-c"></div></div><div class="grain"></div>
@@ -247,6 +281,21 @@ body{ background:transparent; }
     <button class="btn" id="saveBtn" style="display:none" onclick="window.__saveFile()">✅ 下载完成，点这里保存</button>
     <div class="hint" id="dlHint" style="display:none">iPhone 会弹出分享菜单，点「存储视频」即可保存到相册；没弹出就点「点这里保存」<br>💡 直链有时效，解析完尽快下载</div>
   </div>
+
+  <!-- 历史解析：只存原链接 / 标题 / 封面 / 时间在本机浏览器，不上传、不存直链；直链会过期，需要时点「重新解析」 -->
+  <section class="jxh" id="jxHist" aria-label="历史解析">
+    <div class="jxh-head">
+      <button type="button" class="jxh-toggle" id="jxhToggle" aria-expanded="false" aria-controls="jxhBody">🕘 历史解析 <span class="jxh-count" id="jxhCount">0</span><span class="jxh-caret">▾</span></button>
+      <button type="button" class="jxh-clear" id="jxhClear" hidden>清空历史</button>
+    </div>
+    <div class="jxh-body" id="jxhBody" hidden>
+      <p class="jxh-note">只保存在本设备的浏览器里，不会上传；最多保留 50 条。只记原链接，下载直链会过期，需要时点「重新解析」。</p>
+      <p class="jxh-note jxh-note-warn" id="jxhWarn" hidden>当前浏览器无法使用本地存储（可能是无痕模式或被禁用），历史只在本页有效，刷新后不会保留。</p>
+      <ul class="jxh-list" id="jxhList"></ul>
+      <div class="jxh-empty" id="jxhEmpty">暂无历史解析记录，解析成功后会自动记在这里</div>
+    </div>
+    <div class="jxh-msg" id="jxhMsg" aria-live="polite"></div>
+  </section>
 
   <footer>解析仅供个人学习交流<br>请勿传播他人原创作品</footer>
 </div>
@@ -1023,6 +1072,7 @@ var deviceId = (function(){
         var hRejected = humanDone(hq, data, hUsed); hq = '';
         if(!data.ok) throw new Error(hRejected ? humanMsg(data) : (data.error || '解析失败'));
         renderResult(data);
+        try { if (window.JiexiHistory) window.JiexiHistory.add({ url: text, title: data.title, cover: data.cover }); } catch(e){}
         try {
           var el = $('parseCount');
           var n = parseInt(el.textContent, 10);
@@ -1388,5 +1438,197 @@ refreshQuota();
 })();
 </script>
 <script src="/ytmerge.js"></script>
+<script>
+/* ===== 历史解析（localStorage，各站独立 key；只存 原链接/标题/封面/时间） ===== */
+(function(){
+/* JIEXI_HISTORY_CORE_BEGIN */
+var JiexiHistoryCore = (function(){
+  var MAX = 50;
+  var STOP = '"<>' + "'" + '，。！？；、（）【】「」《》“”‘’';
+  function noCtl(s){ for (var i = 0; i < s.length; i++) { if (s.charCodeAt(i) <= 32) return false; } return true; }
+  function isHttp(u){ return typeof u === 'string' && u.length <= 2048 && /^https?:[/][/][^/]/i.test(u) && noCtl(u); }
+  function oneLine(s, n){
+    s = String(s == null ? '' : s); var o = '';
+    for (var i = 0; i < s.length && o.length < n + 1; i++) { var c = s.charCodeAt(i); o += (c < 32 || c === 127) ? ' ' : s.charAt(i); }
+    o = o.replace(/ +/g, ' ').replace(/^ | $/g, '');
+    return o.length > n ? o.slice(0, n) + '…' : o;
+  }
+  function firstUrl(text){
+    var s = String(text == null ? '' : text);
+    var m = /https?:[/][/]/i.exec(s);
+    if (!m) return '';
+    var j = m.index;
+    while (j < s.length && s.charCodeAt(j) > 32 && STOP.indexOf(s.charAt(j)) < 0) j++;
+    var u = s.slice(m.index, j);
+    while (u.length && '.,;!?)'.indexOf(u.charAt(u.length - 1)) >= 0) u = u.slice(0, -1);
+    return isHttp(u) ? u : '';
+  }
+  function esc(s){
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+  /* 只留白名单字段：url / title / cover / time，别的（cookie、直链、token）一律丢掉 */
+  function clean(e){
+    if (!e || typeof e !== 'object') return null;
+    var url = firstUrl(e.url);
+    if (!url) return null;
+    var t = Number(e.time);
+    return { url: url, title: oneLine(e.title, 120), cover: isHttp(e.cover) ? e.cover : '', time: (t > 0 && isFinite(t)) ? Math.floor(t) : 0 };
+  }
+  function probe(ls){
+    try { if (!ls) return null; var k = '__jxh_probe__'; ls.setItem(k, '1'); ls.removeItem(k); return ls; } catch (e) { return null; }
+  }
+  function load(ls, key){
+    if (!ls) return [];
+    var raw; try { raw = ls.getItem(key); } catch (e) { return []; }
+    if (!raw) return [];
+    var arr; try { arr = JSON.parse(raw); } catch (e) { return []; }
+    if (!arr || typeof arr.length !== 'number') return [];
+    var out = [], seen = {};
+    for (var i = 0; i < arr.length && out.length < MAX; i++) {
+      var c = clean(arr[i]);
+      if (c && !seen['u' + c.url]) { seen['u' + c.url] = 1; out.push(c); }
+    }
+    return out;
+  }
+  function save(ls, key, list){
+    if (!ls) return false;
+    try { ls.setItem(key, JSON.stringify(list.slice(0, MAX))); return true; }
+    catch (e) {
+      /* 空间满了就砍一半再试一次 */
+      try { ls.setItem(key, JSON.stringify(list.slice(0, Math.floor(MAX / 2)))); return true; } catch (e2) { return false; }
+    }
+  }
+  function add(list, entry, now){
+    var c = clean({ url: entry && entry.url, title: entry && entry.title, cover: entry && entry.cover, time: now || Date.now() });
+    if (!c) return list.slice(0, MAX);
+    var out = [c];
+    for (var i = 0; i < list.length && out.length < MAX; i++) { if (list[i].url !== c.url) out.push(list[i]); }
+    return out;
+  }
+  function remove(list, url){
+    var out = [];
+    for (var i = 0; i < list.length; i++) { if (list[i].url !== url) out.push(list[i]); }
+    return out;
+  }
+  function pad(n){ return (n < 10 ? '0' : '') + n; }
+  function fmtTime(t, now){
+    if (!t) return '';
+    now = now || Date.now();
+    var d = now - t;
+    if (d >= 0 && d < 60000) return '刚刚';
+    if (d >= 0 && d < 3600000) return Math.floor(d / 60000) + ' 分钟前';
+    var a = new Date(t), b = new Date(now);
+    var hm = pad(a.getHours()) + ':' + pad(a.getMinutes());
+    if (a.toDateString() === b.toDateString()) return '今天 ' + hm;
+    var md = pad(a.getMonth() + 1) + '-' + pad(a.getDate());
+    return (a.getFullYear() === b.getFullYear() ? md : a.getFullYear() + '-' + md) + ' ' + hm;
+  }
+  function renderItems(list, now){
+    var h = '';
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i];
+      h += '<li class="jxh-item">' +
+        '<div class="jxh-cover">🎞' + (e.cover ? '<img src="' + esc(e.cover) + '" alt="" loading="lazy" referrerpolicy="no-referrer">' : '') + '</div>' +
+        '<div class="jxh-main">' +
+          '<div class="jxh-title">' + esc(e.title || '（无标题）') + '</div>' +
+          '<div class="jxh-url">' + esc(e.url) + '</div>' +
+          '<div class="jxh-meta">' + esc(fmtTime(e.time, now)) + '</div>' +
+          '<div class="jxh-acts">' +
+            '<button type="button" class="jxh-re" data-act="reparse" data-i="' + i + '">重新解析</button>' +
+            '<a href="' + esc(e.url) + '" target="_blank" rel="noopener noreferrer" data-act="open" data-i="' + i + '">打开原链接</a>' +
+            '<button type="button" data-act="copy" data-i="' + i + '">复制链接</button>' +
+            '<button type="button" class="jxh-del" data-act="del" data-i="' + i + '">删除</button>' +
+          '</div>' +
+        '</div>' +
+      '</li>';
+    }
+    return h;
+  }
+  return { MAX: MAX, isHttp: isHttp, firstUrl: firstUrl, esc: esc, clean: clean, probe: probe, load: load, save: save, add: add, remove: remove, fmtTime: fmtTime, renderItems: renderItems };
+})();
+/* JIEXI_HISTORY_CORE_END */
+
+  var CFG = {"key": "jiexi_history_youtube_v1", "input": "urlInput", "btn": "parseBtn"};
+  var C = JiexiHistoryCore;
+  var ls = null; try { ls = C.probe(window.localStorage); } catch (e) { ls = null; }
+  var list = C.load(ls, CFG.key);
+  if (CFG.migrate) { try { var mg = CFG.migrate(ls, list); if (mg) { list = mg; C.save(ls, CFG.key, list); } } catch (e) {} }
+  var root = document.getElementById('jxHist');
+  if (!root) { window.JiexiHistory = { add: function(){}, list: function(){ return list.slice(); } }; return; }
+  var $j = function(id){ return document.getElementById(id); };
+  var toggle = $j('jxhToggle'), body = $j('jxhBody'), ul = $j('jxhList'), empty = $j('jxhEmpty'), clearBtn = $j('jxhClear'), msg = $j('jxhMsg');
+  var OPEN_KEY = CFG.key + '_open';
+  var open = false; try { open = !!ls && ls.getItem(OPEN_KEY) === '1'; } catch (e) {}
+  var msgTimer = null, armTimer = null;
+  if (!ls) $j('jxhWarn').hidden = false;
+
+  function say(t){ msg.textContent = t; clearTimeout(msgTimer); msgTimer = setTimeout(function(){ msg.textContent = ''; }, 2200); }
+  function setOpen(v){
+    open = v; body.hidden = !v; root.classList.toggle('open', v); toggle.setAttribute('aria-expanded', v ? 'true' : 'false');
+    try { if (ls) ls.setItem(OPEN_KEY, v ? '1' : '0'); } catch (e) {}
+  }
+  function disarm(){ clearTimeout(armTimer); clearBtn.classList.remove('armed'); clearBtn.textContent = '清空历史'; }
+  function render(){
+    $j('jxhCount').textContent = String(list.length);
+    ul.innerHTML = C.renderItems(list, Date.now());
+    empty.hidden = list.length > 0;
+    clearBtn.hidden = list.length === 0;
+    disarm();
+  }
+  function persist(){ if (ls && !C.save(ls, CFG.key, list)) say('本地存储已满，历史没能保存'); }
+  function copy(text){
+    function fallback(){
+      var ta = document.createElement('textarea'); ta.value = text; ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed'; ta.style.top = '-1000px'; document.body.appendChild(ta); ta.select();
+      var ok = false; try { ok = document.execCommand('copy'); } catch (e) {}
+      ta.remove(); say(ok ? '链接已复制' : '复制失败，请长按链接手动复制');
+    }
+    try {
+      if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(text).then(function(){ say('链接已复制'); }, fallback); return; }
+    } catch (e) {}
+    fallback();
+  }
+  function reparse(url){
+    var inp = $j(CFG.input), btn = $j(CFG.btn);
+    if (!inp || !btn) return;
+    inp.value = url;
+    try { inp.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) {}
+    try { inp.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) {}
+    say('已填入原链接，正在重新解析…');
+    btn.click();
+  }
+  toggle.addEventListener('click', function(){ setOpen(!open); });
+  clearBtn.addEventListener('click', function(){
+    if (!clearBtn.classList.contains('armed')) {
+      clearBtn.classList.add('armed'); clearBtn.textContent = '再点一次确认清空';
+      clearTimeout(armTimer); armTimer = setTimeout(disarm, 3000); return;
+    }
+    list = []; persist(); render(); say('历史已清空');
+  });
+  ul.addEventListener('click', function(ev){
+    var t = ev.target;
+    while (t && t !== ul && !(t.getAttribute && t.getAttribute('data-act'))) t = t.parentNode;
+    if (!t || t === ul) return;
+    var e = list[+t.getAttribute('data-i')];
+    if (!e) return;
+    var act = t.getAttribute('data-act');
+    if (act === 'open') return; /* 交给 <a target=_blank> */
+    ev.preventDefault();
+    if (act === 'reparse') reparse(e.url);
+    else if (act === 'copy') copy(e.url);
+    else if (act === 'del') { list = C.remove(list, e.url); persist(); render(); say('已删除 1 条'); }
+  });
+  /* 封面加载失败（过期 / 防盗链）就隐藏，露出占位图标 */
+  ul.addEventListener('error', function(ev){ var t = ev.target; if (t && t.tagName === 'IMG') t.style.display = 'none'; }, true);
+
+  window.JiexiHistory = {
+    add: function(entry){
+      try { list = C.add(list, entry || {}, Date.now()); persist(); render(); } catch (e) {}
+    },
+    list: function(){ return list.slice(); }
+  };
+  render(); setOpen(open);
+})();
+</script>
 </body>
 </html>
