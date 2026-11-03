@@ -122,3 +122,69 @@ test('index.html: 历史区块、独立 key、解析成功后才记录（只传�
   // 重新解析走原来的按钮（人机验证 / 配额照常生效）
   assert.ok(HTML.includes('"input": "urlInput", "btn": "parseBtn"'));
 });
+
+test('history: 原链接 / 封面只认 http(s)——javascript: / data: / vbscript: 等被拒', () => {
+  const C = core();
+  for (const bad of ['javascript:alert(1)', 'JaVaScRiPt:alert(1)', 'data:text/html,<b>x</b>', 'vbscript:msgbox(1)',
+    'file:///etc/passwd', '//evil.com/x', 'https:/x', ' https://a.com', 'https://a.com/\nx', 'blob:https://a.com/1']) {
+    assert.equal(C.isHttp(bad), false, bad);
+    // 存储里的记录：链接不合法整条跳过
+    assert.equal(C.clean({ url: bad, title: 't', cover: '', time: 1 }, true), null, bad);
+    // 封面不合法只丢封面，记录保留
+    const e = C.clean({ url: 'https://a.com/v', title: 't', cover: bad, time: 1 }, true);
+    assert.equal(e.cover, '', bad);
+    assert.equal(C.add([], { url: 'https://a.com/v', cover: bad }, 1)[0].cover, '', bad);
+  }
+  assert.equal(C.isHttp('https://i.ytimg.com/vi/a/hq.jpg'), true);
+  assert.equal(C.isHttp('HTTP://a.com'), true);
+  // 新解析写入时链接里没有 http(s) 就不记
+  assert.deepEqual(plain(C.add([], { url: 'data:text/html,https' }, 1)), []);
+  assert.deepEqual(plain(C.add([], { url: ['https://a.com'] }, 1)), []);
+  const h = C.renderItems(C.load(memLS({ [KEY]: JSON.stringify([{ url: 'https://a.com', cover: 'javascript:alert(1)', title: 'x', time: 1 }]) }), KEY), 2);
+  assert.ok(!/javascript:/i.test(h), h);
+  assert.ok(!h.includes('<img'), h);
+});
+
+test('history: 读取时坏记录逐条跳过（字段类型不对），好记录照常保留，不抛错', () => {
+  const C = core();
+  const good = { url: 'https://youtu.be/ok', title: 'OK', cover: 'https://i.ytimg.com/ok.jpg', time: 123 };
+  const rows = [
+    good,
+    { url: 123, title: 'num url' },
+    { url: ['https://youtu.be/arr'], title: 'arr url' },
+    { url: { toString: 'https://x' } },
+    { url: 'https://youtu.be/t1', title: { a: 1 } },
+    { url: 'https://youtu.be/t2', title: ['x'] },
+    { url: 'https://youtu.be/t3', title: 5 },
+    { url: 'https://youtu.be/c1', cover: 42 },
+    { url: 'https://youtu.be/c2', cover: { src: 'https://a' } },
+    { url: 'https://youtu.be/tm', time: '2026-11-03' },
+    { url: 'https://youtu.be/tm2', time: true },
+    ['https://youtu.be/array-record'],
+    'https://youtu.be/string-record',
+    null, 0, false, true,
+    { url: 'https://youtu.be/minimal' },
+    { url: 'https://youtu.be/nulls', title: null, cover: null, time: null },
+    { url: 'https://youtu.be/ok', title: 'dup' },
+  ];
+  const got = plain(C.load(memLS({ [KEY]: JSON.stringify(rows) }), KEY));
+  assert.deepEqual(got, [
+    good,
+    { url: 'https://youtu.be/minimal', title: '', cover: '', time: 0 },
+    { url: 'https://youtu.be/nulls', title: '', cover: '', time: 0 },
+  ]);
+  // 各种坏 JSON / 非数组都返回 []
+  for (const raw of ['', '{', 'null', 'true', '1', '"x"', '{"length":3,"0":{"url":"https://a.com"}}', '[', 'undefined']) {
+    assert.deepEqual(plain(C.load(memLS({ [KEY]: raw }), KEY)), [], raw);
+  }
+  // getItem 返回非字符串（怪异实现）也不炸
+  assert.deepEqual(plain(C.load({ getItem: () => 42 }, KEY)), []);
+});
+
+test('history: 标题只以转义文本插入（index.html 渲染路径没有未转义的 title）', () => {
+  assert.match(HTML, /'<div class="jxh-title">' \+ esc\(e\.title \|\| '（无标题）'\) \+ '<\/div>'/);
+  assert.match(HTML, /'<div class="jxh-url">' \+ esc\(e\.url\) \+ '<\/div>'/);
+  assert.match(HTML, /'<img src="' \+ esc\(e\.cover\) \+ '"/);
+  assert.match(HTML, /<a href="' \+ esc\(e\.url\) \+ '"/);
+  assert.match(HTML, /msg\.textContent = t;/);
+});

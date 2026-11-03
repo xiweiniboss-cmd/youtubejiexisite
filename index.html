@@ -1466,13 +1466,26 @@ var JiexiHistoryCore = (function(){
   function esc(s){
     return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
-  /* 只留白名单字段：url / title / cover / time，别的（cookie、直链、token）一律丢掉 */
-  function clean(e){
-    if (!e || typeof e !== 'object') return null;
-    var url = firstUrl(e.url);
+  /* 只留白名单字段：url / title / cover / time，别的（cookie、直链、token）一律丢掉。
+     strict（读 localStorage 时）：字段类型不对或链接不是 http(s) 就整条跳过；
+     宽松（新解析写入时）：从分享文案里取第一个 http(s) 链接，标题转成字符串。
+     封面不是 http(s)（javascript: / data: 等）只丢封面，不丢记录。 */
+  function clean(e, strict){
+    if (!e || typeof e !== 'object' || Array.isArray(e)) return null;
+    var url, title, cover = e.cover, t = e.time;
+    if (strict) {
+      if (typeof e.url !== 'string' || !isHttp(e.url)) return null;
+      if (e.title != null && typeof e.title !== 'string') return null;
+      if (cover != null && typeof cover !== 'string') return null;
+      if (t != null && typeof t !== 'number') return null;
+      url = e.url; title = e.title;
+    } else {
+      url = firstUrl(typeof e.url === 'string' ? e.url : '');
+      title = (typeof e.title === 'string' || typeof e.title === 'number') ? e.title : '';
+      t = Number(t);
+    }
     if (!url) return null;
-    var t = Number(e.time);
-    return { url: url, title: oneLine(e.title, 120), cover: isHttp(e.cover) ? e.cover : '', time: (t > 0 && isFinite(t)) ? Math.floor(t) : 0 };
+    return { url: url, title: oneLine(title, 120), cover: isHttp(cover) ? cover : '', time: (t > 0 && isFinite(t)) ? Math.floor(t) : 0 };
   }
   function probe(ls){
     try { if (!ls) return null; var k = '__jxh_probe__'; ls.setItem(k, '1'); ls.removeItem(k); return ls; } catch (e) { return null; }
@@ -1480,12 +1493,12 @@ var JiexiHistoryCore = (function(){
   function load(ls, key){
     if (!ls) return [];
     var raw; try { raw = ls.getItem(key); } catch (e) { return []; }
-    if (!raw) return [];
+    if (!raw || typeof raw !== 'string') return [];
     var arr; try { arr = JSON.parse(raw); } catch (e) { return []; }
-    if (!arr || typeof arr.length !== 'number') return [];
+    if (!Array.isArray(arr)) return [];
     var out = [], seen = {};
     for (var i = 0; i < arr.length && out.length < MAX; i++) {
-      var c = clean(arr[i]);
+      var c = null; try { c = clean(arr[i], true); } catch (e) { c = null; }
       if (c && !seen['u' + c.url]) { seen['u' + c.url] = 1; out.push(c); }
     }
     return out;
