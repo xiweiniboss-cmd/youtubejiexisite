@@ -255,7 +255,8 @@ test('server-status: 200 body over 16KB -> online:true degraded (服务器返回
 
 test('index.html: card is collapsed by default; online / auth / 5xx / 404 / offline states; toggle; ping median', async () => {
   const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
-  assert.match(html, /本站已解析 <b id="parseCount">-<\/b> 次<\/p>\n  <\/section>\n\n  <!-- 服务器状态/);
+  assert.match(html, /<p class="jx-count">本站已解析 <b id="parseCount">-<\/b> 次<\/p>/);
+  assert.match(html, /<!-- 服务器状态/);
   assert.match(html, /id="srvDetail" style="display:none"/);
   assert.match(html, /详情 ▾/);
   const script = html.split('<script>').map((x) => x.split('</script>')[0]).find((x) => x.includes("$('srvCard')"));

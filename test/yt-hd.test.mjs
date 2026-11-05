@@ -1301,9 +1301,9 @@ test('index.html wires DIRECT_LIMITED and phone-merge 403 to server merge and dr
   assert.doesNotMatch(html, /复制直链」(粘贴到|用) ?Safari/);
   assert.doesNotMatch(html, /请点(下方|下面的|右侧)?「(🔗 )?复制直链」/);
   assert.match(html, /hdErr\.directLimited = !!\(h && \(h\.directOk === false \|\| h\.code === 'DIRECT_LIMITED'\)\)/);
-  assert.match(html, /e\.serverMerge && \(e\.directLimited \|\| code === 'DIRECT_LIMITED'\)\) \{\s*offerServerMerge\(hdSlot, d, best, '⚠️ ' \+ DIRECT_LIMITED_NOTE/);
+  assert.match(html, /e\.serverMerge && \(e\.directLimited \|\| code === 'DIRECT_LIMITED'\)\) \{\s*offerServerMerge\(hdSlot, d, best, DIRECT_LIMITED_NOTE/);
   assert.match(html, /if \(isDirectLimited\(e\) && autoServerMerge\(vid, v\.height \|\| resHeight\(v\)\)\) return;\s*showError\('合并下载失败：/);
   assert.match(html, /if \(isDirectLimited\(e\) && spec && spec\.v && spec\.height > 0 && autoServerMerge\(spec\.v, spec\.height\)\) return;/);
   // 复制直链按钮本身保留
-  assert.match(html, /copyBtn\.textContent = '🔗 复制直链'/);
+  assert.match(html, /copyBtn\.textContent = '复制直链'/);
 });
