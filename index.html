@@ -191,6 +191,25 @@ body{ background:transparent; }
 .jxh-empty{ margin-top:12px; padding:16px 0 6px; text-align:center; font-size:12.5px; color:rgba(245,243,239,.38); }
 .jxh-msg{ font-size:12px; color:var(--jxh-accent); text-align:center; min-height:0; }
 .jxh-msg:not(:empty){ padding:0 0 10px; }
+
+/* press-anim-v2：解析按钮整颗按压 + 弹簧回弹 + 触点光圈（JS 加类驱动，不依赖 :active） */
+#parseBtn{ position:relative; overflow:hidden; touch-action:manipulation; user-select:none; -webkit-user-select:none; will-change:transform; transform:translateZ(0) scale(1);
+  transition:transform .32s cubic-bezier(.34,1.56,.64,1), box-shadow .32s ease, filter .25s ease, opacity .2s; }
+#parseBtn:active{ transform:translateZ(0) scale(1); }
+#parseBtn.is-pressed{ transform:translateZ(0) translateY(1px) scale(.95); filter:brightness(.9) saturate(1.1);
+  box-shadow:0 4px 10px rgba(0,0,0,.4), inset 0 2px 6px rgba(0,0,0,.35); transition:transform .09s ease-out, box-shadow .09s ease-out, filter .09s ease-out; }
+#parseBtn.is-release{ animation:pressSpringV2 .52s cubic-bezier(.2,.8,.2,1) both; }
+@keyframes pressSpringV2{
+  0%{ transform:translateZ(0) translateY(1px) scale(.95); }
+  35%{ transform:translateZ(0) translateY(-1px) scale(1.035); }
+  60%{ transform:translateZ(0) scale(.99); }
+  80%{ transform:translateZ(0) scale(1.008); }
+  100%{ transform:translateZ(0) scale(1); }
+}
+#parseBtn .press-ripple{ position:absolute; border-radius:50%; pointer-events:none; transform:translate(-50%,-50%) scale(0);
+  background:radial-gradient(circle, rgba(255,255,255,.38) 0%, rgba(255,255,255,.12) 45%, rgba(255,255,255,0) 70%); animation:pressRippleV2 .6s ease-out forwards; }
+@keyframes pressRippleV2{ to{ transform:translate(-50%,-50%) scale(1); opacity:0; } }
+@media (prefers-reduced-motion: reduce){ #parseBtn, #parseBtn.is-pressed{ transition:none; } #parseBtn.is-release{ animation:none; } #parseBtn .press-ripple{ display:none; } }
 </style>
 </head>
 <body>
@@ -1641,6 +1660,38 @@ var JiexiHistoryCore = (function(){
     list: function(){ return list.slice(); }
   };
   render(); setOpen(open);
+})();
+</script>
+<script>
+/* press-anim-v2：按下立刻缩、至少保持 90ms 让快点也看得见，松开弹簧回弹 + 从手指位置扩散的光圈 */
+(function(){
+  var b = document.getElementById('parseBtn'); if(!b) return;
+  var downAt = 0, pressed = false, relTimer = null;
+  function press(e){
+    if(b.disabled) return;
+    pressed = true; downAt = Date.now(); clearTimeout(relTimer);
+    b.classList.remove('is-release'); b.classList.add('is-pressed');
+    var r = b.getBoundingClientRect();
+    var x = (e && e.clientX != null ? e.clientX : r.left + r.width / 2) - r.left;
+    var y = (e && e.clientY != null ? e.clientY : r.top + r.height / 2) - r.top;
+    var d = Math.max(r.width, r.height) * 2.2;
+    var rp = document.createElement('span'); rp.className = 'press-ripple';
+    rp.style.cssText = 'left:' + x + 'px;top:' + y + 'px;width:' + d + 'px;height:' + d + 'px';
+    b.insertBefore(rp, b.firstChild);
+    setTimeout(function(){ if(rp.parentNode) rp.parentNode.removeChild(rp); }, 650);
+  }
+  function release(){
+    if(!pressed) return; pressed = false;
+    var wait = Math.max(0, 90 - (Date.now() - downAt));
+    relTimer = setTimeout(function(){ b.classList.remove('is-pressed'); void b.offsetWidth; b.classList.add('is-release'); }, wait);
+  }
+  b.addEventListener('pointerdown', press);
+  b.addEventListener('pointerup', release);
+  b.addEventListener('pointercancel', release);
+  b.addEventListener('pointerleave', release);
+  b.addEventListener('animationend', function(e){ if(e.animationName === 'pressSpringV2') b.classList.remove('is-release'); });
+  b.addEventListener('keydown', function(e){ if((e.key === 'Enter' || e.key === ' ') && !e.repeat) press(); });
+  b.addEventListener('keyup', function(e){ if(e.key === 'Enter' || e.key === ' ') release(); });
 })();
 </script>
 </body>
