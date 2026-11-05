@@ -115,7 +115,7 @@ test('index.html: 历史区块、独立 key、解析成功后才记录（只传�
   assert.ok(HTML.includes('"key": "' + KEY + '"'), '本站 key 必须是 ' + KEY);
   for (const id of ['jxHist', 'jxhToggle', 'jxhBody', 'jxhList', 'jxhClear']) assert.ok(HTML.includes('id="' + id + '"'), id);
   assert.match(HTML, />清空历史</);
-  assert.match(HTML, /🕘 历史解析/);
+  assert.match(HTML, /历史解析 <span class="jxh-count" id="jxhCount">/);
   // 挂在 parseBtn 成功分支：renderResult(data) 之后，且 data.ok 判定之后
   assert.match(HTML, /if\(!data\.ok\) throw new Error\([^\n]*\);\n\s*renderResult\(data\);\n\s*try \{ if \(window\.JiexiHistory\) window\.JiexiHistory\.add\(\{ url: text, title: data\.title, cover: data\.cover \}\); \} catch\(e\)\{\}\n/);
   assert.equal((HTML.match(/JiexiHistory\.add\(/g) || []).length, 1);

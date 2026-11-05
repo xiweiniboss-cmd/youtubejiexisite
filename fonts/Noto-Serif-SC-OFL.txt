@@ -1,0 +1,8 @@
+Copyright 2014-2021 Adobe, with Reserved Font Name 'Source'.
+Noto Serif SC, as distributed by Google Fonts. fonts/noto-serif-sc-500.woff2
+is a subset of the Medium (weight 500) cut, and contains only the glyphs in
+the headline 「保存无水印的 YouTube 视频」.
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1.
+The full license text is in OFL.txt in this directory.
+https://scripts.sil.org/OFL
