@@ -155,7 +155,7 @@
   <footer>解析仅供个人学习交流<br>请勿传播他人原创作品</footer>
 </div>
 
-<button type="button" id="fbBtn" title="问题反馈" aria-label="问题反馈"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></button>
+<button type="button" id="fbBtn" title="问题反馈" aria-label="问题反馈"><span class="fb-mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/><path d="M8 10h8"/><path d="M8 13.5h5"/></svg></span><span class="fb-label">反馈</span></button>
 <div id="fbWrap">
   <div class="backdrop" id="fbBackdrop"></div>
   <div class="sheet" id="fbSheet">
@@ -1132,7 +1132,7 @@ refreshQuota();
   var btn = document.getElementById('fbBtn');
   if(!btn) return;
   var KEY = 'fab_pos_youtube';
-  function clamp(x, y){ return { x: Math.min(Math.max(4, x), window.innerWidth - 56), y: Math.min(Math.max(4, y), window.innerHeight - 56) }; }
+  function clamp(x, y){ var w = btn.offsetWidth || 96, h = btn.offsetHeight || 40; return { x: Math.min(Math.max(8, x), window.innerWidth - w - 8), y: Math.min(Math.max(8, y), window.innerHeight - h - 8) }; }
   try {
     var saved = JSON.parse(localStorage.getItem(KEY) || 'null');
     if(saved && typeof saved.x === 'number' && typeof saved.y === 'number'){
@@ -1142,7 +1142,7 @@ refreshQuota();
   } catch(e){}
   var sx=0, sy=0, ox=0, oy=0, moved=false, dragging=false, dragEndAt=0;
   document.addEventListener('click', function(e){
-    if(e.target === btn && moved && Date.now() - dragEndAt < 300){ e.stopPropagation(); e.preventDefault(); }
+    if(btn.contains(e.target) && moved && Date.now() - dragEndAt < 300){ e.stopPropagation(); e.preventDefault(); }
   }, true);
   btn.addEventListener('pointerdown', function(e){
     dragging = true; moved = false;

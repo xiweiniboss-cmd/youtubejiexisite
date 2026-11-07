@@ -843,22 +843,60 @@ footer a:hover { color: var(--jx-secondary); }
   right: 16px;
   bottom: calc(16px + env(safe-area-inset-bottom));
   z-index: 60;
-  display: grid;
-  place-items: center;
-  width: 48px;
-  height: 48px;
-  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: auto;
+  height: 40px;
+  padding: 0 14px 0 6px;
   border: 1px solid var(--jx-hairline-strong);
-  border-radius: 12px;
-  background: var(--jx-surface);
-  color: var(--jx-secondary);
-  box-shadow: var(--jx-shadow-float);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--jx-surface) 78%, transparent);
+  color: var(--jx-text);
+  box-shadow: var(--jx-shadow-float), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(16px) saturate(1.2);
+  -webkit-backdrop-filter: blur(16px) saturate(1.2);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0.08em;
   touch-action: none;
   user-select: none;
-  transition: background-color var(--jx-fast) var(--jx-ease), color var(--jx-fast) var(--jx-ease);
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  cursor: pointer;
+  transition: background-color var(--jx-fast) var(--jx-ease), border-color var(--jx-fast) var(--jx-ease), transform 160ms var(--jx-ease);
 }
 
-#fbBtn:hover { background: var(--jx-raised); color: var(--jx-text); }
+#fbBtn:hover {
+  background: var(--jx-raised);
+  border-color: color-mix(in srgb, var(--jx-accent) 55%, var(--jx-hairline-strong));
+  color: var(--jx-text);
+}
+
+#fbBtn:active { transform: scale(0.97); }
+
+#fbBtn:focus-visible {
+  outline: 2px solid var(--jx-accent);
+  outline-offset: 3px;
+}
+
+#fbBtn .fb-mark {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  flex: none;
+  background: var(--jx-accent);
+  color: var(--jx-on-accent);
+  box-shadow: var(--jx-highlight);
+  pointer-events: none;
+}
+
+#fbBtn .fb-mark svg { display: block; }
+
+#fbBtn .fb-label { pointer-events: none; padding-right: 2px; }
 
 #fbWrap {
   display: none;
