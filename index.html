@@ -155,26 +155,50 @@
   <footer>解析仅供个人学习交流<br>请勿传播他人原创作品</footer>
 </div>
 
-<button type="button" id="fbBtn" title="问题反馈" aria-label="问题反馈"><span class="fb-mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/><path d="M8 10h8"/><path d="M8 13.5h5"/></svg></span><span class="fb-label">反馈</span></button>
+<button type="button" id="fbBtn" title="问题反馈" aria-label="问题反馈" aria-haspopup="dialog"><span class="fb-mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/><path d="M8 10h8"/><path d="M8 13.5h5"/></svg></span><span class="fb-label">反馈</span></button>
 <div id="fbWrap">
   <div class="backdrop" id="fbBackdrop"></div>
-  <div class="sheet" id="fbSheet">
-    <h3>问题反馈</h3>
-    <p>解析失败、下载不了，或者结果不对，写在这里。可以附截图或录屏。</p>
-    <textarea id="fbMsg" placeholder="哪条链接，页面提示了什么"></textarea>
-    <input type="text" id="fbContact" placeholder="联系方式，选填" maxlength="120">
-    <label class="flabel" for="fbFiles">截图或录屏，最多 3 个，每个不超过 20MB</label>
-    <input type="file" id="fbFiles" accept="image/*,video/*" multiple>
+  <div class="sheet fb-sheet" id="fbSheet" role="dialog" aria-modal="true" aria-labelledby="fbTitle">
+    <div class="fb-grab" aria-hidden="true"></div>
+    <div class="fb-head">
+      <div>
+        <div class="fb-kicker">只发给站长，不会公开</div>
+        <h3 id="fbTitle">问题反馈</h3>
+      </div>
+      <button type="button" class="fb-x" id="fbCancel" aria-label="关闭">×</button>
+    </div>
+    <p class="fb-lead">解析失败、下不下来、结果不对，说一下发生了什么就行。</p>
+    <div class="fb-chips" id="fbChips" role="group" aria-label="问题类型">
+      <button type="button" class="fb-chip" data-chip="解析失败">解析失败</button>
+      <button type="button" class="fb-chip" data-chip="下载失败">下载失败</button>
+      <button type="button" class="fb-chip" data-chip="还有水印">还有水印</button>
+      <button type="button" class="fb-chip" data-chip="视频有问题">视频有问题</button>
+      <button type="button" class="fb-chip" data-chip="其他">其他</button>
+    </div>
+    <label class="fb-field">
+      <span>怎么回事</span>
+      <textarea id="fbMsg" maxlength="2000" placeholder="例如：这条链接解析出来是空白，或者下载保存没反应。链接也可以直接贴在这里。"></textarea>
+      <em class="fb-count" id="fbCount">0 / 2000</em>
+    </label>
+    <label class="fb-field">
+      <span>怎么联系你 <i>可选</i></span>
+      <input type="text" id="fbContact" maxlength="120" placeholder="邮箱或社交账号" autocomplete="off">
+    </label>
+    <div class="fb-files">
+      <div class="fb-file-head">截图或录屏 <i>可选 · 最多 3 个 · 单个不超过 20MB</i></div>
+      <div class="fb-previews" id="fbPreviews"></div>
+      <button type="button" class="fb-drop" id="fbDrop"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V6m0 0-3.5 3.5M12 6l3.5 3.5"/><path d="M5 16.5V18a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-1.5"/></svg><span>添加图片或视频</span></button>
+      <input type="file" id="fbFiles" accept="image/*,video/*" multiple hidden>
+    </div>
+    <p class="fb-note" id="fbLinkNote" hidden>输入框里的链接会一起提交，方便对照是哪一条。</p>
     <div id="tsWidget"></div>
     <div id="fbErr" style="display:none"></div>
-    <div class="row">
-      <button type="button" class="btn-ghost" id="fbCancel">取消</button>
+    <div class="fb-actions">
       <button type="button" class="btn-ok" id="fbSubmit">提交反馈</button>
     </div>
     <div id="fbDone"><p>反馈已提交，谢谢</p></div>
   </div>
 </div>
-
 <script>
 (function(){
   var $ = function(id){ return document.getElementById(id); };
@@ -843,50 +867,156 @@ var deviceId = (function(){
       showFbError('验证组件加载失败，请检查网络后重试。');
     });
   }
-  $('fbBtn').onclick = function(){ $('fbWrap').classList.add('show'); $('fbDone').style.display = 'none'; hideFbError(); loadTurnstile(); };
-  $('fbBackdrop').onclick = function(){ $('fbWrap').classList.remove('show'); };
-  $('fbCancel').onclick = function(){ $('fbWrap').classList.remove('show'); };
-  $('fbSubmit').onclick = async function(){
-    hideFbError();
-    var msg = $('fbMsg').value.trim();
-    if(!msg){ showFbError('请先填写反馈内容。'); return; }
-    var files = Array.prototype.slice.call($('fbFiles').files || []);
-    if(files.length > 3){ showFbError('最多上传 3 个附件。'); return; }
-    for(var i = 0; i < files.length; i++){
-      var f = files[i];
-      if(!/^(image|video)\//.test(f.type || '')){ showFbError('只支持图片和视频附件。'); return; }
-      if(f.size > 20 * 1024 * 1024){ showFbError('单个附件不能超过 20MB。'); return; }
+    var fbKind = '';
+  var fbPicked = [];
+  function fbShowErr(text){
+    var e = $('fbErr');
+    if (!e) return;
+    e.style.display = text ? 'block' : 'none';
+    e.textContent = text || '';
+  }
+  function fbSyncCount(){ $('fbCount').textContent = $('fbMsg').value.length + ' / 2000'; }
+  function fbLinkNote(){
+    var raw = ($('urlInput') && $('urlInput').value || '').trim();
+    $('fbLinkNote').hidden = !/https?:\/\//i.test(raw);
+  }
+  function fbRenderPicked(){
+    var box = $('fbPreviews');
+    box.innerHTML = '';
+    fbPicked.forEach(function(item, i){
+      var el = document.createElement('div');
+      el.className = 'fb-thumb';
+      if ((item.file.type || '').indexOf('video/') === 0) {
+        var v = document.createElement('video');
+        v.src = item.url; v.muted = true; v.playsInline = true;
+        el.appendChild(v);
+      } else {
+        var img = document.createElement('img');
+        img.src = item.url; img.alt = '';
+        el.appendChild(img);
+      }
+      var rm = document.createElement('button');
+      rm.type = 'button';
+      rm.className = 'fb-thumb-x';
+      rm.setAttribute('aria-label', '移除这个附件');
+      rm.textContent = '×';
+      rm.onclick = function(){
+        URL.revokeObjectURL(item.url);
+        fbPicked.splice(i, 1);
+        fbRenderPicked();
+      };
+      el.appendChild(rm);
+      box.appendChild(el);
+    });
+    $('fbDrop').hidden = fbPicked.length >= 3;
+  }
+  function fbAddFiles(list){
+    var arr = Array.prototype.slice.call(list || []);
+    var warned = false;
+    for (var i = 0; i < arr.length; i++) {
+      var f = arr[i];
+      if (fbPicked.length >= 3) { if (!warned) fbShowErr('最多 3 个附件。'); warned = true; break; }
+      if (!/^(image|video)\//.test(f.type || '')) { fbShowErr('只支持图片和视频附件。'); continue; }
+      if (f.size > 20 * 1024 * 1024) { fbShowErr('单个附件不能超过 20MB。'); continue; }
+      fbPicked.push({ file: f, url: URL.createObjectURL(f) });
     }
+    fbRenderPicked();
+  }
+  function fbClearPicked(){
+    fbPicked.forEach(function(item){ URL.revokeObjectURL(item.url); });
+    fbPicked = [];
+    fbRenderPicked();
+  }
+  function fbCompose(msg){
+    var text = msg || '（未写具体描述）';
+    if (fbKind) text = '【' + fbKind + '】\n' + text;
+    var raw = ($('urlInput') && $('urlInput').value || '').trim();
+    if (/https?:\/\//i.test(raw)) text += '\n\n当前输入：\n' + raw.slice(0, 800);
+    return text;
+  }
+  function fbClose(){
+    $('fbWrap').classList.remove('show');
+    document.body.style.overflow = '';
+  }
+  function fbOpen(){
+    $('fbDone').style.display = 'none';
+    if (typeof hideFbError === 'function') hideFbError();
+    else fbShowErr('');
+    fbLinkNote();
+    fbSyncCount();
+    $('fbWrap').classList.add('show');
+    document.body.style.overflow = 'hidden';
+    if (typeof loadTurnstile === 'function') loadTurnstile();
+    setTimeout(function(){ $('fbMsg').focus(); }, 40);
+  }
+  $('fbBtn').onclick = fbOpen;
+  $('fbBackdrop').onclick = fbClose;
+  $('fbCancel').onclick = fbClose;
+  document.addEventListener('keydown', function(e){
+    if (e.key === 'Escape' && $('fbWrap').classList.contains('show')) fbClose();
+  });
+  $('fbMsg').addEventListener('input', fbSyncCount);
+  $('fbChips').addEventListener('click', function(e){
+    var b = e.target.closest ? e.target.closest('.fb-chip') : null;
+    if (!b) return;
+    var v = b.getAttribute('data-chip');
+    fbKind = (fbKind === v) ? '' : v;
+    var chips = document.querySelectorAll('.fb-chip');
+    for (var i = 0; i < chips.length; i++) chips[i].classList.toggle('on', chips[i].getAttribute('data-chip') === fbKind);
+  });
+  $('fbDrop').onclick = function(){ $('fbFiles').click(); };
+  $('fbFiles').onchange = function(){ fbAddFiles($('fbFiles').files); $('fbFiles').value = ''; };
+  ['dragenter', 'dragover'].forEach(function(ev){
+    $('fbDrop').addEventListener(ev, function(e){ e.preventDefault(); $('fbDrop').classList.add('is-over'); });
+  });
+  ['dragleave', 'drop'].forEach(function(ev){
+    $('fbDrop').addEventListener(ev, function(e){ e.preventDefault(); $('fbDrop').classList.remove('is-over'); });
+  });
+  $('fbDrop').addEventListener('drop', function(e){ fbAddFiles(e.dataTransfer && e.dataTransfer.files); });
+  $('fbSubmit').onclick = async function(){
+    if (typeof hideFbError === 'function') hideFbError();
+    else fbShowErr('');
+    var msg = $('fbMsg').value.trim();
+    if (!msg && !fbKind) { fbShowErr('先写一下遇到了什么，或选一个问题类型。'); $('fbMsg').focus(); return; }
+    var files = fbPicked.map(function(item){ return item.file; });
     var tsToken = '';
-    if (tsWidgetId !== null) {
-      try { tsToken = turnstile.getResponse(tsWidgetId) || ''; } catch(e){}
-      if (!tsToken) { showFbError('请先完成人机验证。'); return; }
-    } else {
-      showFbError('验证组件未加载完成，请稍等几秒再试。');
-      return;
+    if (typeof tsWidgetId !== 'undefined') {
+      if (tsWidgetId !== null) {
+        try { tsToken = turnstile.getResponse(tsWidgetId) || ''; } catch (e) {}
+        if (!tsToken) { fbShowErr('请先完成人机验证。'); return; }
+      } else {
+        fbShowErr('验证组件未加载完成，请稍等几秒再试。');
+        return;
+      }
     }
     var btn = $('fbSubmit');
     btn.disabled = true; btn.textContent = '提交中…';
-    try{
+    try {
       var fd = new FormData();
-      fd.append('message', msg);
+      fd.append('message', fbCompose(msg));
       fd.append('contact', $('fbContact').value.trim());
       fd.append('page', location.href);
       if (tsToken) fd.append('cf-turnstile-response', tsToken);
       files.forEach(function(ff){ fd.append('files', ff, ff.name); });
       const r = await fetch('/api/feedback', { method: 'POST', body: fd });
       const j = await r.json();
-      if(j.ok){
+      if (j.ok) {
         $('fbMsg').value = ''; $('fbContact').value = ''; $('fbFiles').value = '';
+        fbKind = '';
+        var chips = document.querySelectorAll('.fb-chip');
+        for (var i = 0; i < chips.length; i++) chips[i].classList.remove('on');
+        fbClearPicked();
+        fbSyncCount();
         $('fbDone').style.display = 'block';
-        setTimeout(function(){ $('fbWrap').classList.remove('show'); }, 1600);
+        setTimeout(fbClose, 1600);
       } else {
-        showFbError('反馈提交失败：' + (j.error || '请稍后重试'));
+        fbShowErr('反馈提交失败：' + (j.error || '请稍后重试'));
       }
-    }catch(e){ showFbError('网络错误，请稍后重试。'); }
-    if (tsWidgetId !== null) { try { turnstile.reset(tsWidgetId); } catch(e){} }
+    } catch (e) { fbShowErr('网络错误，请稍后重试。'); }
+    if (typeof tsWidgetId !== 'undefined' && tsWidgetId !== null) { try { turnstile.reset(tsWidgetId); } catch (e) {} }
     btn.disabled = false; btn.textContent = '提交反馈';
   };
+
 
   /* 本站解析次数 */
   fetch('/api/stats').then(function(r){ return r.json(); }).then(function(j){
