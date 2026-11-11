@@ -88,6 +88,16 @@ async function verifyTurnstile(token, secret, ip) {
 }
 
 // ---------- 人机验证通行证（一次 siteverify 通过后，30 分钟内的解析 / 高清 / 下载 / 合并都不用再点验证） ----------
+const YT_HOSTS = ['youtube.com', 'youtu.be', 'youtube-nocookie.com'];
+function isYouTubeUrl(u) {
+  try {
+    const x = new URL(u);
+    const h = x.hostname.toLowerCase().replace(/\.$/, '');
+    return (x.protocol === 'https:' || x.protocol === 'http:') && YT_HOSTS.some((d) => h === d || h.endsWith('.' + d));
+  } catch {
+    return false;
+  }
+}
 export const HUMAN_PASS_COOKIE = 'yt_hp';
 export const HUMAN_PASS_TTL_SECS = 30 * 60;
 export const HUMAN_PASS_MAX_AGE_SECS = 2 * 60 * 60; // 续期封顶：距第一次真验证最多 2 小时
@@ -397,7 +407,11 @@ async function handleParse(request, env) {
   const reqUrl = new URL(request.url);
   const shareText = reqUrl.searchParams.get('url') || '';
   if (!shareText.trim()) return json({ ok: false, error: '请先粘贴 YouTube 分享链接' }, 400);
-  const debug = reqUrl.searchParams.get('debug') === '1';
+  // 文案里有链接但不是本站支持的域名：直接拒绝，不调用计费接口（按解析后的 hostname 判断）
+  const firstLink = (String(shareText).match(/https?:\/\/[^\s"'<>]+/) || [])[0] || '';
+  if (firstLink && !isYouTubeUrl(firstLink)) return json({ ok: false, error: '只支持 YouTube 链接（youtube.com / youtu.be）' }, 400);
+  // debug 输出上游数据结构，只给带管理口令的请求
+  const debug = reqUrl.searchParams.get('debug') === '1' && checkAdminKey(reqUrl, env);
 
   // 人机验证在路由里统一做（checkHuman），这里不再重复
 
@@ -405,7 +419,7 @@ async function handleParse(request, env) {
   const PARSE_COOLDOWN_SECS = 60;
   const parseIp = request.headers.get('cf-connecting-ip') || '';
   if (parseIp && env.FEEDBACK_KV) {
-    const lastTs = await env.FEEDBACK_KV.get('pcool_' + parseIp);
+    const lastTs = await env.FEEDBACK_KV.get('pcool_youtube_' + parseIp);
     if (lastTs) {
       const remain = PARSE_COOLDOWN_SECS - Math.floor((Date.now() - Number(lastTs)) / 1000);
       if (remain > 0) return json({ ok: false, error: `解析太频繁，请 ${remain} 秒后再试` }, 429);
@@ -418,7 +432,7 @@ async function handleParse(request, env) {
   const parseUrl = new URL(request.url);
   const deviceId = parseUrl.searchParams.get('deviceId') || '';
   const quotaId = deviceId || parseIp;
-  const quotaKey = 'dlimit_' + quotaId + '_' + bjDate;
+  const quotaKey = 'dlimit_youtube_' + quotaId + '_' + bjDate;
   let usedToday = 0;
   if (parseIp && env.FEEDBACK_KV) {
     try { usedToday = Number((await env.FEEDBACK_KV.get(quotaKey)) || 0); } catch {}
@@ -429,7 +443,7 @@ async function handleParse(request, env) {
   try {
     const result = await parseYoutubeViaRedFox(shareText, apiKey, debug);
     if (parseIp && env.FEEDBACK_KV)
-      await env.FEEDBACK_KV.put('pcool_' + parseIp, String(Date.now()), {
+      await env.FEEDBACK_KV.put('pcool_youtube_' + parseIp, String(Date.now()), {
         expirationTtl: PARSE_COOLDOWN_SECS,
       });
     // 本站解析次数统计（仅成功计数）
@@ -735,7 +749,7 @@ async function handleFeedbackSubmit(request, env) {
   const COOLDOWN_SECS = 600;
   const clientIp = request.headers.get('cf-connecting-ip') || '';
   if (clientIp) {
-    const lastTs = await env.FEEDBACK_KV.get('cool_' + clientIp);
+    const lastTs = await env.FEEDBACK_KV.get('cool_youtube_' + clientIp);
     if (lastTs) {
       const remain = COOLDOWN_SECS - Math.floor((Date.now() - Number(lastTs)) / 1000);
       if (remain > 0)
@@ -749,7 +763,9 @@ async function handleFeedbackSubmit(request, env) {
   const id = 'fb_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
   const attachments = [];
   if (files.length) {
-    if (!env.FEEDBACK_BUCKET) return json({ ok: false, error: '附件功能暂未启用' }, 500);
+    // 没绑 R2（FEEDBACK_BUCKET）：明确告诉用户附件暂不可用，文字反馈不受影响
+    if (!env.FEEDBACK_BUCKET)
+      return json({ ok: false, code: 'ATTACH_DISABLED', error: '本站暂未开启附件上传（存储未绑定），请去掉附件只提交文字，或把截图发到联系方式里' }, 503);
     for (const f of files) {
       const type = f.type || '';
       if (!/^(image|video)\//.test(type))
@@ -784,7 +800,7 @@ async function handleFeedbackSubmit(request, env) {
   };
   await env.FEEDBACK_KV.put(id, JSON.stringify(record));
   if (clientIp)
-    await env.FEEDBACK_KV.put('cool_' + clientIp, String(Date.now()), {
+    await env.FEEDBACK_KV.put('cool_youtube_' + clientIp, String(Date.now()), {
       expirationTtl: COOLDOWN_SECS,
     });
   return json({ ok: true });
@@ -799,13 +815,23 @@ async function handleFeedbackList(request, env) {
   const url = new URL(request.url);
   if (!checkAdminKey(url, env)) return json({ ok: false, error: '无权访问' }, 403);
   if (!env.FEEDBACK_KV) return json({ ok: false, error: '未绑定 KV' }, 500);
-  const listed = await env.FEEDBACK_KV.list({ prefix: 'fb_' });
   const items = [];
-  for (const k of listed.keys) {
-    try {
-      const v = await env.FEEDBACK_KV.get(k.name);
-      if (v) items.push(JSON.parse(v));
-    } catch {}
+  for (const prefix of ['fb_', 'feedback_']) {
+    const listed = await env.FEEDBACK_KV.list({ prefix });
+    for (const k of listed.keys) {
+      try {
+        const v = await env.FEEDBACK_KV.get(k.name);
+        if (!v) continue;
+        const it = JSON.parse(v);
+        // 快手站旧版记录：key 是 feedback_<id>，时间字段叫 ts，没有 page
+        if (prefix === 'feedback_') {
+          if (!it.time && it.ts) it.time = new Date(Number(it.ts)).toISOString();
+          if (!it.page || !/^https?:/.test(String(it.page))) it.page = 'https://kuaishoujiexi.pages.dev/';
+          it.id = String(it.id || k.name.slice('feedback_'.length));
+        }
+        items.push(it);
+      } catch {}
+    }
   }
   items.sort((a, b) => String(b.time || '').localeCompare(String(a.time || '')));
   return json({ ok: true, count: items.length, items });
@@ -818,7 +844,7 @@ async function handleFeedbackDelete(request, env) {
   const id = url.searchParams.get('id') || '';
   if (!/^fb_[a-z0-9_]+$/i.test(id)) return json({ ok: false, error: '参数错误' }, 400);
   try {
-    const v = await env.FEEDBACK_KV.get(id);
+    const v = (await env.FEEDBACK_KV.get(id)) || (await env.FEEDBACK_KV.get('feedback_' + id));
     if (v) {
       const rec = JSON.parse(v);
       if (env.FEEDBACK_BUCKET && Array.isArray(rec.attachments)) {
@@ -831,6 +857,7 @@ async function handleFeedbackDelete(request, env) {
     }
   } catch {}
   await env.FEEDBACK_KV.delete(id);
+  await env.FEEDBACK_KV.delete('feedback_' + id); // 快手旧版记录
   return json({ ok: true });
 }
 
@@ -887,6 +914,8 @@ const siteName = (p) => {
     if (h.includes('douyin')) return '抖音站';
     if (h.includes('youtube')) return 'YouTube站';
     if (h.includes('bilibili')) return 'B站站';
+    if (h.includes('kuaishou')) return '快手站';
+    if (h.includes('weibo')) return '微博站';
     if (h.includes('DeepSeek')) return 'DeepSeek站';
     return h;
   } catch { return ''; }
@@ -982,7 +1011,7 @@ h2{font-size:16px;margin:24px 0 12px;color:#f1f1f3}
 </style></head>
 <body><div class="wrap">
 <h1>📊 数据总览 <span id="time"></span></h1>
-<div class="sub">五站解析次数统计（仅成功计数）</div>
+<div class="sub">各站解析次数统计（仅成功计数）</div>
 <div class="grid" id="grid"><div class="err">加载中…</div></div>
 <div class="total" id="total" style="display:none"><div class="num" id="totalNum">0</div><div class="label">累计解析</div></div>
 
@@ -1010,7 +1039,7 @@ h2{font-size:16px;margin:24px 0 12px;color:#f1f1f3}
 </div><script>
 const key = new URLSearchParams(location.search).get('key') || '';
 document.getElementById('adminLink').href = '/admin?key=' + encodeURIComponent(key);
-const COLORS = ['#FE2C55','#25F4EE','#FFC107','#9C27B0'];
+const COLORS = ['#FE2C55','#25F4EE','#FFC107','#9C27B0','#FF7A1A','#4CAF50'];
 const COUNTRY_ZH = {CN:'中国',US:'美国',JP:'日本',KR:'韩国',HK:'香港',TW:'台湾',MO:'澳门',SG:'新加坡',GB:'英国',DE:'德国',FR:'法国',IT:'意大利',ES:'西班牙',CA:'加拿大',AU:'澳大利亚',NZ:'新西兰',RU:'俄罗斯',IN:'印度',BR:'巴西',MX:'墨西哥',TH:'泰国',MY:'马来西亚',ID:'印度尼西亚',PH:'菲律宾',VN:'越南',TR:'土耳其',AE:'阿联酋',XX:'未知'};
 async function load(){
   const grid = document.getElementById('grid');
@@ -1136,7 +1165,7 @@ load();
 async function handleParseHistory(request, env) {
   const url = new URL(request.url);
   if (!checkAdminKey(url, env)) return json({ ok: false, error: '无权访问' }, 403);
-  const siteNames = { tiktok: 'TikTok站', xhs: '小红书站', douyin: '抖音站', youtube: 'YouTube站', bilibili: 'B站站' };
+  const siteNames = { tiktok: 'TikTok站', xhs: '小红书站', douyin: '抖音站', youtube: 'YouTube站', bilibili: 'B站站', kuaishou: '快手站' };
   const all = [];
   if (env.FEEDBACK_KV) {
     for (const site of Object.keys(siteNames)) {
@@ -1156,12 +1185,12 @@ async function handleGeoStats(request, env) {
   const url = new URL(request.url);
   if (!checkAdminKey(url, env)) return json({ ok: false, error: '无权访问' }, 403);
   const byCountry = {};
-  const bySite = { tiktok: {}, xhs: {}, douyin: {}, youtube: {}, bilibili: {} };
+  const bySite = { tiktok: {}, xhs: {}, douyin: {}, youtube: {}, bilibili: {}, kuaishou: {} };
   if (env.FEEDBACK_KV) {
     try {
       const listed = await env.FEEDBACK_KV.list({ prefix: 'geoparse_' });
       for (const k of listed.keys) {
-        const m = k.name.match(/^geoparse_(tiktok|xhs|douyin|youtube|bilibili)_([A-Z]{2})$/);
+        const m = k.name.match(/^geoparse_(tiktok|xhs|douyin|youtube|bilibili|kuaishou)_([A-Z]{2})$/);
         if (!m) continue;
         const n = Number((await env.FEEDBACK_KV.get(k.name)) || 0);
         if (!n) continue;
@@ -1185,7 +1214,7 @@ async function handleParseQuota(request, env) {
   const bjDate = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
   let used = 0;
   if (quotaId && env.FEEDBACK_KV) {
-    try { used = Number((await env.FEEDBACK_KV.get('dlimit_' + quotaId + '_' + bjDate)) || 0); } catch {}
+    try { used = Number((await env.FEEDBACK_KV.get('dlimit_youtube_' + quotaId + '_' + bjDate)) || 0); } catch {}
   }
   return json({ ok: true, limit: DAILY_LIMIT, used, remaining: Math.max(0, DAILY_LIMIT - used) });
 }
@@ -1200,6 +1229,7 @@ async function handleStatsAll(request, env) {
     { key: 'stats_parse_douyin', name: '抖音站' },
     { key: 'stats_parse_youtube', name: 'YouTube站' },
     { key: 'stats_parse_bilibili', name: 'B站站' },
+    { key: 'stats_parse_kuaishou', name: '快手站' },
   ];
   const result = [];
   for (const s of sites) {
@@ -1559,7 +1589,7 @@ function hdSuccessJson(vid, client, j, pair) {
 // Cookie 只发给 MWEB / TV / WEB。已经拿到 720P 就不会因为后面的 BOT_CHECK 把结果丢掉。
 export const ytHdTiming = {
   botRetryDelaysMs: [400, 1000],
-  probeTimeoutMs: 5000,
+  probeTimeoutMs: 3000,
 };
 
 // ---- 直链尾部探测 ----
@@ -1601,8 +1631,8 @@ async function probeHdHit(hit, auth) {
   const bad = res.find((r) => r.limited);
   return bad ? { ok: false, status: bad.status } : { ok: true };
 }
-// 受限时换不需要 PO token 的客户端（ANDROID_VR、TVHTML5）再签一次，IOS 放最后。
-const YT_DIRECT_FALLBACK_KEYS = ['vr', 'tv', 'ios'];
+// 受限时只再用 IOS 签一次：实测 ANDROID_VR / TVHTML5 在直链受限时同样受限，白白多两次往返，已去掉。
+const YT_DIRECT_FALLBACK_KEYS = ['ios'];
 export const DIRECT_LIMITED_MSG = 'YouTube 只让服务器拿到这条视频的开头一小段（直链受限），手机里合并会在中途 403。请改用「服务器合并」。';
 
 function sleepMs(ms) {
@@ -2334,17 +2364,16 @@ export default {
     // Turnstile 公开 site key 下发
     if (url.pathname === '/api/turnstile-key')
       // required：服务器是否要求人机验证（只是布尔值，不含任何密钥）。前端据此区分「没配置」和「配了但 site key 缺失」
-      return json({ ok: true, siteKey: (env.TURNSTILE_SITE_KEY || '').trim(), required: !!(env.TURNSTILE_SECRET_KEY || '').trim() });
+      return json({ ok: true, siteKey: (env.TURNSTILE_SITE_KEY || '').trim(), required: !!(env.TURNSTILE_SECRET_KEY || '').trim(), attach: !!env.FEEDBACK_BUCKET });
 
     // 本站解析次数
     if (url.pathname === '/api/stats') {
-      let n = 0;
-      if (env.FEEDBACK_KV) {
-        try {
-          n = Number((await env.FEEDBACK_KV.get('stats_parse_youtube')) || 0);
-        } catch {}
-      }
-      return json({ ok: true, parseCount: n });
+      if (!env.FEEDBACK_KV) return json({ ok: true, bound: false, parseCount: null, error: '未绑定 KV' });
+      let n = null;
+      try {
+        n = Number((await env.FEEDBACK_KV.get('stats_parse_youtube')) || 0);
+      } catch {}
+      return json({ ok: true, bound: true, parseCount: n });
     }
 
     if (url.pathname === '/api/feedback') {

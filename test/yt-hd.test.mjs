@@ -1192,16 +1192,16 @@ test('yt-hd probes the tail of video and audio before returning direct links', a
   assert.ok(probes.every((p) => /oculus/.test(p.ua) && !p.cookie));
 });
 
-test('yt-hd: tail 403 on ANDROID_VR switches to TVHTML5 (before IOS), no cookie sent to anonymous clients', async () => {
+test('yt-hd: tail 403 on ANDROID_VR switches straight to IOS (tv/vr fallback removed), no cookie sent to anonymous clients', async () => {
   const probes = [], players = [];
   const r = await withFetch(directMock({ limitedFor: ['ANDROID_VR'], probes, players }), () => worker.fetch(new Request('https://example.com/api/yt-hd?url=WeiM_vffWAw'), {}));
   const b = await r.json();
   assert.equal(r.status, 200);
   assert.equal(b.directOk, true);
-  assert.equal(b.client, 'tv');
-  assert.match(b.video.url, /TVHTML5/);
-  assert.match(b.audio.url, /TVHTML5/);
-  assert.deepEqual(players.map((p) => p.name), ['ANDROID_VR', 'TVHTML5']);
+  assert.equal(b.client, 'ios');
+  assert.match(b.video.url, /IOS/);
+  assert.match(b.audio.url, /IOS/);
+  assert.deepEqual(players.map((p) => p.name), ['ANDROID_VR', 'IOS']);
   assert.ok(players.every((p) => !p.cookie));
 });
 
@@ -1217,7 +1217,7 @@ test('yt-hd: every client tail-403s -> DIRECT_LIMITED with directOk:false, IOS t
   assert.equal(b.error, DIRECT_LIMITED_MSG);
   assert.equal(b.serverMerge, true);
   assert.equal(b.video, undefined);
-  assert.deepEqual(players.map((p) => p.name), ['ANDROID_VR', 'TVHTML5', 'IOS']);
+  assert.deepEqual(players.map((p) => p.name), ['ANDROID_VR', 'IOS']);
   assert.ok(b.tried.includes('vr:direct403'));
   assert.ok(b.tried.includes('ios:direct403'));
   assert.equal(JSON.stringify(b).includes('local-test-token'), false);
@@ -1290,8 +1290,9 @@ test('index.html: isDirectLimited recognises 403 / DIRECT_LIMITED, autoServerMer
   assert.equal(ctx.started.length, 0);
   assert.equal(vm.runInContext("autoServerMerge('WeiM_vffWAw', 1080)", ctx), true);
   assert.deepEqual(ctx.started[0], { url: 'https://youtu.be/WeiM_vffWAw', q: '1080', mode: 'merged', label: '1080P 含声音' });
-  assert.match(ctx.nodes.autoMergeNote.innerHTML, /直链受限，已自动改用服务器合并/);
-  assert.match(ctx.nodes.autoMergeNote.innerHTML, /合并中/);
+  assert.match(ctx.nodes.autoMergeNote.textContent, /直链受限，已自动改用服务器合并/);
+  assert.match(ctx.nodes.autoMergeNote.textContent, /合并中/);
+  assert.equal(ctx.nodes.autoMergeNote.innerHTML, '', '提示走 textContent，不拼 HTML');
   vm.runInContext("autoServerMerge('abc', 360)", ctx);
   assert.equal(ctx.started[1].q, '720');
 });

@@ -239,8 +239,8 @@ test('turnstile: status / ping / stats / key / merge status+file are not gated',
     const env = { ...ENV, TURNSTILE_SITE_KEY: ' 0x4AAAA-public ' };
     assert.equal((await call('/api/ping', env)).resp.status, 200);
     assert.equal((await call('/api/stats', env)).body.ok, true);
-    assert.deepEqual((await call('/api/turnstile-key', env)).body, { ok: true, siteKey: '0x4AAAA-public', required: true });
-    assert.deepEqual((await call('/api/turnstile-key', {})).body, { ok: true, siteKey: '', required: false });
+    assert.deepEqual((await call('/api/turnstile-key', env)).body, { ok: true, siteKey: '0x4AAAA-public', required: true, attach: false });
+    assert.deepEqual((await call('/api/turnstile-key', {})).body, { ok: true, siteKey: '', required: false, attach: false });
     assert.notEqual((await call('/api/server-status', env)).resp.status, 403);
     const st = await call('/api/yt1080-status?id=job-0001', env);
     assert.equal(st.resp.status, 500); // 没配 YT_MERGE_TOKEN，但不是 403
@@ -253,7 +253,8 @@ test('turnstile: status / ping / stats / key / merge status+file are not gated',
 function frontendHuman() {
   const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
   const i = html.indexOf('  var TS_PASS_MS');
-  const j = html.indexOf('  ensureTurnstileScript().then(function(siteKey){\n    try {\n      var box');
+  // 解析区组件改成点「开始解析」才加载：渲染代码包在 initParseTs() 里
+  const j = html.indexOf('  var _tsInitP = null;');
   assert.ok(i > 0 && j > i);
   const k = html.indexOf('  var TS_MSG_LOADING');
   const l = html.indexOf('  function tsSetState');

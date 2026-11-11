@@ -2,8 +2,20 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>YouTube 无水印解析下载</title>
+<meta name="description" content="粘贴 YouTube 分享链接，解析可下载的画质，支持手机里合成带声音的 MP4。">
+<meta name="theme-color" content="#141415">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23141415'/%3E%3Cpath d='M14 24V14h10M40 14h10v10M50 40v10H40M24 50H14V40' fill='none' stroke='%23FF0033' stroke-width='4'/%3E%3Cpath d='M27 22v20l16-10z' fill='%23FF0033'/%3E%3C/svg%3E">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="YouTube 无水印解析下载">
+<meta property="og:title" content="YouTube 无水印解析下载">
+<meta property="og:description" content="粘贴 YouTube 分享链接，解析可下载的画质，支持手机里合成带声音的 MP4。">
+<meta property="og:url" content="https://youtubejiexisite.pages.dev/">
+<meta property="og:locale" content="zh_CN">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="YouTube 无水印解析下载">
+<meta name="twitter:description" content="粘贴 YouTube 分享链接，解析可下载的画质，支持手机里合成带声音的 MP4。">
 <link rel="stylesheet" href="jiexi.css">
 <style>
 .ts-parse.ts-compact{ display:flex; justify-content:center; }
@@ -66,11 +78,11 @@
         <!-- 服务器合并：清晰度 + 提交。地址和口令只在 Pages 环境变量 YT_MERGE_BASE / YT_MERGE_TOKEN，不进前端 -->
         <div id="mergeRow" class="jx-merge">
           <select id="mergeQuality" aria-label="合并清晰度">
-            <option value="1080|merged" selected>1080P 带声音</option>
-            <option value="720|merged">720P 带声音</option>
+            <option value="1080|merged" selected>1080P（含声音）</option>
+            <option value="720|merged">720P（含声音）</option>
             <option value="1080|silent">1080P 无声</option>
             <option value="720|silent">720P 无声</option>
-            <option value="360|merged">360P 带声音</option>
+            <option value="360|merged">360P（含声音）</option>
           </select>
           <button type="button" class="btn ghost" id="merge1080Btn">服务器合并</button>
         </div>
@@ -239,11 +251,13 @@ var deviceId = (function(){
   function fileName(base, ext){
     return 'youtube_' + String(base).replace(/[^\w\-]+/g, '_').slice(0, 40) + '.' + ext;
   }
-  function showError(html){
+  // 纯文本（textContent），换行用 \n；接口/上游返回的文字绝不当 HTML 渲染
+  function showError(text){
     errBox.style.display = 'block';
-    errBox.innerHTML = html;
+    errBox.style.whiteSpace = 'pre-line';
+    errBox.textContent = String(text == null ? '' : text);
   }
-  function hideError(){ errBox.style.display = 'none'; errBox.innerHTML = ''; }
+  function hideError(){ errBox.style.display = 'none'; errBox.textContent = ''; }
   function setParseBtn(t, disabled){
     parseBtn.textContent = t;
     parseBtn.disabled = !!disabled;
@@ -289,9 +303,10 @@ var deviceId = (function(){
       resList.insertBefore(box, resList.firstChild);
     }
     var head = DIRECT_LIMITED_NOTE + '（' + q + 'P 含声音，大约几分钟，页面不要关）。';
-    box.innerHTML = head;
+    box.style.whiteSpace = 'pre-line';
+    box.textContent = head;
     hideError();
-    startServerMerge('https://youtu.be/' + vid, String(q), 'merged', q + 'P 含声音', function(html){ box.innerHTML = head + '<br>' + html; });
+    startServerMerge('https://youtu.be/' + vid, String(q), 'merged', q + 'P 含声音', function(text){ box.textContent = head + '\n' + text; });
     return true;
   }
   function streamSpec(stream, vid, client){
@@ -434,7 +449,7 @@ var deviceId = (function(){
       if (humanDone('', e)) { showError('下载失败：' + humanMsg(e)); return; }
       // 纯音频没有画面高度，不替它去合并视频。
       if (isDirectLimited(e) && spec && spec.v && spec.height > 0 && autoServerMerge(spec.v, spec.height)) return;
-      showError('下载失败：' + formatDlError(e) + '<br><br>直链有时效，超时请重新解析。');
+      showError('下载失败：' + formatDlError(e) + '\n\n直链有时效，超时请重新解析。');
     });
   }
 
@@ -509,7 +524,7 @@ var deviceId = (function(){
       hideDlProg();
       if (humanDone('', e)) { showError('合并下载失败：' + humanMsg(e)); return; }
       if (isDirectLimited(e) && autoServerMerge(vid, v.height || resHeight(v))) return;
-      showError('合并下载失败：' + formatDlError(e) + '<br><br>手机里合并不了时，用「服务器合并」。');
+      showError('合并下载失败：' + formatDlError(e) + '\n\n手机里合并不了时，用「服务器合并」。');
     }).then(function(){ _merging = false; btn.disabled = false; btn.textContent = old; });
   }
 
@@ -539,8 +554,9 @@ var deviceId = (function(){
       if (hb.disabled) return;
       hb.disabled = true;
       startServerMerge('https://youtu.be/' + (d.videoId || ''), String(q), 'merged', q + 'P 含声音', function(html){
-        ht.innerHTML = html;
-        if (/失败|连不上|超时|不可用|存不了/.test(String(html).replace(/<[^>]+>/g, ''))) hb.disabled = false;
+        ht.style.whiteSpace = 'pre-line';
+        ht.textContent = String(html);
+        if (/失败|连不上|超时|不可用|存不了/.test(String(html))) hb.disabled = false;
       });
     };
     slot.appendChild(hb);
@@ -668,7 +684,9 @@ var deviceId = (function(){
             if (mbOld) { mbOld.style.display = 'none'; if (mbOld.nextSibling) mbOld.nextSibling.style.display = 'none'; }
             return;
           }
-          hdSlot.innerHTML = '<div class="hint">' + hdFailText(e) + '</div>';
+          hdSlot.innerHTML = '';
+          var hfDiv = document.createElement('div'); hfDiv.className = 'hint'; hfDiv.textContent = hdFailText(e);
+          hdSlot.appendChild(hfDiv);
         });
       }
       if (best && bestA && window.YTMerge) {
@@ -800,7 +818,10 @@ var deviceId = (function(){
     }
     return String((body && (body.error || body.message)) || '人机验证未通过，请重试');
   }
-  ensureTurnstileScript().then(function(siteKey){
+  var _tsInitP = null;
+  function initParseTs(){
+  if (_tsInitP) return _tsInitP;
+  _tsInitP = ensureTurnstileScript().then(function(siteKey){
     try {
       var box = $('tsParseWidget');
       // 320 宽的手机放不下 300px 标准组件，改用紧凑版（并居中）
@@ -832,18 +853,39 @@ var deviceId = (function(){
     if (e && e.noKey && !tsRequired) { tsSetState('off'); return; }
     tsSetState('failed');
   });
+  return _tsInitP;
+  }
+  // 点「开始解析」时调用：按需加载组件，等到有 token（或服务器不要求 / 本地通行证有效）再继续
+  function humanReady(){
+    if (tsState === 'off' || (tsParseWidgetId === null && Date.now() < tsPassUntil)) return Promise.resolve();
+    return initParseTs().then(function(){
+      return new Promise(function(resolve, reject){
+        var t0 = Date.now();
+        (function poll(){
+          if (tsState === 'off' || tsParseWidgetId === null) {
+            if (tsRequired && (tsState === 'failed' || tsState === 'rejected')) return reject(new Error(tsNeedMsg()));
+            return resolve();
+          }
+          if (tsState === 'rejected') return reject(new Error(tsNeedMsg()));
+          if (humanQuery() !== null) return resolve();
+          if (Date.now() - t0 > 120000) return reject(new Error('请先完成人机验证'));
+          setTimeout(poll, 300);
+        })();
+      });
+    });
+  }
 
     /* 反馈表单 */
   var tsWidgetId = null;
-  function showFbError(html){
+  function showFbError(text){
     var e = $('fbErr');
     e.style.display = 'block';
-    e.innerHTML = html;
+    e.textContent = String(text == null ? '' : text);
   }
   function hideFbError(){
     var e = $('fbErr');
     e.style.display = 'none';
-    e.innerHTML = '';
+    e.textContent = '';
   }
   function loadTurnstile(){
     if (tsWidgetId !== null) return;
@@ -947,6 +989,15 @@ var deviceId = (function(){
     $('fbWrap').classList.add('show');
     document.body.style.overflow = 'hidden';
     if (typeof loadTurnstile === 'function') loadTurnstile();
+    fetch('/api/turnstile-key').then(function(r){ return r.json(); }).then(function(j){
+      if (j && j.attach === false) {
+        var fz = document.querySelector('.fb-files');
+        if (fz) { fz.hidden = true; fz.style.display = 'none'; }
+        var fn = $('fbAttachOff');
+        if (!fn) { fn = document.createElement('p'); fn.id = 'fbAttachOff'; fn.className = 'fb-note'; fn.textContent = '本站暂未开启截图/录屏上传，写清楚遇到的问题即可。'; if (fz && fz.parentNode) fz.parentNode.insertBefore(fn, fz.nextSibling); }
+        fbPicked = []; if (typeof fbRenderPicked === 'function') fbRenderPicked();
+      }
+    }).catch(function(){});
     setTimeout(function(){ $('fbMsg').focus(); }, 40);
   }
   $('fbBtn').onclick = fbOpen;
@@ -1020,8 +1071,8 @@ var deviceId = (function(){
 
   /* 本站解析次数 */
   fetch('/api/stats').then(function(r){ return r.json(); }).then(function(j){
-    if (j.ok && typeof j.parseCount === 'number') $('parseCount').textContent = j.parseCount;
-  }).catch(function(){});
+    $('parseCount').textContent = (j && j.ok && typeof j.parseCount === 'number') ? j.parseCount : '-';
+  }).catch(function(){ $('parseCount').textContent = '-'; });
 
   parseBtn.onclick = function(){
     var text = urlInput.value.trim();
@@ -1066,14 +1117,24 @@ var deviceId = (function(){
         showError('解析失败：' + msg);
       });
   };
+  (function(){
+    var parseCore = parseBtn.onclick;
+    parseBtn.onclick = function(){
+      if (!urlInput.value.trim() || parseBtn.disabled) return parseCore();
+      hideError();
+      setParseBtn('人机验证中…', true);
+      humanReady().then(function(){ resetParseBtn(); parseCore(); }, function(e){ resetParseBtn(); showError(String((e && e.message) || tsNeedMsg())); });
+    };
+  })();
 
   // 1080P 带声音：经 Pages Worker 中转到 EC2，EC2 用 yt-dlp 取流 + ffmpeg 合并。
   // EC2 任务是异步的：提交后每 10 秒轮询一次状态，done 后再下载成品。
   // 下载复用同一套进度条 + iPhone 分享兜底（自动试一次，失败亮「点这里保存」）。
   var mergeBtn = $('merge1080Btn'), mergeStatus = $('merge1080Status'), mergeTimer = null;
-  function setMergeStatus(html){
+  function setMergeStatus(text){
     mergeStatus.style.display = 'block';
-    mergeStatus.innerHTML = html;
+    mergeStatus.style.whiteSpace = 'pre-line';
+    mergeStatus.textContent = String(text == null ? '' : text);
   }
   function setMergeBtn(t, disabled){
     mergeBtn.textContent = t;
@@ -1094,6 +1155,7 @@ var deviceId = (function(){
     h = h.slice(0, 20);
     try { localStorage.setItem('yt_merge_history', JSON.stringify(h)); } catch(e){}
   }
+  function escHist(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){ return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
   function renderHistory(){
     var panel = $('mergeHistoryPanel'), h = loadHistory();
     if(!h.length){
@@ -1102,7 +1164,7 @@ var deviceId = (function(){
       var html = '<div class="hint">成品在服务器上保留 1 小时，过期后点下载会提示任务不存在，需重新提交。点删除可去掉这条记录。</div>';
       h.forEach(function(item, idx){
         html += '<div class="jx-hist-row">'
-          + '<span class="jx-hist-main">' + (item.label || '') + ' · ' + (item.filename || '') + ' · ' + fmtMB(item.size || 0) + '<br><span class="jx-hist-time">' + (item.time || '') + '</span></span>'
+          + '<span class="jx-hist-main">' + escHist(item.label) + ' · ' + escHist(item.filename) + ' · ' + fmtMB(item.size || 0) + '<br><span class="jx-hist-time">' + escHist(item.time) + '</span></span>'
           + '<button class="btn ghost" data-hist-dl="' + idx + '">下载</button>'
           + '<button class="btn ghost" data-hist-del="' + idx + '">删除</button></div>';
       });
@@ -1175,7 +1237,7 @@ var deviceId = (function(){
           var down = j.code === 'MERGE_ORIGIN_DOWN' || /连不上|内部出错/.test(j.error || '') || res.status >= 500;
           var tail = res.status === 429
             ? '（服务器一次只能合一个）'
-            : (down ? '<br>合并服务器连不上，请稍后再试。' : '');
+            : (down ? '\n合并服务器连不上，请稍后再试。' : '');
           status('提交失败：' + (j.error || '服务器异常') + tail);
           return;
         }
@@ -1202,7 +1264,7 @@ var deviceId = (function(){
                 clearInterval(mergeTimer); mergeTimer = null;
                 resetMergeBtn();
                 var down = s.code === 'MERGE_ORIGIN_DOWN' || /连不上|内部出错/.test(s.error || '');
-                status('查询失败：' + (s.error || '服务器异常') + (down ? '<br>合并服务器连不上，请稍后再试。' : '，请重新提交。'));
+                status('查询失败：' + (s.error || '服务器异常') + (down ? '\n合并服务器连不上，请稍后再试。' : '，请重新提交。'));
                 return;
               }
               if(s.status === 'done'){
@@ -1227,7 +1289,7 @@ var deviceId = (function(){
       .catch(function(e){
         resetMergeBtn();
         if (hq) { resetParseTs(); hq = ''; }
-        status('提交失败：' + (e.message || '网络错误') + '<br>合并服务器可能连不上，请稍后再试。');
+        status('提交失败：' + (e.message || '网络错误') + '\n合并服务器可能连不上，请稍后再试。');
       });
   }
   mergeBtn.onclick = function(){
