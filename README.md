@@ -55,6 +55,8 @@ YouTube 的 `playabilityStatus.status` 经常是 `LOGIN_REQUIRED`，但含义要
 
 源站 DNS 失败时，Cloudflare 会返回 HTTP 530 / error code 1016。Worker 改成中文 JSON（`code: "MERGE_ORIGIN_DOWN"`），说明去检查 `YT_MERGE_BASE`、`YT_MERGE_TOKEN` 和 EC2 进程。Worker 不能直接请求裸 IP（会被 Cloudflare 1003 拦截），地址要用主机名。
 
+页面解析/合并区域会显示「当前处理中 X/3 · 排队 Y」。数据来自同域 `GET /api/queue`，由 Worker 转发 EC2 公开的 `GET /queue`（不带口令，只回传 `running` / `queued` / `max_concurrent` / `max_queue`）。前端不直连 EC2：默认源站是 `http://…:30002`，HTTPS 页面会因混合内容被拦。排队已满时，`/api/yt1080-start` 会回 HTTP 503，`code: "QUEUE_FULL"`，页面提示稍后再试。
+
 手机里的本地合并（解析结果上的「一键下载」，`YTMerge` + `/api/yt-hd` + `/api/ytdl`）不依赖 EC2。
 
 本地检查：

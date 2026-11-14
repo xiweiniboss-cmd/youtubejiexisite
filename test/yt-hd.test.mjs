@@ -272,6 +272,28 @@ test('merge proxy rewrites a Cloudflare 1016 body and passes JSON through', asyn
   }
 });
 
+test('yt1080-start 503 queue full becomes QUEUE_FULL in Chinese, token not leaked', async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    ok: false,
+    error: 'queue full: 3 running, 10 waiting (max 3 running, 10 queued); try later',
+    running: 3, queued: 10, max_concurrent: 3, max_queue: 10,
+  }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+  try {
+    const r = await worker.fetch(
+      new Request('https://example.com/api/yt1080-start?url=https://youtu.be/dQw4w9WgXcQ', { method: 'POST' }),
+      { YT_MERGE_TOKEN: 'local-test-token' },
+    );
+    const body = await r.json();
+    assert.equal(r.status, 503);
+    assert.equal(body.code, 'QUEUE_FULL');
+    assert.match(body.error, /当前排队已满/);
+    assert.equal(JSON.stringify(body).includes('local-test-token'), false);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
 function playerAt(height, { progressive = false } = {}) {
   if (progressive) {
     return {

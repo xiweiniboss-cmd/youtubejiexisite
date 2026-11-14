@@ -1408,6 +1408,14 @@ footer a:hover { color: var(--jx-secondary); }
 
 .srv-jobs { color: var(--jx-secondary); }
 
+.queue-badge {
+  margin: var(--jx-space-3) 0 0;
+  font-size: var(--jx-text-sm);
+  line-height: var(--jx-leading-sm);
+  color: var(--jx-secondary);
+}
+.queue-badge.is-unknown { color: var(--jx-muted); }
+
 .jx-merge {
   display: flex;
   flex-wrap: wrap;

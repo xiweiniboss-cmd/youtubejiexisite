@@ -242,6 +242,7 @@ test('turnstile: status / ping / stats / key / merge status+file are not gated',
     assert.deepEqual((await call('/api/turnstile-key', env)).body, { ok: true, siteKey: '0x4AAAA-public', required: true, attach: false });
     assert.deepEqual((await call('/api/turnstile-key', {})).body, { ok: true, siteKey: '', required: false, attach: false });
     assert.notEqual((await call('/api/server-status', env)).resp.status, 403);
+    assert.notEqual((await call('/api/queue', env)).resp.status, 403);
     const st = await call('/api/yt1080-status?id=job-0001', env);
     assert.equal(st.resp.status, 500); // 没配 YT_MERGE_TOKEN，但不是 403
     assert.equal((await call('/api/yt1080-file?id=job-0001', env)).resp.status, 500);

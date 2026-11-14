@@ -13,7 +13,7 @@
 //   这样「合并历史（保留 1 小时）」里的成品在通行证过期后也能下载；任务 id 必须是 6–64 位 [A-Za-z0-9_-]，否则 400 不转发。
 //   通行证有效时不调 siteverify；只有距 2 小时封顶不足 15 分钟且请求带了新 token 时才真验一次并换全新通行证。
 //   siteverify 连不上 / 超时 / 非 2xx → 503 HUMAN_UNAVAILABLE；token 无效 → 403 HUMAN_FAILED；没 token 没通行证 → 403 HUMAN_REQUIRED。
-//   /api/ping /api/server-status /api/stats 等不拦。
+//   /api/ping /api/server-status /api/queue /api/stats 等不拦。
 // 高清直连 /api/yt-hd（都不写进仓库，只在 Pages → Settings → Environment variables 配加密变量）：
 //   YT_COOKIES   已登录 youtube.com 的 Cookie（请求头 "a=b; c=d"，或 Netscape cookies.txt，或 [{name,value}] JSON）。别名 YT_COOKIE
 //   YT_PO_TOKEN  可选。InnerTube player 的 PO Token，放进 serviceIntegrityDimensions.poToken。别名 YT_POT
@@ -29,8 +29,15 @@
 //   GET {YT_MERGE_BASE}/status   请求头 X-Merge-Token: <YT_MERGE_TOKEN>（与 /yt1080-jobs 相同鉴权），超时 5 秒
 //   期望返回 200 JSON：
 //   {"ok":true,"mem":{"total":字节,"used":字节},"cpu":{"load1":f,"load5":f,"load15":f,"cores":n},
-//    "disk":{"total":字节,"used":字节},"uptimeSec":n,"jobs":{"running":n,"queued":n}}
+//    "disk":{"total":字节,"used":字节},"uptimeSec":n,"jobs":{"running":n,"queued":n},
+//    "running":n,"queued":n,"max_concurrent":n,"max_queue":n}
 //   Worker 只取这些字段并转成数字，自己算百分比（CPU = load1/cores*100，封顶 100），口令不会回传。
+//   任务数优先读 jobs.*，没有则读顶层 running/queued（新版 /status 就是顶层字段）。
+// 队列徽章 /api/queue（前端「当前处理中 X/3 · 排队 Y」）：Worker 请求 EC2 的
+//   GET {YT_MERGE_BASE}/queue   不带口令（该接口本身公开），超时 5 秒
+//   期望返回 200 JSON：{"running":n,"queued":n,"max_concurrent":n,"max_queue":n}
+//   Worker 只回传这四个数字和 ok，绝不附加口令。结果同样边缘缓存约 4 秒并单飞。
+//   前端不直连 EC2：默认源站是 http://…:30002，HTTPS 页面会因混合内容被拦。
 //   旧版 EC2 没有 /status 返回 404 时视为「在线但未提供详细状态」（statusSupported:false）；
 //   401/403 视为在线但口令不匹配（authFailed:true）；500/501/503/505–519/531–599 视为在线但异常（degraded:true）；
 //   超时 / 连不上 / 502 / 504 / 520–530 / 带 server: cloudflare 的 5xx / 1016 视为离线（服务器不可达）。
@@ -1948,6 +1955,32 @@ function mergeConnectError(e) {
     error: '合并服务暂时连不上（' + detail + '）。请检查 Pages 环境变量 YT_MERGE_BASE、YT_MERGE_TOKEN，以及 EC2 上的合并服务是否在运行。',
   }, 502);
 }
+// EC2 排队已满时回 503，正文是英文 queue full 加上 running/queued/max_*。
+// 转成中文 JSON（code: QUEUE_FULL），让前端不要误当成「服务器连不上」。
+export function rewriteQueueFull(status, parsed) {
+  if (status !== 503 || !parsed || typeof parsed !== 'object') return null;
+  const looksFull = parsed.code === 'QUEUE_FULL' || /queue\s*full/i.test(String(parsed.error || ''));
+  const running = statusNum(parsed.running);
+  const queued = statusNum(parsed.queued);
+  const maxC = statusNum(parsed.max_concurrent);
+  const maxQ = statusNum(parsed.max_queue);
+  if (!looksFull && running === null && queued === null) return null;
+  const parts = [];
+  if (running !== null && maxC !== null) parts.push('处理中 ' + Math.floor(running) + '/' + Math.floor(maxC));
+  else if (running !== null) parts.push('处理中 ' + Math.floor(running));
+  if (queued !== null && maxQ !== null) parts.push('排队 ' + Math.floor(queued) + '/' + Math.floor(maxQ));
+  else if (queued !== null) parts.push('排队 ' + Math.floor(queued));
+  const body = {
+    ok: false,
+    code: 'QUEUE_FULL',
+    error: '当前排队已满' + (parts.length ? '（' + parts.join('，') + '）' : '') + '，请稍后再试。',
+  };
+  if (running !== null) body.running = Math.floor(running);
+  if (queued !== null) body.queued = Math.floor(queued);
+  if (maxC !== null) body.max_concurrent = Math.floor(maxC);
+  if (maxQ !== null) body.max_queue = Math.floor(maxQ);
+  return json(body, 503);
+}
 async function mergePassthrough(resp) {
   const text = await resp.text();
   if (mergeOriginDown(resp.status, text)) {
@@ -1955,8 +1988,9 @@ async function mergePassthrough(resp) {
   }
   // EC2 正常时返回 JSON；若上游返回非 JSON（如 Cloudflare 1003），
   // 不能原样透传（前端 r.json() 会抛晦涩的英文错），要转成中文 JSON 错误。
+  let parsed;
   try {
-    JSON.parse(text);
+    parsed = JSON.parse(text);
   } catch {
     if (resp.status >= 500) {
       return json({
@@ -1967,6 +2001,8 @@ async function mergePassthrough(resp) {
     }
     return json({ ok: false, error: '合并服务返回异常（HTTP ' + resp.status + '）：' + text.slice(0, 200) }, resp.status >= 400 ? resp.status : 502);
   }
+  const queueFull = rewriteQueueFull(resp.status, parsed);
+  if (queueFull) return queueFull;
   return new Response(text, {
     status: resp.status,
     headers: {
@@ -2111,7 +2147,9 @@ export function sanitizeServerStatus(raw) {
   const coresRaw = statusNum(c.cores);
   const cores = coresRaw !== null && coresRaw >= 1 ? Math.floor(coresRaw) : null;
   const cpuPct = load1 !== null && cores ? statusPct(load1, cores, null) : statusPct(null, null, statusNum(c.percent));
-  const running = statusNum(j.running), queued = statusNum(j.queued);
+  let running = statusNum(j.running), queued = statusNum(j.queued);
+  if (running === null) running = statusNum(r.running);
+  if (queued === null) queued = statusNum(r.queued);
   const uptime = statusNum(r.uptimeSec);
   return {
     mem: { total: memTotal, used: memUsed, percent: statusPct(memUsed, memTotal, statusNum(m.percent)) },
@@ -2272,6 +2310,103 @@ async function handleServerStatus(request, env, ctx) {
   });
 }
 
+/* ================= 队列徽章 /api/queue ================= */
+// 公开转发 EC2 GET /queue，不带口令。字段清洗后只回传四个数字。
+export const QUEUE_TIMEOUT_MS = 5000;
+export const QUEUE_MAX_BODY = 16 * 1024;
+const QUEUE_TTL = 4;
+const queueMemo = { key: '', done: false, at: 0, promise: null };
+
+export function sanitizeQueue(raw) {
+  const r = statusObj(raw);
+  const running = statusNum(r.running);
+  const queued = statusNum(r.queued);
+  const maxC = statusNum(r.max_concurrent);
+  const maxQ = statusNum(r.max_queue);
+  if (running === null || queued === null || maxC === null || maxQ === null) return null;
+  return {
+    ok: true,
+    running: Math.floor(running),
+    queued: Math.floor(queued),
+    max_concurrent: Math.floor(maxC),
+    max_queue: Math.floor(maxQ),
+  };
+}
+
+export function _resetQueueCache() {
+  queueMemo.key = '';
+  queueMemo.done = false;
+  queueMemo.at = 0;
+  queueMemo.promise = null;
+}
+
+export async function fetchQueue(env, opts) {
+  const timeoutMs = (opts && opts.timeoutMs) || QUEUE_TIMEOUT_MS;
+  const ctrl = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, timeoutMs);
+  const fail = (error) => ({ ok: false, error });
+  try {
+    let resp;
+    try {
+      resp = await fetch(mergeBase(env) + '/queue', {
+        method: 'GET',
+        headers: { 'Accept': 'application/json', 'User-Agent': 'yt-site-queue/1' },
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      if (timedOut || (e && e.name === 'AbortError')) return fail('连接超时');
+      return fail('无法连接服务器');
+    }
+    let body;
+    try {
+      body = await readBodyCapped(resp, QUEUE_MAX_BODY);
+    } catch {
+      if (timedOut) return fail('连接超时');
+      body = { text: '', over: false };
+    }
+    const st = resp.status;
+    if (statusOriginUnreachable(st, resp.headers, body.text)) return fail('服务器不可达');
+    if (st !== 200) return fail('服务器异常（HTTP ' + st + '）');
+    if (body.over) return fail('服务器返回内容过大');
+    let raw;
+    try { raw = JSON.parse(body.text); } catch { return fail('服务器返回格式异常'); }
+    const clean = sanitizeQueue(raw);
+    if (!clean) return fail('服务器返回格式异常');
+    return clean;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function handleQueue(request, env, ctx) {
+  const memoKey = mergeBase(env);
+  const fresh = queueMemo.key === memoKey && queueMemo.promise && (!queueMemo.done || Date.now() - queueMemo.at < QUEUE_TTL * 1000);
+  if (!fresh) {
+    queueMemo.key = memoKey;
+    queueMemo.done = false;
+    queueMemo.at = 0;
+    const p = fetchQueue(env).then(
+      (body) => { if (queueMemo.promise === p) { queueMemo.done = true; queueMemo.at = Date.now(); } return body; },
+      (err) => { if (queueMemo.promise === p) _resetQueueCache(); throw err; },
+    );
+    queueMemo.promise = p;
+  }
+  let body;
+  try {
+    body = await queueMemo.promise;
+  } catch {
+    body = { ok: false, error: '无法连接服务器' };
+  }
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'public, max-age=' + QUEUE_TTL,
+    },
+  });
+}
+
 function handlePing() {
   return new Response(JSON.stringify({ ok: true, t: Date.now() }), {
     status: 200,
@@ -2341,6 +2476,7 @@ export default {
 
     if (url.pathname === '/api/ping') return handlePing();
     if (url.pathname === '/api/server-status') return handleServerStatus(request, env, ctx);
+    if (url.pathname === '/api/queue') return handleQueue(request, env, ctx);
 
     // 人机验证门禁（只拦解析类接口；状态 / 统计 / 静态文件不拦）
     if (HUMAN_PATHS.has(url.pathname)) {
