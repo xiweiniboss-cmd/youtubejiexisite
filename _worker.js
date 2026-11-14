@@ -1955,16 +1955,17 @@ function mergeConnectError(e) {
     error: '合并服务暂时连不上（' + detail + '）。请检查 Pages 环境变量 YT_MERGE_BASE、YT_MERGE_TOKEN，以及 EC2 上的合并服务是否在运行。',
   }, 502);
 }
-// EC2 排队已满时回 503，正文是英文 queue full 加上 running/queued/max_*。
-// 转成中文 JSON（code: QUEUE_FULL），让前端不要误当成「服务器连不上」。
+// EC2 排队已满时回 503，正文是 queue_full_payload()：error 以 "queue full:" 开头，
+// 并带 running/queued/max_*。只在确认是排队已满时才改成中文 JSON（code: QUEUE_FULL），
+// 其它 503 原样透传，让前端走「合并服务器连不上」那条提示。
 export function rewriteQueueFull(status, parsed) {
   if (status !== 503 || !parsed || typeof parsed !== 'object') return null;
   const looksFull = parsed.code === 'QUEUE_FULL' || /queue\s*full/i.test(String(parsed.error || ''));
+  if (!looksFull) return null;
   const running = statusNum(parsed.running);
   const queued = statusNum(parsed.queued);
   const maxC = statusNum(parsed.max_concurrent);
   const maxQ = statusNum(parsed.max_queue);
-  if (!looksFull && running === null && queued === null) return null;
   const parts = [];
   if (running !== null && maxC !== null) parts.push('处理中 ' + Math.floor(running) + '/' + Math.floor(maxC));
   else if (running !== null) parts.push('处理中 ' + Math.floor(running));

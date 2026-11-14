@@ -377,6 +377,20 @@ test('rewriteQueueFull: 503 queue full becomes Chinese QUEUE_FULL', () => {
 test('rewriteQueueFull: ignores unrelated 503 / other statuses', () => {
   assert.equal(rewriteQueueFull(500, { error: 'queue full' }), null);
   assert.equal(rewriteQueueFull(503, { error: 'upstream busy' }), null);
+  // 即便带了 running/queued，没有 queue full / QUEUE_FULL 也不该改写
+  assert.equal(rewriteQueueFull(503, { ok: false, error: 'internal error', running: 1, queued: 0, max_concurrent: 3, max_queue: 10 }), null);
+});
+
+test('rewriteQueueFull: already-normalized QUEUE_FULL code is kept', () => {
+  const resp = rewriteQueueFull(503, { ok: false, code: 'QUEUE_FULL', error: '当前排队已满，请稍后再试。', running: 2, queued: 1, max_concurrent: 3, max_queue: 10 });
+  assert.ok(resp);
+  return resp.json().then((body) => {
+    assert.equal(resp.status, 503);
+    assert.equal(body.code, 'QUEUE_FULL');
+    assert.match(body.error, /当前排队已满/);
+    assert.equal(body.running, 2);
+    assert.equal(body.queued, 1);
+  });
 });
 
 test('api/queue: forwards EC2 /queue without a token and caches', async () => {
@@ -409,12 +423,16 @@ test('api/queue: does not need YT_MERGE_TOKEN; EC2 errors become ok:false', asyn
   });
 });
 
-test('index.html shows the queue badge and treats 503 as 排队已满', () => {
+test('index.html shows the queue badge and treats only QUEUE_FULL as 排队已满', () => {
   const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
   assert.match(html, /id="queueBadge"/);
   assert.match(html, /当前处理中 /);
+  assert.match(html, />正在获取…</);
   assert.match(html, /服务器状态未知/);
   assert.match(html, /\/api\/queue/);
-  assert.match(html, /QUEUE_FULL/);
+  assert.match(html, /j\.code === 'QUEUE_FULL'/);
+  assert.doesNotMatch(html, /j\.code === 'QUEUE_FULL' \|\| res\.status === 503/);
   assert.match(html, /当前排队已满，请稍后再试/);
+  assert.match(html, /请求太频繁，请稍后再试/);
+  assert.doesNotMatch(html, /一次只能合一个/);
 });

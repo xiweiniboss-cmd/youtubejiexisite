@@ -294,6 +294,28 @@ test('yt1080-start 503 queue full becomes QUEUE_FULL in Chinese, token not leake
   }
 });
 
+test('yt1080-start unrelated 503 is not rewritten as QUEUE_FULL', async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    ok: false,
+    error: 'internal error',
+    running: 1, queued: 0, max_concurrent: 3, max_queue: 10,
+  }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+  try {
+    const r = await worker.fetch(
+      new Request('https://example.com/api/yt1080-start?url=https://youtu.be/dQw4w9WgXcQ', { method: 'POST' }),
+      { YT_MERGE_TOKEN: 'local-test-token' },
+    );
+    const body = await r.json();
+    assert.equal(r.status, 503);
+    assert.notEqual(body.code, 'QUEUE_FULL');
+    assert.equal(body.error, 'internal error');
+    assert.equal(JSON.stringify(body).includes('local-test-token'), false);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
 function playerAt(height, { progressive = false } = {}) {
   if (progressive) {
     return {
