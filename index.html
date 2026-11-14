@@ -80,6 +80,8 @@
         <div id="tsParseWidget" class="ts-parse"></div>
         <div id="tsParseState" class="hint ts-state" style="display:none" aria-live="polite"></div>
         <!-- 服务器合并：清晰度 + 提交。地址和口令只在 Pages 环境变量 YT_MERGE_BASE / YT_MERGE_TOKEN，不进前端 -->
+        <!-- 任务数来自同域 /api/queue（Worker 转发 EC2 公开的 GET /queue，口令不进前端） -->
+        <p class="queue-badge" id="queueBadge" aria-live="polite">正在获取…</p>
         <div id="mergeRow" class="jx-merge">
           <select id="mergeQuality" aria-label="合并清晰度">
             <option value="1080|merged" selected>1080P（含声音）</option>
@@ -1238,9 +1240,13 @@ var deviceId = (function(){
         hq = '';
         if(!j.ok){
           resetMergeBtn();
+          if (j.code === 'QUEUE_FULL') {
+            status('提交失败：' + (j.error || '当前排队已满，请稍后再试。'));
+            return;
+          }
           var down = j.code === 'MERGE_ORIGIN_DOWN' || /连不上|内部出错/.test(j.error || '') || res.status >= 500;
           var tail = res.status === 429
-            ? '（服务器一次只能合一个）'
+            ? '（请求太频繁，请稍后再试）'
             : (down ? '\n合并服务器连不上，请稍后再试。' : '');
           status('提交失败：' + (j.error || '服务器异常') + tail);
           return;
@@ -1470,6 +1476,34 @@ refreshQuota();
     }
     var p2 = getJson('/api/server-status').then(render, function(){ setState('', '-'); ms('srvLat', null); clearStats(); note(''); });
     Promise.all([p1, p2]).then(function(){ busy = false; fit(); }, function(){ busy = false; fit(); });
+  }
+  function start(){ if (!timer) timer = setInterval(refresh, 5000); }
+  function stop(){ if (timer) { clearInterval(timer); timer = null; } }
+  document.addEventListener('visibilitychange', function(){
+    if (document.hidden) stop(); else { refresh(); start(); }
+  });
+  refresh(); start();
+})();
+
+// 合并队列徽章：初始「正在获取…」，每 5 秒拉一次 /api/queue，页签隐藏时暂停。失败显示「服务器状态未知」。
+(function(){
+  var el = document.getElementById('queueBadge');
+  if (!el) return;
+  var timer = null, busy = false;
+  function unknown(){
+    el.textContent = '服务器状态未知';
+    el.classList.add('is-unknown');
+  }
+  function render(j){
+    if (!j || !j.ok || typeof j.running !== 'number' || typeof j.queued !== 'number') { unknown(); return; }
+    var maxc = typeof j.max_concurrent === 'number' && j.max_concurrent > 0 ? j.max_concurrent : 3;
+    el.textContent = '当前处理中 ' + j.running + '/' + maxc + ' · 排队 ' + j.queued;
+    el.classList.remove('is-unknown');
+  }
+  function refresh(){
+    if (busy || document.hidden) return;
+    busy = true;
+    fetch('/api/queue', { cache: 'no-store' }).then(function(r){ return r.json(); }).then(render, unknown).then(function(){ busy = false; }, function(){ busy = false; });
   }
   function start(){ if (!timer) timer = setInterval(refresh, 5000); }
   function stop(){ if (timer) { clearInterval(timer); timer = null; } }

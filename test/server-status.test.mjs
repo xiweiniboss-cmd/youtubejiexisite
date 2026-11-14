@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
-import worker, { fetchServerStatus, sanitizeServerStatus, _resetServerStatusCache, SERVER_STATUS_MAX_BODY } from '../_worker.js';
+import worker, { fetchServerStatus, sanitizeServerStatus, _resetServerStatusCache, SERVER_STATUS_MAX_BODY, fetchQueue, sanitizeQueue, _resetQueueCache, rewriteQueueFull } from '../_worker.js';
 
 const TOKEN = 'merge-token-SECRET-123';
 const GB = 1073741824;
@@ -20,7 +20,8 @@ async function withFetch(fake, fn) {
   const orig = globalThis.fetch;
   globalThis.fetch = fake;
   _resetServerStatusCache();
-  try { return await fn(); } finally { globalThis.fetch = orig; _resetServerStatusCache(); }
+  _resetQueueCache();
+  try { return await fn(); } finally { globalThis.fetch = orig; _resetServerStatusCache(); _resetQueueCache(); }
 }
 async function callRoute(env, path = '/api/server-status') {
   const resp = await worker.fetch(new Request('https://yt.example.com' + path), env, { waitUntil() {} });
@@ -336,4 +337,102 @@ test('index.html: card is collapsed by default; online / auth / 5xx / 404 / offl
   assert.equal(e.srvLat.textContent, '-');
   assert.equal(e.srvMem.textContent, '-');
   assert.equal(e.srvLine.className, 'srv-line');
+});
+
+test('sanitizeServerStatus: top-level running/queued when jobs is missing', () => {
+  const s = sanitizeServerStatus({ running: 2, queued: 4, max_concurrent: 3, max_queue: 10 });
+  assert.deepEqual(s.jobs, { running: 2, queued: 4 });
+});
+
+test('sanitizeQueue: keeps four numbers and drops extras', () => {
+  assert.deepEqual(
+    sanitizeQueue({ running: '1', queued: 0, max_concurrent: 3, max_queue: '10', token: 'secret' }),
+    { ok: true, running: 1, queued: 0, max_concurrent: 3, max_queue: 10 },
+  );
+  assert.equal(sanitizeQueue({ running: 1, queued: 0 }), null);
+  assert.equal(sanitizeQueue(null), null);
+});
+
+test('rewriteQueueFull: 503 queue full becomes Chinese QUEUE_FULL', () => {
+  const resp = rewriteQueueFull(503, {
+    ok: false,
+    error: 'queue full: 3 running, 10 waiting (max 3 running, 10 queued); try later',
+    running: 3, queued: 10, max_concurrent: 3, max_queue: 10,
+  });
+  assert.ok(resp);
+  return resp.json().then((body) => {
+    assert.equal(resp.status, 503);
+    assert.equal(body.ok, false);
+    assert.equal(body.code, 'QUEUE_FULL');
+    assert.match(body.error, /当前排队已满/);
+    assert.match(body.error, /处理中 3\/3/);
+    assert.match(body.error, /排队 10\/10/);
+    assert.equal(body.running, 3);
+    assert.equal(body.queued, 10);
+    assert.equal(body.max_concurrent, 3);
+    assert.equal(body.max_queue, 10);
+  });
+});
+
+test('rewriteQueueFull: ignores unrelated 503 / other statuses', () => {
+  assert.equal(rewriteQueueFull(500, { error: 'queue full' }), null);
+  assert.equal(rewriteQueueFull(503, { error: 'upstream busy' }), null);
+  // 即便带了 running/queued，没有 queue full / QUEUE_FULL 也不该改写
+  assert.equal(rewriteQueueFull(503, { ok: false, error: 'internal error', running: 1, queued: 0, max_concurrent: 3, max_queue: 10 }), null);
+});
+
+test('rewriteQueueFull: already-normalized QUEUE_FULL code is kept', () => {
+  const resp = rewriteQueueFull(503, { ok: false, code: 'QUEUE_FULL', error: '当前排队已满，请稍后再试。', running: 2, queued: 1, max_concurrent: 3, max_queue: 10 });
+  assert.ok(resp);
+  return resp.json().then((body) => {
+    assert.equal(resp.status, 503);
+    assert.equal(body.code, 'QUEUE_FULL');
+    assert.match(body.error, /当前排队已满/);
+    assert.equal(body.running, 2);
+    assert.equal(body.queued, 1);
+  });
+});
+
+test('api/queue: forwards EC2 /queue without a token and caches', async () => {
+  const calls = [];
+  await withFetch(async (url, init) => {
+    calls.push({ url: String(url), headers: new Headers(init && init.headers) });
+    return new Response(JSON.stringify({ running: 1, queued: 2, max_concurrent: 3, max_queue: 10, secret: 'nope' }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    });
+  }, async () => {
+    const { resp, text, body } = await callRoute({ YT_MERGE_BASE: 'http://ec2.example:30002/', YT_MERGE_TOKEN: TOKEN }, '/api/queue');
+    assert.equal(resp.status, 200);
+    assert.deepEqual(body, { ok: true, running: 1, queued: 2, max_concurrent: 3, max_queue: 10 });
+    assert.equal(body.secret, undefined);
+    assert.ok(!text.includes(TOKEN) && !text.includes('nope'));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'http://ec2.example:30002/queue');
+    assert.equal(calls[0].headers.get('X-Merge-Token'), null);
+    await callRoute({ YT_MERGE_BASE: 'http://ec2.example:30002/', YT_MERGE_TOKEN: TOKEN }, '/api/queue');
+    assert.equal(calls.length, 1);
+  });
+});
+
+test('api/queue: does not need YT_MERGE_TOKEN; EC2 errors become ok:false', async () => {
+  await withFetch(async () => { throw new TypeError('fetch failed'); }, async () => {
+    const { resp, body } = await callRoute({}, '/api/queue');
+    assert.equal(resp.status, 200);
+    assert.equal(body.ok, false);
+    assert.match(body.error, /无法连接服务器/);
+  });
+});
+
+test('index.html shows the queue badge and treats only QUEUE_FULL as 排队已满', () => {
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  assert.match(html, /id="queueBadge"/);
+  assert.match(html, /当前处理中 /);
+  assert.match(html, />正在获取…</);
+  assert.match(html, /服务器状态未知/);
+  assert.match(html, /\/api\/queue/);
+  assert.match(html, /j\.code === 'QUEUE_FULL'/);
+  assert.doesNotMatch(html, /j\.code === 'QUEUE_FULL' \|\| res\.status === 503/);
+  assert.match(html, /当前排队已满，请稍后再试/);
+  assert.match(html, /请求太频繁，请稍后再试/);
+  assert.doesNotMatch(html, /一次只能合一个/);
 });
