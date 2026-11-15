@@ -14,18 +14,30 @@ async function withFetch(fn, body) {
 const call = (path, init, env) => worker.fetch(new Request('https://youtubejiexisite.pages.dev' + path, init), env);
 const START = '/api/yt1080-start?url=' + encodeURIComponent('https://youtu.be/dQw4w9WgXcQ');
 
-test('merge start: per-IP hourly limit (IPv6 /64), only successful starts count, 429 in Chinese', async () => {
+const hourKey = (ipk) => 'mrl_h_' + ipk + '_' + new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 13);
+const dayKey = (ipk) => 'mrl_d_' + ipk + '_' + new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+const ec2Ok = (n) => new Response(JSON.stringify({ ok: true, job_id: 'job' + n }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+test('merge start: reserve-first — counters are incremented BEFORE EC2 is called; lock blocks a 2nd start; hourly cap (IPv6 /64)', async () => {
   const kv = memKV();
   const env = { YT_MERGE_TOKEN: 't', FEEDBACK_KV: kv };
-  let ec2 = 0, ec2Status = 200;
-  await withFetch(async () => { ec2++; return new Response(JSON.stringify(ec2Status === 200 ? { ok: true, job_id: 'job' + ec2 } : { ok: false, error: 'queue full' }), { status: ec2Status, headers: { 'Content-Type': 'application/json' } }); }, async () => {
-    ec2Status = 503;
-    const full = await call(START, { method: 'POST', headers: { 'cf-connecting-ip': '2001:db8:aa:bb::1' } }, env);
-    assert.equal(full.status, 503);
-    ec2Status = 200;
+  const ipk = '2001:db8:aa:bb::/64';
+  let ec2 = 0;
+  await withFetch(async () => {
+    ec2++;
+    if (ec2 <= MERGE_LIMIT_HOUR) {
+      assert.equal(kv.m.get(hourKey(ipk)), String(ec2), 'hour counter already reserved when EC2 is called');
+      assert.ok(kv.m.get('mlock_' + ipk), 'in-flight lock set before EC2 is called');
+    }
+    return ec2Ok(ec2);
+  }, async () => {
     for (let i = 0; i < MERGE_LIMIT_HOUR; i++) {
       const r = await call(START, { method: 'POST', headers: { 'cf-connecting-ip': '2001:db8:aa:bb::' + (i + 10).toString(16) } }, env);
       assert.equal(r.status, 200, 'start #' + (i + 1));
+      const again = await call(START, { method: 'POST', headers: { 'cf-connecting-ip': '2001:db8:aa:bb::abcd' } }, env);
+      assert.equal(again.status, 429, 'lock blocks an immediate second start');
+      assert.match((await again.json()).error, /1 分钟/);
+      kv.m.delete('mlock_' + ipk); // 模拟 60 秒锁过期
     }
     const before = ec2;
     const r = await call(START, { method: 'POST', headers: { 'cf-connecting-ip': '2001:db8:aa:bb:ffff::1' } }, env);
@@ -34,8 +46,44 @@ test('merge start: per-IP hourly limit (IPv6 /64), only successful starts count,
     assert.equal(j.code, 'MERGE_RATE_LIMIT');
     assert.match(j.error, /每小时最多 5 次/);
     assert.equal(ec2, before, 'limited request must not reach EC2');
+    assert.equal(kv.m.get(hourKey(ipk)), String(MERGE_LIMIT_HOUR), 'denied request does not reserve');
     const other = await call(START, { method: 'POST', headers: { 'cf-connecting-ip': '2001:db8:aa:bc::1' } }, env);
     assert.equal(other.status, 200, 'a different /64 is not affected');
+  });
+});
+
+test('merge start: refund + unlock when EC2 rejects (queue full / 5xx) or is unreachable', async () => {
+  const kv = memKV();
+  const env = { YT_MERGE_TOKEN: 't', FEEDBACK_KV: kv };
+  let mode = 'full';
+  await withFetch(async () => {
+    if (mode === 'down') throw new Error('connect ECONNREFUSED');
+    if (mode === 'full') return new Response(JSON.stringify({ ok: false, error: 'queue full', running: 3, queued: 10, max_concurrent: 3, max_queue: 10 }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ ok: false, error: 'bad' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+  }, async () => {
+    for (const m of ['full', 'down', 'reject']) {
+      mode = m;
+      const r = await call(START, { method: 'POST', headers: { 'cf-connecting-ip': '9.8.7.6' } }, env);
+      assert.notEqual(r.status, 200, m);
+      assert.equal(kv.m.get(hourKey('9.8.7.6')), '0', m + ': hourly refunded');
+      assert.equal(kv.m.get(dayKey('9.8.7.6')), '0', m + ': daily refunded');
+      assert.equal(kv.m.has('mlock_9.8.7.6'), false, m + ': lock released so the user can retry right away');
+    }
+  });
+});
+
+test('merge start: concurrent burst from one /64 — only one request reaches EC2', async () => {
+  const kv = memKV();
+  const env = { YT_MERGE_TOKEN: 't', FEEDBACK_KV: kv };
+  let ec2 = 0;
+  await withFetch(async () => { ec2++; await new Promise((r) => setTimeout(r, 30)); return ec2Ok(ec2); }, async () => {
+    const rs = await Promise.all(Array.from({ length: 12 }, (_, i) =>
+      call(START, { method: 'POST', headers: { 'cf-connecting-ip': '2001:db8:cc:dd::' + (i + 1) } }, env)));
+    const codes = rs.map((r) => r.status);
+    assert.equal(codes.filter((c) => c === 200).length, 1, codes.join(','));
+    assert.equal(codes.filter((c) => c === 429).length, 11);
+    assert.equal(ec2, 1);
+    assert.equal(kv.m.get(hourKey('2001:db8:cc:dd::/64')), '1');
   });
 });
 

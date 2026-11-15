@@ -2205,30 +2205,58 @@ async function mergePassthrough(resp) {
 }
 export const MERGE_LIMIT_HOUR = 5;
 export const MERGE_LIMIT_DAY = 15;
-async function mergeRateCheck(request, env) {
+export const MERGE_LOCK_SECS = 60; // KV 最短 TTL 就是 60 秒
+// 同一 isolate 内的「正在提交」集合：JS 单线程，这一层是原子的，挡住同一实例上的并发突发
+const mergeInflight = new Set();
+function mergeLimitJson(error) {
+  return json({ ok: false, code: 'MERGE_RATE_LIMIT', error }, 429);
+}
+// 先占位再转发：
+//   1) 同一 IP（IPv6 /64）同一时间只允许一个合并提交：isolate 内 Set + KV 锁键 mlock_<ip>（TTL 60 秒）；
+//   2) 检查每小时 / 每天次数后立刻 +1（占位），再去请求 EC2；
+//   3) EC2 连不上 / 拒绝 / 排队满：退还次数并释放锁；EC2 接下任务：锁留到 TTL 自然过期（同一 IP 约 1 分钟只能提交一次）。
+// Workers KV 不是原子的、跨地域最终一致，这样只能大幅收窄并发窗口，不能 100% 杜绝；要彻底原子需要 Durable Object。
+async function mergeRateReserve(request, env) {
   const kv = env.FEEDBACK_KV;
   const ipk = clientIpKey(request);
-  const noop = { deny: null, commit: async () => {} };
-  if (!kv || !ipk) return noop;
+  const none = async () => {};
+  if (!ipk) return { deny: null, settle: none };
+  if (mergeInflight.has(ipk)) return { deny: mergeLimitJson('你上一个合并任务还在提交中，请等它返回后再试（约 1 分钟）'), settle: none };
+  mergeInflight.add(ipk);
+  const unlockMem = () => { mergeInflight.delete(ipk); };
+  if (!kv) return { deny: null, settle: async () => { unlockMem(); } };
   const now = new Date(Date.now() + 8 * 3600 * 1000).toISOString();
+  const lk = 'mlock_' + ipk;
   const hk = 'mrl_h_' + ipk + '_' + now.slice(0, 13);
   const dk = 'mrl_d_' + ipk + '_' + now.slice(0, 10);
   let h = 0, d = 0;
   try {
+    if (await kv.get(lk)) { unlockMem(); return { deny: mergeLimitJson('你上一个合并任务刚提交，请约 1 分钟后再提交下一个'), settle: none }; }
     h = Number((await kv.get(hk)) || 0);
     d = Number((await kv.get(dk)) || 0);
-  } catch { return noop; }
-  if (d >= MERGE_LIMIT_DAY)
-    return { deny: json({ ok: false, code: 'MERGE_RATE_LIMIT', error: '今天的服务器合并次数已用完（每天 ' + MERGE_LIMIT_DAY + ' 次），明天再来吧' }, 429), commit: noop.commit };
-  if (h >= MERGE_LIMIT_HOUR)
-    return { deny: json({ ok: false, code: 'MERGE_RATE_LIMIT', error: '服务器合并太频繁了（每小时最多 ' + MERGE_LIMIT_HOUR + ' 次），请稍后再试' }, 429), commit: noop.commit };
+  } catch {
+    return { deny: null, settle: async () => { unlockMem(); } }; // KV 出错不挡用户
+  }
+  if (d >= MERGE_LIMIT_DAY) { unlockMem(); return { deny: mergeLimitJson('今天的服务器合并次数已用完（每天 ' + MERGE_LIMIT_DAY + ' 次），明天再来吧'), settle: none }; }
+  if (h >= MERGE_LIMIT_HOUR) { unlockMem(); return { deny: mergeLimitJson('服务器合并太频繁了（每小时最多 ' + MERGE_LIMIT_HOUR + ' 次），请稍后再试'), settle: none }; }
+  let reserved = false;
+  try {
+    await kv.put(lk, String(Date.now()), { expirationTtl: MERGE_LOCK_SECS });
+    await kv.put(hk, String(h + 1), { expirationTtl: 7200 });
+    await kv.put(dk, String(d + 1), { expirationTtl: 172800 });
+    reserved = true;
+  } catch {}
+  const dec = async (k, ttl) => {
+    const cur = Number((await kv.get(k)) || 0);
+    await kv.put(k, String(Math.max(0, cur - 1)), { expirationTtl: ttl });
+  };
   return {
     deny: null,
-    commit: async () => {
-      try {
-        await kv.put(hk, String(h + 1), { expirationTtl: 7200 });
-        await kv.put(dk, String(d + 1), { expirationTtl: 172800 });
-      } catch {}
+    // accepted=true：EC2 已接下任务，保留占位和锁；false：退还次数、删锁
+    settle: async (accepted) => {
+      unlockMem();
+      if (accepted || !reserved) return;
+      try { await dec(hk, 7200); await dec(dk, 172800); await kv.delete(lk); } catch {}
     },
   };
 }
@@ -2246,7 +2274,7 @@ async function handleYt1080Start(request, env) {
   if (!ytVid) return json({ ok: false, error: '只支持单个 YouTube 视频链接（youtube.com / youtu.be）' }, 400);
   const safeYtUrl = 'https://www.youtube.com/watch?v=' + ytVid;
   // 合并任务很吃 EC2：同一 IP（IPv6 按 /64）每小时最多 MERGE_LIMIT_HOUR 次、每天（北京时间）最多 MERGE_LIMIT_DAY 次
-  const mergeRate = await mergeRateCheck(request, env);
+  const mergeRate = await mergeRateReserve(request, env);
   if (mergeRate.deny) return mergeRate.deny;
   const qualityRaw = parseInt(reqUrl.searchParams.get('quality') || '1080', 10);
   const quality = [360, 720, 1080].includes(qualityRaw) ? qualityRaw : 1080;
@@ -2265,9 +2293,10 @@ async function handleYt1080Start(request, env) {
         merge_output_format: 'mp4',
       }),
     });
-    if (resp.ok) await mergeRate.commit(); // 只有 EC2 真正接下任务才计数（连不上 / 排队满不扣次数）
+    await mergeRate.settle(resp.ok); // 只有 EC2 真正接下任务才保留占位（拒绝 / 排队满 / 5xx 退还）
     return mergePassthrough(resp);
   } catch (e) {
+    await mergeRate.settle(false); // 连不上 EC2：退还
     return mergeConnectError(e);
   }
 }
