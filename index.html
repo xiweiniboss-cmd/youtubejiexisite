@@ -1756,5 +1756,24 @@ var JiexiHistoryCore = (function(){
   b.addEventListener('keyup', function(e){ if(e.key === 'Enter' || e.key === ' ') release(); });
 })();
 </script>
+<script id="alljiexi-prefill">
+// 预填：总入口 alljiexi 跳过来时带 #url=<分享文字>（也兼容 ?url=），只填进输入框，不自动解析，人机验证照常由用户完成
+(function () {
+  try {
+    var h = location.hash.replace(/^#/, ''), v = '';
+    if (/(^|&)url=/.test(h)) v = new URLSearchParams(h).get('url') || '';
+    if (!v && location.search) v = new URLSearchParams(location.search).get('url') || '';
+    if (!v) return;
+    v = String(v).replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '').slice(0, 2000);
+    var el = document.getElementById('urlInput');
+    if (el && !el.value.trim()) {
+      el.value = v;
+      try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) {}
+      try { el.focus({ preventScroll: true }); } catch (e) {}
+    }
+    if (history.replaceState) history.replaceState(null, '', location.pathname);
+  } catch (e) {}
+})();
+</script>
 </body>
 </html>
