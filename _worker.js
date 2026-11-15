@@ -120,7 +120,7 @@ async function fetchAllowedHops(url, init, isAllowed, maxHops = 5) {
 }
 
 // 管理员登录：POST /api/admin/login 校验 FEEDBACK_ADMIN_KEY 后下发 HttpOnly Cookie（HMAC 签名，12 小时有效）；
-// 管理接口不再接受地址栏 ?key=。脚本调用可用请求头 Authorization: Bearer <管理密码>。
+// 管理接口不再接受地址栏 ?key=，也不接受 Authorization: Bearer（没有任何调用方，且绕过了输错锁定），只认登录后下发的 Cookie。
 const ADMIN_COOKIE = 'jx_admin';
 const ADMIN_SESSION_SECS = 12 * 3600;
 const ADMIN_FAIL_MAX = 10; // 同一 IP（IPv6 /64）15 分钟内最多输错 10 次
@@ -150,8 +150,6 @@ function adminCookieValue(request) {
 async function isAdmin(request, env) {
   const secret = String((env && env.FEEDBACK_ADMIN_KEY) || '');
   if (!secret) return false;
-  const auth = request.headers.get('Authorization') || '';
-  if (/^Bearer /i.test(auth) && safeEqual(auth.slice(7).trim(), secret)) return true;
   const m = adminCookieValue(request).match(/^(\d{9,11})\.([A-Za-z0-9_-]{20,})$/);
   if (!m || Number(m[1]) < Math.floor(Date.now() / 1000)) return false;
   return safeEqual(m[2], await adminSig(secret, m[1]));

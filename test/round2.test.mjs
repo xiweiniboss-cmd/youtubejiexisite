@@ -97,3 +97,19 @@ test('ytdl: redirect to a non-allowlisted host is refused without fetching it', 
     assert.deepEqual(seen, ['https://rr1---sn.googlevideo.com/videoplayback?id=1']);
   });
 });
+
+test('admin: Authorization: Bearer is no longer accepted; lockout applies before compare (11th attempt even with right password is 429)', async () => {
+  const env = { FEEDBACK_KV: memKV(), FEEDBACK_ADMIN_KEY: 'secret-key' };
+  for (const p of ['/api/stats-all', '/api/feedback/list', '/api/geo-stats', '/api/parse-history']) {
+    const r = await call(p, { headers: { Authorization: 'Bearer secret-key' } }, env);
+    assert.equal(r.status, 403, p);
+  }
+  const login = (key, ip) => call('/api/admin/login', { method: 'POST', headers: { 'Content-Type': 'application/json', 'cf-connecting-ip': ip }, body: JSON.stringify({ key }) }, env);
+  for (let i = 0; i < 10; i++) assert.equal((await login('bad' + i, '2001:db8:5:5::' + (i + 1))).status, 403);
+  const locked = await login('secret-key', '2001:db8:5:5::ff');
+  assert.equal(locked.status, 429);
+  assert.equal(locked.headers.get('Set-Cookie'), null);
+  const legacy = await call('/admin?key=secret-key', { headers: { 'cf-connecting-ip': '2001:db8:5:5::fe' } }, env);
+  assert.equal(legacy.headers.get('Set-Cookie'), null);
+  assert.equal((await login('secret-key', '2001:db8:5:6::1')).status, 200, 'other /64 unaffected');
+});
