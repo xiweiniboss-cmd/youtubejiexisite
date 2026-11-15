@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import worker, { fetchServerStatus, sanitizeServerStatus, _resetServerStatusCache, SERVER_STATUS_MAX_BODY, fetchQueue, sanitizeQueue, _resetQueueCache, rewriteQueueFull } from '../_worker.js';
+// 本地测试默认不配人机验证密钥：显式声明跳过（生产缺密钥会 fail-closed 503）
+{ const _f = worker.fetch.bind(worker); worker.fetch = (r, e, c) => _f(r, { TURNSTILE_DISABLED: '1', ...(e || {}) }, c); }
+
 
 const TOKEN = 'merge-token-SECRET-123';
 const GB = 1073741824;
@@ -213,7 +216,7 @@ test('server-status: single-flight — 50 concurrent requests share one EC2 fetc
     await new Promise((r) => setTimeout(r, 300));
     return new Response(JSON.stringify(FULL), { status: 200 });
   }, async () => {
-    const env = { YT_MERGE_TOKEN: TOKEN, YT_MERGE_BASE: 'http://ec2.single:30002' };
+    const env = { TURNSTILE_DISABLED: '1', YT_MERGE_TOKEN: TOKEN, YT_MERGE_BASE: 'http://ec2.single:30002' };
     const results = await Promise.all(Array.from({ length: 50 }, () => callRoute(env)));
     assert.equal(calls, 1);
     for (const r of results) {

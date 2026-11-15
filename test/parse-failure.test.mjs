@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import worker from '../_worker.js';
+// 本地测试默认不配人机验证密钥：显式声明跳过（生产缺密钥会 fail-closed 503）
+{ const _f = worker.fetch.bind(worker); worker.fetch = (r, e, c) => _f(r, { TURNSTILE_DISABLED: '1', ...(e || {}) }, c); }
+
 
 // 解析失败记录（接了 parse-log 之后失败就是 ok=0 的解析记录）：上游失败时往 D1 parse_log 插一行 ok=0，链接 / 原因去掉令牌参数；4xx 不记；不碰共用 KV；不影响响应
 function memKV() {
@@ -22,7 +25,7 @@ test('parse 上游失败 → D1 parse_log 记一行 ok=0（链接不带 si 等�
   const orig = globalThis.fetch;
   globalThis.fetch = async () => new Response('broken', { status: 500 });
   try {
-    const env = { FEEDBACK_KV: kv, PARSE_DB: d1, REDFOX_API_KEY: 'fake' };
+    const env = { TURNSTILE_DISABLED: '1', FEEDBACK_KV: kv, PARSE_DB: d1, REDFOX_API_KEY: 'fake' };
     const url = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ&si=SECRETTOKEN';
     const r = await worker.fetch(new Request('https://youtubejiexisite.pages.dev/api/parse?url=' + encodeURIComponent(url), { headers: { 'cf-connecting-ip': '198.51.100.7' } }), env, ctx);
     assert.equal(r.status, 502);

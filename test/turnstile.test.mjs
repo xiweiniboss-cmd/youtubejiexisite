@@ -211,7 +211,7 @@ test('turnstile: siteverify failure -> 403 HUMAN_FAILED; unreachable/timeout/non
   });
 });
 
-test('turnstile: secret unset -> fail-open with one console warning, no cookie, pass cookies ignored', async () => {
+test('turnstile: secret unset -> fail-closed 503 (no upstream, no siteverify); TURNSTILE_DISABLED=1 opts back into fail-open with one warning', async () => {
   const f = fakeFetch();
   const warns = [];
   const origWarn = console.warn;
@@ -220,6 +220,14 @@ test('turnstile: secret unset -> fail-open with one console warning, no cookie, 
   try {
     await withFetch(f.fn, async () => {
       for (const env of [{}, { TURNSTILE_SECRET_KEY: '   ' }]) {
+        const r = await call(PARSE, env);
+        assert.equal(r.resp.status, 503, r.text);
+        assert.equal(r.body.code, 'HUMAN_UNAVAILABLE');
+        assert.equal(r.setCookie, '');
+        const dl = await call('/api/ytdl?url=notaurl', env);
+        assert.equal(dl.resp.status, 503);
+      }
+      for (const env of [{ TURNSTILE_DISABLED: '1' }, { TURNSTILE_SECRET_KEY: '   ', TURNSTILE_DISABLED: 'true' }]) {
         const r = await call(PARSE, env);
         assert.ok(reachedParse(r), r.text);
         assert.equal(r.setCookie, '');
@@ -236,7 +244,7 @@ test('turnstile: secret unset -> fail-open with one console warning, no cookie, 
 test('turnstile: status / ping / stats / key / merge status+file are not gated', async () => {
   const f = fakeFetch();
   await withFetch(f.fn, async () => {
-    const env = { ...ENV, TURNSTILE_SITE_KEY: ' 0x4AAAA-public ' };
+    const env = { TURNSTILE_DISABLED: '1', ...ENV, TURNSTILE_SITE_KEY: ' 0x4AAAA-public ' };
     assert.equal((await call('/api/ping', env)).resp.status, 200);
     assert.equal((await call('/api/stats', env)).body.ok, true);
     assert.deepEqual((await call('/api/turnstile-key', env)).body, { ok: true, siteKey: '0x4AAAA-public', required: true, attach: false });
@@ -352,7 +360,7 @@ test('index.html: load-state UI strings, 8s timeout, compact widget centered, do
 // ---- 合并任务 id 白名单 ----
 test('yt1080-status / yt1080-file: bad job ids -> 400 Chinese error, EC2 never contacted', async () => {
   const f = fakeFetch([], { other: () => new Response(JSON.stringify({ ok: true, status: 'running' }), { headers: { 'content-type': 'application/json' } }) });
-  const env = { ...ENV, YT_MERGE_TOKEN: 'merge-token-not-echoed', YT_MERGE_BASE: 'https://merge.example.com' };
+  const env = { TURNSTILE_DISABLED: '1', ...ENV, YT_MERGE_TOKEN: 'merge-token-not-echoed', YT_MERGE_BASE: 'https://merge.example.com' };
   const bad = ['', '.', '..', '%2e', '%2e%2e', '%252e%252e', 'abc', 'abcde', 'a'.repeat(65), 'job/../x', 'job%2F..%2Fx', 'job.0001', 'job 0001', 'jöb-0001', 'job-0001%00'];
   await withFetch(f.fn, async () => {
     for (const p of ['/api/yt1080-status', '/api/yt1080-file']) {
