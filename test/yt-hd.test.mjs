@@ -1352,3 +1352,26 @@ test('index.html wires DIRECT_LIMITED and phone-merge 403 to server merge and dr
   // 复制直链按钮本身保留
   assert.match(html, /copyBtn\.textContent = '复制直链'/);
 });
+
+test('yt1080-start only forwards a normalized single YouTube video URL to EC2', async () => {
+  const orig = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), body: init && init.body ? JSON.parse(init.body) : null });
+    return new Response(JSON.stringify({ ok: true, job_id: 'job1' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+  try {
+    const env = { YT_MERGE_TOKEN: 'local-test-token' };
+    for (const bad of ['http://169.254.169.254/latest/meta-data/', 'https://example.com/v.mp4', 'https://youtube.com.evil.com/watch?v=dQw4w9WgXcQ', 'https://www.youtube.com/playlist?list=PL123']) {
+      const r = await worker.fetch(new Request('https://example.com/api/yt1080-start?url=' + encodeURIComponent(bad), { method: 'POST' }), env);
+      assert.equal(r.status, 400, bad);
+    }
+    assert.equal(calls.length, 0);
+    const ok = await worker.fetch(new Request('https://example.com/api/yt1080-start?url=' + encodeURIComponent('看这个 https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123 ！'), { method: 'POST' }), env);
+    assert.equal(ok.status, 200);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].body.url, 'https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
