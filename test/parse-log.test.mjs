@@ -80,3 +80,31 @@ test('没绑 PARSE_DB：行为和以前一样', async () => {
   const r = await worker.fetch(req('https://example.com/x', '198.51.100.20', DEV), { REDFOX_API_KEY: 'fake' }, { waitUntil() {} });
   assert.equal(r.status, 400);
 });
+
+test('没过人机验证 / 被冷却拦下的请求不写 D1；被拉黑的人下载接口也 403', async () => {
+  const d1 = fakeD1();
+  d1.db.prepare("INSERT INTO blocklist(type,value,note,created_at) VALUES ('ip','203.0.113.66','',1)").run();
+  const jobs = []; const ctx = { waitUntil: (p) => jobs.push(p) };
+  const orig = globalThis.fetch;
+  let upstream = 0;
+  globalThis.fetch = async (u) => {
+    if (String(u).includes('challenges.cloudflare.com')) return new Response(JSON.stringify({ success: false, 'error-codes': ['invalid-input-response'] }), { headers: { 'content-type': 'application/json' } });
+    upstream++; return new Response('broken', { status: 500 });
+  };
+  try {
+    const env = { PARSE_DB: d1, REDFOX_API_KEY: 'fake', TURNSTILE_SECRET_KEY: 'secret-not-real' };
+    for (let i = 0; i < 20; i++) {
+      const r = await worker.fetch(req('https://www.youtube.com/watch?v=dQw4w9WgXcQ', '198.51.100.' + (40 + i), DEV), env, ctx);
+      assert.ok(r.status >= 400 && r.status < 500, String(r.status));
+    }
+    while (jobs.length) await jobs.shift();
+    assert.equal(d1.db.prepare('SELECT count(*) c FROM parse_log').get().c, 0, '没过人机验证不该写');
+    assert.equal(upstream, 0);
+    for (const p of ['/api/ytdl?url=x', '/api/yt-direct?url=x', '/api/yt1080-file?id=x']) {
+      const h = { 'cf-connecting-ip': '203.0.113.66' };
+      const r = await worker.fetch(new Request('https://youtubejiexisite.pages.dev' + p, { headers: h }), { PARSE_DB: d1 }, ctx);
+      if (p.startsWith('/api/yt1080-file')) assert.equal(r.status, 403, p);
+      else assert.ok(r.status === 403 || r.status === 400, p + ' ' + r.status);
+    }
+  } finally { globalThis.fetch = orig; }
+});

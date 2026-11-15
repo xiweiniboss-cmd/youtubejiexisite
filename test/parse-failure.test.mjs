@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import worker from '../_worker.js';
 
-// 解析失败记录（pf-recorder v2）：上游失败时往 D1 parse_log 插一行 ok=0，链接 / 原因去掉令牌参数；4xx 不记；不碰共用 KV；不影响响应
+// 解析失败记录（接了 parse-log 之后失败就是 ok=0 的解析记录）：上游失败时往 D1 parse_log 插一行 ok=0，链接 / 原因去掉令牌参数；4xx 不记；不碰共用 KV；不影响响应
 function memKV() {
   const m = new Map(), log = [];
   return { m, log, get: async (k) => { log.push(['get', k]); return m.get(k) ?? null; }, put: async (k, v, o) => { log.push(['put', k, o]); m.set(k, String(v)); }, delete: async (k) => { m.delete(k); }, list: async () => ({ keys: [] }) };
@@ -30,7 +30,7 @@ test('parse 上游失败 → D1 parse_log 记一行 ok=0（链接不带 si 等�
     while (jobs.length) await jobs.shift();
     const rows = d1.db.prepare('SELECT * FROM parse_log').all();
     assert.equal(rows.length, 1);
-    assert.deepEqual([rows[0].site, rows[0].ok, rows[0].status, rows[0].url, rows[0].ip], ['youtube', 0, 502, 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', '']);
+    assert.deepEqual([rows[0].site, rows[0].ok, rows[0].status, rows[0].url, rows[0].ip], ['youtube', 0, 502, 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', '198.51.100.7']);
     assert.ok(!JSON.stringify(rows).includes('SECRETTOKEN'));
     assert.ok(!kv.log.some((x) => x[0] === 'put' && String(x[1]).startsWith('pf_')), '不写 pf_ KV');
     // 4xx（不是 YouTube 链接）不记

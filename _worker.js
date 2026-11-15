@@ -654,6 +654,7 @@ async function handleParse(request, env) {
       return json({ ok: false, error: '今日解析次数已用完（20 次），明天再来吧' }, 429);
   }
 
+  plPass(request); // 人机验证（入口 checkHuman）+ 冷却 + 每日次数都过了：这次解析才记进 D1 parse_log
   try {
     const result = await parseYoutubeViaRedFox(shareText, apiKey, debug);
     if (parseIp && env.FEEDBACK_KV)
@@ -2797,186 +2798,41 @@ async function handleYtDirect(request, env) {
   return json({ ok: true, videoId: vid, results: results });
 }
 
-// ==== pf-recorder v2 BEGIN ====
-// 解析失败记录器（各解析站共用同一份代码：allfeedback/shared/pf-recorder.js 是原件，改动后用 shared/pf-sync.mjs 同步到各站）
-// v2：不再写共用的 FEEDBACK_KV（那个 KV 还存着 DeepSeek 的账号和聊天，额度不能被它吃掉），
-//     改为每次失败往 D1 数据库 parse_log（绑定名 PARSE_DB，建表见 allfeedback/shared/parse_log.sql）插一行 ok=0 的记录；
-//     allfeedback「解析失败」视图直接对 parse_log 做 GROUP BY 统计。不记 IP、设备（这些列留空）。
-// - 只记真正的失败：5xx，或 2xx 但返回里写着失败（ok:false / code 不是 0、200）。4xx（输入不对、人机验证、频控、
-//   次数用完）不记；报错文字属于这些情况的也兜底跳过。
-// - 链接和报错文字里出现的链接都只留能定位作品的参数（去掉 xsec_token、share_token、sign 等令牌）。
-// - 写入在 waitUntil 里跑、最多等 10 秒、所有异常吞掉：绝不拖慢、也绝不影响解析接口本身的响应。没绑 D1 就什么都不做。
-// - 开关：环境变量 PARSE_LOG_OFF=1 时完全不写。
-// - 预览部署（<分支或哈希>.<项目>.pages.dev）不提供解析：直接返回 403，免得预览地址变成没有人机验证的公开解析接口。
-//   确实要在预览里测解析，给预览环境加变量 PARSE_ON_PREVIEW=1。
-const PF_WRITE_TIMEOUT_MS = 10000;
-const PF_URL_MAX = 300;
-const PF_MSG_MAX = 160;
-// 链接里只保留能定位作品的参数，其余（xsec_token、share_token、sign、timestamp、uid…）一律去掉
-const PF_KEEP_PARAMS = new Set(['v', 'p', 'id', 'vid', 'bvid', 'aid', 'aweme_id', 'modal_id', 'item_id', 'photoid', 'list', 'index']);
-// 兜底：即使是 5xx / ok:false，报错文字属于这些情况也不算解析失败
-const PF_SKIP_RE = /人机验证|解析太频繁|操作太频繁|今日解析次数|今天的解析次数|请先粘贴|只支持|不像|不是.{0,6}链接|没找到有效的链接|没有找到链接|访问受限|预览环境/;
-const PF_URL_RE = /https?:\/\/[^\s"'<>\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]+/gi;
-
-function pfDay(ms) {
-  return new Date(ms + 8 * 3600 * 1000).toISOString().slice(0, 10);
-}
-function pfCleanOne(raw) {
-  raw = String(raw || '').replace(/[),.;!?\]}>»」』】，。；：？！）、]+$/, '');
-  let u;
-  try { u = new URL(raw); } catch { return ''; }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
-  u.username = '';
-  u.password = '';
-  u.hash = '';
-  const keep = new URLSearchParams();
-  for (const [k, v] of u.searchParams) if (PF_KEEP_PARAMS.has(k.toLowerCase()) && v.length <= 64) keep.append(k, v);
-  const qs = keep.toString();
-  u.search = qs ? '?' + qs : '';
-  return u.toString().slice(0, PF_URL_MAX);
-}
-// 文字里的第一个链接，清理后返回；没有就返回空串
-function pfCleanUrl(text) {
-  const m = String(text || '').match(/https?:\/\/[^\s"'<>]+/i);
-  return m ? pfCleanOne(m[0]) : '';
-}
-// 报错文字里出现的所有链接都清理一遍（上游报错经常把请求地址连同令牌一起带出来），再压空白、限长
-function pfScrub(text, max) {
-  const s = String(text == null ? '' : text).replace(PF_URL_RE, (m) => {
-    const tail = (m.match(/[),.;!?\]}>»」』】，。；：？！）、]+$/) || [''])[0];
-    const c = pfCleanOne(m);
-    return (c || '[链接]') + tail;
-  });
-  return s.replace(/\s+/g, ' ').trim().slice(0, max || PF_MSG_MAX);
-}
-function pfClassify(status, msg) {
-  const m = String(msg || '');
-  const hm = m.match(/(?:HTTP|状态码|status)\s*[:：=]?\s*(\d{3})(?!\d)/i);
-  const up = hm ? Number(hm[1]) : 0;
-  let code = 'other';
-  if (/未配置|not configured/i.test(m)) code = 'config';
-  else if (status === 504 || /超时|timed? ?out|timeout|abort/i.test(m)) code = 'timeout';
-  else if (up === 429 || up === 402 || /额度|积分|余额|quota|rate.?limit|too many requests|credit|balance/i.test(m)) code = 'upstream_quota';
-  else if (up === 404 || /未找到|没找到|找不到|不存在|已删除|私密|无法获取|没有(?:找到)?(?:可下载的?)?(?:视频|图片|作品|内容|媒体)|no (?:video|media)|not found|unavailable|private/i.test(m)) code = 'no_media';
-  else if (up) code = 'upstream_http';
-  else if (/fetch failed|network|网络|连接|ECONN|DNS|TLS|SSL|socket/i.test(m)) code = 'network';
-  else if (/JSON|Unexpected token|格式异常|返回异常|结构/i.test(m)) code = 'bad_upstream';
-  else if (/^(?:Error|TypeError|ReferenceError|RangeError|SyntaxError)\b|is not a function|is not defined|of undefined|of null/.test(m)) code = 'exception';
-  return { code, up };
-}
-// 返回里写着失败吗（TikTok 成功 code=0，微博成功 code=200）
-function pfBodyFailed(status, body) {
-  return status >= 300 || !!(body && typeof body === 'object' && (body.ok === false || (typeof body.code === 'number' && body.code !== 0 && body.code !== 200)));
-}
-async function pfInput(request) {
-  const u = new URL(request.url);
-  let s = u.searchParams.get('url') || u.searchParams.get('text') || '';
-  if (!s && request.method === 'POST' && Number(request.headers.get('content-length') || 0) <= 65536) {
-    try {
-      const b = await request.clone().json();
-      if (b && typeof b === 'object') s = String(b.url || b.link || b.text || '');
-    } catch {}
-  }
-  return String(s).slice(0, 2000);
-}
-function pfFlag(v) {
-  return /^(1|true|yes|on)$/i.test(String(v == null ? '' : v).trim());
-}
-// 预览部署：Pages 的 <哈希或分支>.<项目>.pages.dev（生产是 <项目>.pages.dev 或自定义域名）
-function pfIsPreview(request, env) {
-  if (env && pfFlag(env.PARSE_ON_PREVIEW)) return false;
-  let h = '';
-  try { h = new URL(request.url).hostname.toLowerCase(); } catch { return false; }
-  return /\.pages\.dev$/.test(h) && h.split('.').length > 3;
-}
-function pfPreviewResponse() {
-  const msg = '预览环境不提供解析，请到正式站使用';
-  return new Response(JSON.stringify({ ok: false, code: -1, error: msg, msg }), {
-    status: 403, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
-  });
-}
-function pfWithTimeout(p, ms) {
-  let t;
-  return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error('timeout')), ms); })]).finally(() => clearTimeout(t));
-}
-function createPfRecorder(site, opts) {
-  opts = opts || {};
-  const now = opts.now || (() => Date.now());
-  function record(env, ctx, info) {
-    const db = env && env.PARSE_DB;
-    if (!db || typeof db.prepare !== 'function' || pfFlag(env.PARSE_LOG_OFF)) return null;
-    const job = (async () => {
-      try {
-        await pfWithTimeout(
-          db.prepare('INSERT INTO parse_log (ts, site, url, ok, status, reason) VALUES (?, ?, ?, 0, ?, ?)')
-            .bind(now(), site, pfCleanUrl(info.input), Number(info.st) || 0, pfScrub(info.msg || ('HTTP ' + (Number(info.st) || 0)))).run(),
-          PF_WRITE_TIMEOUT_MS);
-      } catch {}
-    })();
-    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(job);
-    return job;
-  }
-  function inspect(resp, input, env, ctx) {
-    if (!resp || !env || !env.PARSE_DB || pfFlag(env.PARSE_LOG_OFF)) return null;
-    const status = resp.status;
-    if (status >= 300 && status < 500) return null;
-    const ct = (resp.headers.get('content-type') || '').toLowerCase();
-    if (!ct.includes('json')) {
-      return status >= 500 ? record(env, ctx, { input, msg: 'HTTP ' + status, st: status }) : null;
-    }
-    const clone = resp.clone();
-    const job = (async () => {
-      let body = null;
-      try { body = await clone.json(); } catch {}
-      if (!pfBodyFailed(status, body)) return;
-      const msg = body ? String(body.error || body.msg || body.message || '') : '';
-      if (PF_SKIP_RE.test(msg)) return;
-      await record(env, ctx, { input, msg: msg || ('HTTP ' + status), st: status });
-    })().catch(() => {});
-    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(job);
-    return job;
-  }
-  // 用法：return pf.wrap(request, env, ctx, () => handleParse(request, env));
-  async function wrap(request, env, ctx, run) {
-    if (pfIsPreview(request, env)) return pfPreviewResponse();
-    let input = '';
-    try { input = await pfInput(request); } catch {}
-    let resp;
-    try {
-      resp = await run();
-    } catch (e) {
-      try { record(env, ctx, { input, msg: (e && e.message) || String(e), st: 500 }); } catch {}
-      throw e;
-    }
-    try { inspect(resp, input, env, ctx); } catch {}
-    return resp;
-  }
-  return { wrap, record, inspect };
-}
-// ==== pf-recorder v2 END ====
-const pf = createPfRecorder('youtube');
-
-// ==== parse-log v1 BEGIN ====
+// ==== parse-log v2 BEGIN ====
 // 解析记录 + 拉黑（各解析站共用同一份代码：allfeedback/shared/parse-log.js 是原件，改动后用 shared/pf-sync.mjs 同步）
 // 存储：D1 数据库 parse_log（绑定名 PARSE_DB），表 parse_log / blocklist，建表语句见 allfeedback/shared/parse_log.sql。
-// - 每次调用 /api/parse 记一行：时间、站点、链接（去掉令牌类参数）、成功与否、状态码、失败原因、IP、归属地（request.cf）、设备 ID、设备指纹、UA。
-//   只记「有效链接」：站点传入的 valid(input) 返回 false（空输入 / 不是本站链接 / 链接格式不对，站点自己会直接 400）就不记。
+// - 每次解析记一行：时间、站点、链接（去掉令牌类参数）、成功与否、状态码、失败原因（里面的链接也去令牌）、IP、归属地（request.cf）、
+//   设备 ID、设备指纹、UA。失败行（ok=0）同时就是 allfeedback「解析失败」的数据来源，所以接了本模块的站不再需要 pf-recorder。
+// - 只在「人机验证 + 频控都通过之后」才记：站点在 handleParse 里过了这两关时调用 plPass(request)，没调用的请求一律不记
+//   （没过人机验证的刷接口请求不会写 D1，不会把每天的免费写入额度刷光）。
+// - 只记「有效链接」：站点传入的 valid(input) 返回 false（空输入 / 不是本站链接 / 链接格式不对）就不记。
 // - 设备 ID：前端首次访问在 localStorage 生成的随机 UUID，放在请求头 X-Device-Id；格式不对就当没有。
 // - 设备指纹：前端用 canvas 渲染、屏幕尺寸/色深、时区、语言、CPU 核数、平台、UA 算 SHA-256 取前 32 位十六进制，
-//   放在请求头 X-Device-Fp；尽力而为（清缓存不变，但换浏览器/升级浏览器会变），格式不对就当没有。
-// - 拉黑：解析前先查 blocklist（IP / 设备 ID / 指纹，每个 isolate 缓存 60 秒）；命中返回 403「访问受限」。
-//   D1 没绑定 / 查询出错 / 超时一律放行（fail open），出错时沿用上一次成功读到的名单。
-// - 写入全部在 waitUntil 里，出错吞掉，不影响解析响应。约 1% 的写入顺手删掉 30 天前的记录。
+//   放在请求头 X-Device-Fp；尽力而为，格式不对就当没有。同型号同浏览器的设备常常算出同一个指纹。
+// - 拉黑：最先查 blocklist（IP / IPv6 /64 / 设备 ID / 指纹）；命中返回 403「访问受限」，不调上游。
+//   名单在每个 isolate 里缓存 60 秒；过期后先用旧名单放行/拦截，同时在后台（waitUntil）刷新，不让用户干等。
+//   只有刚启动、手里还没有名单时才等一次（最多 1.5 秒）。D1 没绑定 / 查询出错 / 超时一律放行（fail open）。
+//   被拉黑的请求按命中的名单项每分钟最多记一行（换设备头也不会多写）。
+// - 下载 / 媒体代理用 pl.guard(...) 包一层：只查黑名单，不记。
+// - 写入全部在 waitUntil 里、最多等 10 秒、出错吞掉，不影响解析响应。保留 30 天：由微博 Worker 的每日定时任务分批删除。
+// - 开关：PARSE_LOG_OFF=1 时不写记录（黑名单照常检查）。
+// - 预览部署（<分支或哈希>.<项目>.pages.dev）不提供解析：直接 403。确实要测，给预览环境加 PARSE_ON_PREVIEW=1。
 const PL_BLOCK_TTL_MS = 60000;
 const PL_BLOCK_RETRY_MS = 10000;
 const PL_BLOCK_TIMEOUT_MS = 1500;
+const PL_WRITE_TIMEOUT_MS = 10000;
 const PL_RETENTION_MS = 30 * 86400 * 1000;
-const PL_PRUNE_RATE = 0.01;
 const PL_BLOCK_MSG = '访问受限';
 const PL_FP_RE = /^[0-9a-f]{32}$/;
 const PL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const PL_KEEP_PARAMS = new Set(['v', 'p', 'id', 'vid', 'bvid', 'aid', 'aweme_id', 'modal_id', 'item_id', 'photoid', 'list', 'index']);
+const PL_URL_RE = /https?:\/\/[^\s"'<>\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]+/gi;
+const PL_PASSED = new WeakSet();
 
+// 站点在人机验证 + 频控都通过后调用：之后这次解析才会被记录
+function plPass(request) {
+  try { if (request && typeof request === 'object') PL_PASSED.add(request); } catch {}
+}
 function plDevice(request) {
   const v = String(request.headers.get('x-device-id') || '').trim().toLowerCase();
   return PL_UUID_RE.test(v) ? v : '';
@@ -3007,10 +2863,8 @@ function plIp64(ip) {
   while (parts.length < 4) parts.push('0');
   return parts.join(':') + '::/64';
 }
-function plCleanUrl(text) {
-  const m = String(text || '').match(/https?:\/\/[^\s"'<>]+/i);
-  if (!m) return '';
-  const raw = m[0].replace(/[),.;!?\]}>»」』】，。；：？！）、]+$/, '');
+function plCleanOne(raw) {
+  raw = String(raw || '').replace(/[),.;!?\]}>»」』】，。；：？！）、]+$/, '');
   let u;
   try { u = new URL(raw); } catch { return ''; }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
@@ -3023,6 +2877,18 @@ function plCleanUrl(text) {
   u.search = qs ? '?' + qs : '';
   return u.toString().slice(0, 300);
 }
+function plCleanUrl(text) {
+  const m = String(text || '').match(/https?:\/\/[^\s"'<>]+/i);
+  return m ? plCleanOne(m[0]) : '';
+}
+// 失败原因里出现的链接也去掉令牌（上游报错经常把请求地址连同令牌一起带出来）
+function plScrub(text, max) {
+  const s = String(text == null ? '' : text).replace(PL_URL_RE, (m) => {
+    const tail = (m.match(/[),.;!?\]}>»」』】，。；：？！）、]+$/) || [''])[0];
+    return (plCleanOne(m) || '[链接]') + tail;
+  });
+  return s.replace(/\s+/g, ' ').trim().slice(0, max || 160);
+}
 async function plInput(request) {
   const u = new URL(request.url);
   let s = u.searchParams.get('url') || u.searchParams.get('text') || '';
@@ -3034,6 +2900,22 @@ async function plInput(request) {
   }
   return String(s).slice(0, 2000);
 }
+function plFlag(v) {
+  return /^(1|true|yes|on)$/i.test(String(v == null ? '' : v).trim());
+}
+function plIsPreview(request, env) {
+  if (env && plFlag(env.PARSE_ON_PREVIEW)) return false;
+  let h = '';
+  try { h = new URL(request.url).hostname.toLowerCase(); } catch { return false; }
+  return /\.pages\.dev$/.test(h) && h.split('.').length > 3;
+}
+function plJson(obj, status) {
+  return new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } });
+}
+function plPreviewResponse() {
+  const msg = '预览环境不提供解析，请到正式站使用';
+  return plJson({ ok: false, code: -1, error: msg, msg }, 403);
+}
 function plWithTimeout(p, ms) {
   let t;
   return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error('timeout')), ms); })]).finally(() => clearTimeout(t));
@@ -3042,45 +2924,55 @@ function createParseLog(site, opts) {
   opts = opts || {};
   const now = opts.now || (() => Date.now());
   const valid = typeof opts.valid === 'function' ? opts.valid : null;
-  const rand = opts.random || Math.random;
   const cache = { set: null, at: 0, pending: null };
-  const blockLogged = new Map(); // 被拉黑的请求：同一 IP / 设备每分钟最多记一行
+  const blockLogged = new Map(); // 命中的名单项 → 上次记录时间（每分钟最多记一行）
 
-  async function loadBlocklist(db) {
-    try {
-      const r = await plWithTimeout(db.prepare('SELECT type, value FROM blocklist LIMIT 5000').all(), PL_BLOCK_TIMEOUT_MS);
-      const set = new Set();
-      for (const x of (r && r.results) || []) set.add(String(x.type) + ':' + String(x.value));
-      cache.set = set;
-      cache.at = now();
-    } catch {
-      // 读失败：放行，10 秒后再试；有旧名单就继续用旧的
-      if (!cache.set) cache.set = new Set();
-      cache.at = now() - PL_BLOCK_TTL_MS + PL_BLOCK_RETRY_MS;
-    }
+  function refresh(db) {
+    if (cache.pending) return cache.pending;
+    cache.pending = (async () => {
+      try {
+        const r = await plWithTimeout(db.prepare('SELECT type, value FROM blocklist LIMIT 5000').all(), PL_BLOCK_TIMEOUT_MS);
+        const set = new Set();
+        for (const x of (r && r.results) || []) set.add(String(x.type) + ':' + String(x.value));
+        cache.set = set;
+        cache.at = now();
+      } catch {
+        // 读失败：放行，10 秒后再试；有旧名单就继续用旧的
+        if (!cache.set) cache.set = new Set();
+        cache.at = now() - PL_BLOCK_TTL_MS + PL_BLOCK_RETRY_MS;
+      }
+    })().finally(() => { cache.pending = null; });
+    return cache.pending;
   }
-  async function isBlocked(env, ip, device, fp) {
+  // 命中返回名单项（如 'ip:1.2.3.4'），没命中返回 ''
+  async function blockedBy(env, ctx, ip, device, fp) {
     const db = env && env.PARSE_DB;
-    if (!db || typeof db.prepare !== 'function') return false;
-    if (!cache.set || now() - cache.at >= PL_BLOCK_TTL_MS) {
-      if (!cache.pending) cache.pending = loadBlocklist(db).finally(() => { cache.pending = null; });
-      await cache.pending;
+    if (!db || typeof db.prepare !== 'function') return '';
+    if (!cache.set) await refresh(db); // 刚启动：等一次（最多 1.5 秒）
+    else if (now() - cache.at >= PL_BLOCK_TTL_MS && !cache.pending) {
+      const job = refresh(db); // 过期：先用旧名单，后台刷新
+      if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(job);
     }
     const s = cache.set;
-    if (!s || !s.size) return false;
-    if (ip && (s.has('ip:' + ip) || s.has('ip:' + plIp64(ip)))) return true;
-    if (device && s.has('device:' + device)) return true;
-    if (fp && s.has('fp:' + fp)) return true;
-    return false;
+    if (!s || !s.size) return '';
+    if (ip && s.has('ip:' + ip)) return 'ip:' + ip;
+    if (ip && ip.includes(':') && s.has('ip:' + plIp64(ip))) return 'ip:' + plIp64(ip);
+    if (device && s.has('device:' + device)) return 'device:' + device;
+    if (fp && s.has('fp:' + fp)) return 'fp:' + fp;
+    return '';
+  }
+  async function isBlocked(env, ip, device, fp, ctx) {
+    try { return !!(await blockedBy(env, ctx, ip, device, fp)); } catch { return false; }
   }
   function write(env, ctx, row) {
     const db = env && env.PARSE_DB;
-    if (!db || typeof db.prepare !== 'function') return null;
+    if (!db || typeof db.prepare !== 'function' || plFlag(env.PARSE_LOG_OFF)) return null;
     const job = (async () => {
       try {
-        await db.prepare('INSERT INTO parse_log (ts, site, url, ok, status, reason, ip, country, region, city, device_id, fp, ua) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .bind(row.ts, site, row.url, row.ok ? 1 : 0, row.status, row.reason, row.ip, row.country, row.region, row.city, row.device, row.fp, row.ua).run();
-        if (rand() < PL_PRUNE_RATE) await db.prepare('DELETE FROM parse_log WHERE ts < ?').bind(now() - PL_RETENTION_MS).run();
+        await plWithTimeout(
+          db.prepare('INSERT INTO parse_log (ts, site, url, ok, status, reason, ip, country, region, city, device_id, fp, ua) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+            .bind(row.ts, site, row.url, row.ok ? 1 : 0, row.status, row.reason, row.ip, row.country, row.region, row.city, row.device, row.fp, row.ua).run(),
+          PL_WRITE_TIMEOUT_MS);
       } catch {}
     })();
     if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(job);
@@ -3095,40 +2987,47 @@ function createParseLog(site, opts) {
       ua: s(request.headers.get('user-agent'), 200),
     };
   }
-  const blockedResponse = () => new Response(JSON.stringify({ ok: false, code: -1, error: PL_BLOCK_MSG, msg: PL_BLOCK_MSG }), {
-    status: 403, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
-  });
-  // 用法：return pl.wrap(request, env, ctx, () => handleParse(request, env));
+  const blockedResponse = () => plJson({ ok: false, code: -1, error: PL_BLOCK_MSG, msg: PL_BLOCK_MSG }, 403);
+  async function check(request, env, ctx) {
+    let hit = '';
+    try { hit = await blockedBy(env, ctx, plIp(request), plDevice(request), plFp(request)); } catch { hit = ''; }
+    return hit;
+  }
+  // 下载 / 媒体代理：只查黑名单，不记
+  async function guard(request, env, ctx, run) {
+    if (await check(request, env, ctx)) return blockedResponse();
+    return run();
+  }
+  // 用法：return pl.wrap(request, env, ctx, () => handleParse(request, env));  handleParse 里过了人机验证和频控后调 plPass(request)
   async function wrap(request, env, ctx, run) {
+    if (plIsPreview(request, env)) return plPreviewResponse();
     let input = '';
     try { input = await plInput(request); } catch {}
-    const ip = plIp(request), device = plDevice(request), fp = plFp(request);
-    let blocked = false;
-    try { blocked = await isBlocked(env, ip, device, fp); } catch { blocked = false; }
-    if (blocked) {
+    const hit = await check(request, env, ctx);
+    if (hit) {
       try {
-        const k = ip + '|' + device + '|' + fp, t = now();
-        if (!(t - (blockLogged.get(k) || 0) < 60000)) {
+        const t = now();
+        if (!(t - (blockLogged.get(hit) || 0) < 60000)) {
           if (blockLogged.size > 500) blockLogged.clear();
-          blockLogged.set(k, t);
+          blockLogged.set(hit, t);
           write(env, ctx, { ...baseRow(request, input), ok: false, status: 403, reason: '已拉黑，拒绝解析' });
         }
       } catch {}
       return blockedResponse();
     }
     // 无效链接（空 / 不是本站 / 格式不对）：照常交给站点处理（它会 400），但不记
-    let record = true;
-    if (valid) { try { record = !!valid(input); } catch { record = false; } }
+    let record = !!(env && env.PARSE_DB) && !plFlag(env && env.PARSE_LOG_OFF);
+    if (record && valid) { try { record = !!valid(input); } catch { record = false; } }
     if (!record) return run();
     let resp;
     try {
       resp = await run();
     } catch (e) {
-      try { write(env, ctx, { ...baseRow(request, input), ok: false, status: 500, reason: String((e && e.message) || e).slice(0, 160) }); } catch {}
+      try { if (PL_PASSED.has(request)) write(env, ctx, { ...baseRow(request, input), ok: false, status: 500, reason: plScrub((e && e.message) || e) }); } catch {}
       throw e;
     }
     try {
-      if (resp && env && env.PARSE_DB) {
+      if (resp && PL_PASSED.has(request)) {
         const row = baseRow(request, input);
         const status = resp.status;
         const isJson = (resp.headers.get('content-type') || '').toLowerCase().includes('json');
@@ -3138,7 +3037,7 @@ function createParseLog(site, opts) {
           if (clone) { try { body = await clone.json(); } catch {} }
           // 失败：非 2xx，或 ok:false，或 code 不是 0 / 200（TikTok 成功 code=0，微博成功 code=200）
           const failed = status >= 300 || !!(body && (body.ok === false || (typeof body.code === 'number' && body.code !== 0 && body.code !== 200)));
-          const msg = failed ? String((body && (body.error || body.msg || body.message)) || ('HTTP ' + status)).replace(/\s+/g, ' ').trim().slice(0, 160) : '';
+          const msg = failed ? plScrub((body && (body.error || body.msg || body.message)) || ('HTTP ' + status)) : '';
           await write(env, ctx, { ...row, ok: !failed, status, reason: msg });
         })().catch(() => {});
         if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(job);
@@ -3146,21 +3045,22 @@ function createParseLog(site, opts) {
     } catch {}
     return resp;
   }
-  return { wrap, isBlocked, write, _cache: cache };
+  return { wrap, guard, isBlocked, write, _cache: cache };
 }
-// ==== parse-log v1 END ====
+// ==== parse-log v2 END ====
 // 只记有效链接：和 handleParse 开头的本地校验同一套判断（空 / 不是本站链接 → 站点自己 400，不记）
 const pl = createParseLog('youtube', { valid: (t) => { const l = (String(t).match(/https?:\/\/[^\s"'<>]+/) || [])[0] || ''; return !!String(t).trim() && (!l || isYouTubeUrl(l)); } });
 
 /* ================= 路由 ================= */
 function routeHumanGated(pathname, request, env, ctx) {
   // 预览部署（<分支或哈希>.youtubejiexisite.pages.dev）不提供解析 / 下载类接口（预览没配人机验证，免得变成公开接口）
-  if (pfIsPreview(request, env)) return pfPreviewResponse();
-  if (pathname === '/api/parse') return pl.wrap(request, env, ctx, () => pf.wrap(request, env, ctx, () => handleParse(request, env)));
-  if (pathname === '/api/ytdl') return handleYtDl(request, env);
-  if (pathname === '/api/yt1080-start') return handleYt1080Start(request, env);
-  if (pathname === '/api/yt-direct') return handleYtDirect(request, env);
-  return handleYtHd(request, env); // /api/yt-hd
+  if (plIsPreview(request, env)) return plPreviewResponse();
+  if (pathname === '/api/parse') return pl.wrap(request, env, ctx, () => handleParse(request, env));
+  // 下载类接口也查黑名单（只查不记）
+  if (pathname === '/api/ytdl') return pl.guard(request, env, ctx, () => handleYtDl(request, env));
+  if (pathname === '/api/yt1080-start') return pl.guard(request, env, ctx, () => handleYt1080Start(request, env));
+  if (pathname === '/api/yt-direct') return pl.guard(request, env, ctx, () => handleYtDirect(request, env));
+  return pl.guard(request, env, ctx, () => handleYtHd(request, env)); // /api/yt-hd
 }
 
 const app = {
@@ -3178,7 +3078,7 @@ const app = {
       return withSetCookie(await routeHumanGated(url.pathname, request, env, ctx), gate.setCookie, gate.tokenUsed);
     }
     if (url.pathname === '/api/yt1080-status') return handleYt1080Status(request, env);
-    if (url.pathname === '/api/yt1080-file') return handleYt1080File(request, env);
+    if (url.pathname === '/api/yt1080-file') return pl.guard(request, env, ctx, () => handleYt1080File(request, env));
 
     if (url.pathname === '/api/diag')
       return json({
