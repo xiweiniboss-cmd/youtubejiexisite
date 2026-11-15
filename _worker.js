@@ -55,12 +55,196 @@ const UA_PC =
 // 附件类型白名单：浏览器传上来的 type 可被伪造，image/svg+xml 这类能带脚本的类型一律拒收
 const SAFE_ATTACH_TYPE = /^(image\/(png|jpe?g|pjpeg|gif|webp|heic|heif|avif|bmp)|video\/[a-z0-9.+-]+)$/i;
 
+/* ================= 安全辅助（Round 2）：IP 归一 / CORS 白名单 / 管理员 Cookie 登录 / 跳转逐跳校验 ================= */
+// 限流用的 IP 键：IPv4 原样；IPv6 归一到 /64（同一用户通常独占一个 /64，换后 64 位就能拿新配额）
+function ipLimitKey(ip) {
+  ip = String(ip || '').trim().toLowerCase();
+  if (!ip.includes(':')) return ip;
+  let s = ip.split('%')[0];
+  const v4 = s.match(/(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (v4 && /^::(ffff:)?[\d.]+$/.test(s)) return v4[1]; // IPv4-mapped，按 IPv4 算
+  if (v4) s = s.slice(0, -v4[1].length) + '0:0';
+  const halves = s.split('::');
+  const head = halves[0] ? halves[0].split(':') : [];
+  let parts = head;
+  if (halves.length > 1) {
+    const tail = halves[1] ? halves[1].split(':') : [];
+    parts = head.concat(Array(Math.max(0, 8 - head.length - tail.length)).fill('0'), tail);
+  }
+  parts = parts.slice(0, 4).map((x) => (parseInt(x || '0', 16) || 0).toString(16));
+  while (parts.length < 4) parts.push('0');
+  return parts.join(':') + '::/64';
+}
+function clientIpKey(request) {
+  return ipLimitKey(request.headers.get('cf-connecting-ip') || '');
+}
+
+// CORS：只给本站来源回显 Origin（同源、站点 pages.dev 域名及其预览子域、环境变量 ALLOWED_ORIGINS 里的自定义域名）
+const SITE_ORIGINS = ["https://youtubejiexisite.pages.dev"];
+function originAllowed(origin, request, env) {
+  if (!origin) return false;
+  let o;
+  try { o = new URL(origin); } catch { return false; }
+  if (origin === new URL(request.url).origin) return true;
+  const extra = String((env && env.ALLOWED_ORIGINS) || '').split(',').map((s) => s.trim().replace(/\/+$/, '')).filter(Boolean);
+  if (SITE_ORIGINS.includes(origin) || extra.includes(origin)) return true;
+  return o.protocol === 'https:' && SITE_ORIGINS.some((s) => o.hostname.endsWith('.' + new URL(s).hostname));
+}
+function applyCors(request, env, resp) {
+  if (!resp || !new URL(request.url).pathname.startsWith('/api/')) return resp;
+  const origin = request.headers.get('Origin') || '';
+  const r = new Response(resp.body, resp);
+  r.headers.delete('Access-Control-Allow-Origin');
+  if (originAllowed(origin, request, env)) r.headers.set('Access-Control-Allow-Origin', origin);
+  r.headers.append('Vary', 'Origin');
+  return r;
+}
+
+// 代理抓取：手动跟随跳转（最多 maxHops 次），每一跳都只允许 https + 白名单域名，否则返回 null
+async function fetchAllowedHops(url, init, isAllowed, maxHops = 5) {
+  let cur = String(url);
+  for (let hop = 0; hop <= maxHops; hop++) {
+    let u;
+    try { u = new URL(cur); } catch { return null; }
+    if (u.protocol !== 'https:' || !isAllowed(u.hostname)) return null;
+    const resp = await fetch(u.toString(), { ...init, redirect: 'manual' });
+    const loc = resp.headers.get('location');
+    if (resp.status >= 300 && resp.status < 400 && loc) {
+      try { if (resp.body) await resp.body.cancel(); } catch {}
+      try { cur = new URL(loc, u).toString(); } catch { return null; }
+      continue;
+    }
+    return resp;
+  }
+  return null;
+}
+
+// 管理员登录：POST /api/admin/login 校验 FEEDBACK_ADMIN_KEY 后下发 HttpOnly Cookie（HMAC 签名，12 小时有效）；
+// 管理接口不再接受地址栏 ?key=。脚本调用可用请求头 Authorization: Bearer <管理密码>。
+const ADMIN_COOKIE = 'jx_admin';
+const ADMIN_SESSION_SECS = 12 * 3600;
+const ADMIN_FAIL_MAX = 10; // 同一 IP（IPv6 /64）15 分钟内最多输错 10 次
+function safeEqual(a, b) {
+  a = String(a); b = String(b);
+  if (a.length !== b.length) return false;
+  let x = 0;
+  for (let i = 0; i < a.length; i++) x |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return x === 0;
+}
+async function adminSig(secret, exp) {
+  const enc = new TextEncoder();
+  const k = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', k, enc.encode('jx-admin|' + exp)));
+  let s = '';
+  for (const b of sig) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function adminCookieValue(request) {
+  const raw = request.headers.get('Cookie') || '';
+  for (const part of raw.split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === ADMIN_COOKIE) return part.slice(i + 1).trim();
+  }
+  return '';
+}
+async function isAdmin(request, env) {
+  const secret = String((env && env.FEEDBACK_ADMIN_KEY) || '');
+  if (!secret) return false;
+  const auth = request.headers.get('Authorization') || '';
+  if (/^Bearer /i.test(auth) && safeEqual(auth.slice(7).trim(), secret)) return true;
+  const m = adminCookieValue(request).match(/^(\d{9,11})\.([A-Za-z0-9_-]{20,})$/);
+  if (!m || Number(m[1]) < Math.floor(Date.now() / 1000)) return false;
+  return safeEqual(m[2], await adminSig(secret, m[1]));
+}
+async function adminSetCookie(env) {
+  const exp = Math.floor(Date.now() / 1000) + ADMIN_SESSION_SECS;
+  return ADMIN_COOKIE + '=' + exp + '.' + (await adminSig(String(env.FEEDBACK_ADMIN_KEY), exp)) +
+    '; Path=/; Max-Age=' + ADMIN_SESSION_SECS + '; HttpOnly; Secure; SameSite=Strict';
+}
+function adminClearCookie() {
+  return ADMIN_COOKIE + '=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict';
+}
+// 校验登录密码（带失败次数限制）：返回 { ok } 或 { ok:false, status, error }
+async function adminCheckPassword(request, env, key) {
+  const secret = String((env && env.FEEDBACK_ADMIN_KEY) || '');
+  if (!secret) return { ok: false, status: 500, error: '未配置管理密码 FEEDBACK_ADMIN_KEY' };
+  const kv = env.FEEDBACK_KV;
+  const ipk = clientIpKey(request);
+  const fk = 'admfail_' + ipk;
+  let fails = 0;
+  if (kv && ipk) {
+    try { fails = Number((await kv.get(fk)) || 0); } catch {}
+    if (fails >= ADMIN_FAIL_MAX) return { ok: false, status: 429, error: '密码错误次数过多，请 15 分钟后再试' };
+  }
+  if (!safeEqual(String(key || ''), secret)) {
+    if (kv && ipk) { try { await kv.put(fk, String(fails + 1), { expirationTtl: 900 }); } catch {} }
+    return { ok: false, status: 403, error: '密码错误' };
+  }
+  return { ok: true };
+}
+function adminJson(data, status, cookie) {
+  const h = new Headers({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+  if (cookie) h.append('Set-Cookie', cookie);
+  return new Response(JSON.stringify(data), { status: status || 200, headers: h });
+}
+async function handleAdminLogin(request, env) {
+  if (request.method !== 'POST') return adminJson({ ok: false, error: '方法不支持' }, 405);
+  let key = '';
+  try {
+    const ct = request.headers.get('content-type') || '';
+    if (ct.includes('application/json')) key = String(((await request.json()) || {}).key || '');
+    else key = String((await request.formData()).get('key') || '');
+  } catch {}
+  const r = await adminCheckPassword(request, env, key);
+  if (!r.ok) return adminJson({ ok: false, error: r.error }, r.status);
+  return adminJson({ ok: true }, 200, await adminSetCookie(env));
+}
+function handleAdminLogout(request) {
+  if (request.method !== 'POST') return adminJson({ ok: false, error: '方法不支持' }, 405);
+  return adminJson({ ok: true }, 200, adminClearCookie());
+}
+const ADMIN_PAGE_HEADERS = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY' };
+const ADMIN_LOGIN_HTML = `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>管理登录</title>
+<style>body{margin:0;font-family:-apple-system,"PingFang SC",sans-serif;background:#0f0f13;color:#f1f1f3;display:flex;min-height:100vh;align-items:center;justify-content:center}
+form{background:#1a1a21;border-radius:16px;padding:24px 20px;width:min(320px,90vw)}h1{font-size:18px;margin:0 0 14px}
+input{width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #2a2a34;background:#0f0f13;color:#f1f1f3;font-size:15px}
+button{margin-top:12px;width:100%;padding:12px;border:none;border-radius:10px;background:#FE2C55;color:#fff;font-size:15px}
+#err{color:#ff8ba0;font-size:13px;min-height:18px;margin-top:8px}</style></head>
+<body><form id="f"><h1>管理后台登录</h1><input type="password" id="k" autocomplete="current-password" placeholder="管理密码" required>
+<button type="submit">登录</button><div id="err"></div></form>
+<script>
+document.getElementById('f').onsubmit = async function(e){
+  e.preventDefault();
+  var err = document.getElementById('err'); err.textContent = '';
+  try {
+    var r = await fetch('/api/admin/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: document.getElementById('k').value }), credentials: 'same-origin' });
+    var j = await r.json();
+    if (j.ok) location.replace(location.pathname); else err.textContent = j.error || '登录失败';
+  } catch (x) { err.textContent = '网络错误'; }
+};
+<\/script></body></html>`;
+// /admin、/dashboard：已登录给页面；未登录给登录页。旧书签 ?key=密码 仍可用一次：校验通过换成 Cookie 并跳转去掉地址栏里的密码
+async function serveAdminPage(request, env, html) {
+  const url = new URL(request.url);
+  const legacy = url.searchParams.get('key');
+  if (legacy !== null) {
+    const r = await adminCheckPassword(request, env, legacy);
+    const h = new Headers({ Location: url.pathname, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+    if (r.ok) h.append('Set-Cookie', await adminSetCookie(env));
+    return new Response(null, { status: 302, headers: h });
+  }
+  if (!(await isAdmin(request, env))) return new Response(ADMIN_LOGIN_HTML, { status: 401, headers: ADMIN_PAGE_HEADERS });
+  return new Response(html, { headers: ADMIN_PAGE_HEADERS });
+}
+/* ================= 安全辅助结束 ================= */
+
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
-      'Access-Control-Allow-Origin': '*',
       'Cache-Control': 'no-store',
     },
   });
@@ -421,7 +605,7 @@ async function handleParse(request, env) {
   const firstLink = (String(shareText).match(/https?:\/\/[^\s"'<>]+/) || [])[0] || '';
   if (firstLink && !isYouTubeUrl(firstLink)) return json({ ok: false, error: '只支持 YouTube 链接（youtube.com / youtu.be）' }, 400);
   // debug 输出上游数据结构，只给带管理口令的请求
-  const debug = reqUrl.searchParams.get('debug') === '1' && checkAdminKey(reqUrl, env);
+  const debug = reqUrl.searchParams.get('debug') === '1' && (await isAdmin(request, env));
 
   // 人机验证在路由里统一做（checkHuman），这里不再重复
 
@@ -429,7 +613,7 @@ async function handleParse(request, env) {
   const PARSE_COOLDOWN_SECS = 60;
   const parseIp = request.headers.get('cf-connecting-ip') || '';
   if (parseIp && env.FEEDBACK_KV) {
-    const lastTs = await env.FEEDBACK_KV.get('pcool_youtube_' + parseIp);
+    const lastTs = await env.FEEDBACK_KV.get('pcool_youtube_' + ipLimitKey(parseIp));
     if (lastTs) {
       const remain = PARSE_COOLDOWN_SECS - Math.floor((Date.now() - Number(lastTs)) / 1000);
       if (remain > 0) return json({ ok: false, error: `解析太频繁，请 ${remain} 秒后再试` }, 429);
@@ -441,7 +625,7 @@ async function handleParse(request, env) {
   const bjDate = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
   const parseUrl = new URL(request.url);
   const deviceId = parseUrl.searchParams.get('deviceId') || '';
-  const quotaId = parseIp || deviceId; // 按 IP 计配额：deviceId 由前端传，换一个就能绕过
+  const quotaId = ipLimitKey(parseIp) || deviceId; // 按 IP 计配额：deviceId 由前端传，换一个就能绕过
   const quotaKey = 'dlimit_youtube_' + quotaId + '_' + bjDate;
   let usedToday = 0;
   if (parseIp && env.FEEDBACK_KV) {
@@ -453,7 +637,7 @@ async function handleParse(request, env) {
   try {
     const result = await parseYoutubeViaRedFox(shareText, apiKey, debug);
     if (parseIp && env.FEEDBACK_KV)
-      await env.FEEDBACK_KV.put('pcool_youtube_' + parseIp, String(Date.now()), {
+      await env.FEEDBACK_KV.put('pcool_youtube_' + ipLimitKey(parseIp), String(Date.now()), {
         expirationTtl: PARSE_COOLDOWN_SECS,
       });
     // 本站解析次数统计（仅成功计数）
@@ -558,7 +742,6 @@ function ytdlMediaResponse(resp, filename) {
   h.set('Access-Control-Expose-Headers', 'Content-Range, Content-Length');
   h.set('Content-Disposition', 'attachment; filename="' + filename + '"');
   h.set('Cache-Control', 'no-store');
-  h.set('Access-Control-Allow-Origin', '*');
   return new Response(resp.body, { status: resp.status === 206 ? 206 : 200, headers: h });
 }
 
@@ -609,12 +792,16 @@ async function ytdlResolveHit(vid, itag, step, auth) {
   return { url: fmt.url, ua: c.ua, cookie: useCookie ? auth.cookie : '' };
 }
 
+function isAllowedMediaHost(host) {
+  return isAllowedMediaUrl('https://' + host + '/');
+}
+// 手动跟随跳转（最多 5 跳），每一跳都重新校验 https + googlevideo/youtube 白名单；跳出白名单按 502 处理
 async function ytdlReadMedia(request, mediaUrl, ua, cookie, signal) {
-  const resp = await fetch(mediaUrl, {
+  const resp = await fetchAllowedHops(mediaUrl, {
     headers: ytdlUpstreamHeaders(request, ua, cookie ? { cookie } : undefined),
     signal,
-  });
-  return resp;
+  }, isAllowedMediaHost);
+  return resp || new Response(null, { status: 502 });
 }
 
 // fallbackUrl：解析当时的 googlevideo 直链。重新签发拿不到或媒体 401/403/410 时，同一次请求里再试这条。
@@ -699,10 +886,11 @@ async function handleYtDl(request, env) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 120000);
   try {
-    const resp = await fetch(mediaUrl, {
+    const resp = await fetchAllowedHops(mediaUrl, {
       headers: ytdlUpstreamHeaders(request, YT_UA[u.searchParams.get('ua') || ''] || UA_PC),
       signal: ctrl.signal,
-    });
+    }, isAllowedMediaHost);
+    if (!resp) return json({ ok: false, error: '不支持的下载地址' }, 400);
     if (!resp.ok || !resp.body) return ytdlFail(resp.status);
     return ytdlMediaResponse(resp, filename);
   } catch (e) {
@@ -759,7 +947,7 @@ async function handleFeedbackSubmit(request, env) {
   const COOLDOWN_SECS = 600;
   const clientIp = request.headers.get('cf-connecting-ip') || '';
   if (clientIp) {
-    const lastTs = await env.FEEDBACK_KV.get('cool_youtube_' + clientIp);
+    const lastTs = await env.FEEDBACK_KV.get('cool_youtube_' + ipLimitKey(clientIp));
     if (lastTs) {
       const remain = COOLDOWN_SECS - Math.floor((Date.now() - Number(lastTs)) / 1000);
       if (remain > 0)
@@ -810,20 +998,16 @@ async function handleFeedbackSubmit(request, env) {
   };
   await env.FEEDBACK_KV.put(id, JSON.stringify(record));
   if (clientIp)
-    await env.FEEDBACK_KV.put('cool_youtube_' + clientIp, String(Date.now()), {
+    await env.FEEDBACK_KV.put('cool_youtube_' + ipLimitKey(clientIp), String(Date.now()), {
       expirationTtl: COOLDOWN_SECS,
     });
   return json({ ok: true });
 }
 
-function checkAdminKey(url, env) {
-  const key = env.FEEDBACK_ADMIN_KEY || '';
-  return !!key && url.searchParams.get('key') === key;
-}
 
 async function handleFeedbackList(request, env) {
   const url = new URL(request.url);
-  if (!checkAdminKey(url, env)) return json({ ok: false, error: '无权访问' }, 403);
+  if (!(await isAdmin(request, env))) return json({ ok: false, error: '无权访问' }, 403);
   if (!env.FEEDBACK_KV) return json({ ok: false, error: '未绑定 KV' }, 500);
   const items = [];
   for (const prefix of ['fb_', 'feedback_']) {
@@ -849,7 +1033,7 @@ async function handleFeedbackList(request, env) {
 
 async function handleFeedbackDelete(request, env) {
   const url = new URL(request.url);
-  if (!checkAdminKey(url, env)) return json({ ok: false, error: '无权访问' }, 403);
+  if (!(await isAdmin(request, env))) return json({ ok: false, error: '无权访问' }, 403);
   if (!env.FEEDBACK_KV) return json({ ok: false, error: '未绑定 KV' }, 500);
   const id = url.searchParams.get('id') || '';
   if (!/^fb_[a-z0-9_]+$/i.test(id)) return json({ ok: false, error: '参数错误' }, 400);
@@ -873,7 +1057,7 @@ async function handleFeedbackDelete(request, env) {
 
 async function handleFeedbackFile(request, env) {
   const url = new URL(request.url);
-  if (!checkAdminKey(url, env)) return new Response('无权访问', { status: 403 });
+  if (!(await isAdmin(request, env))) return new Response('无权访问', { status: 403 });
   if (!env.FEEDBACK_BUCKET) return new Response('未绑定存储', { status: 500 });
   const m = url.pathname.match(/^\/api\/fb-file\/(.+)$/);
   const key = m ? decodeURIComponent(m[1]) : '';
@@ -911,11 +1095,11 @@ h1{font-size:20px;margin:8px 0 4px}h1 span{font-size:13px;color:#888;font-weight
 </style></head>
 <body><div class="wrap">
 <h1>用户反馈 <span id="count"></span></h1>
-<div style="margin:6px 0 4px"><a href="/dashboard?key=" id="dashLink" style="font-size:13px;color:#FE2C55">📊 数据总览</a></div>
-<script>document.getElementById('dashLink').href = '/dashboard?key=' + encodeURIComponent(new URLSearchParams(location.search).get('key') || '');</script>
+<div style="margin:6px 0 4px"><a href="/dashboard" id="dashLink" style="font-size:13px;color:#FE2C55">📊 数据总览</a></div>
+ <a href="#" id="logoutLink" style="font-size:13px;color:#999;margin-left:10px">退出登录</a>
+<script>document.getElementById('logoutLink').onclick = function(e){ e.preventDefault(); fetch('/api/admin/logout', { method: 'POST' }).then(function(){ location.reload(); }); };</script>
 <div id="list">加载中…</div>
 </div><script>
-const key = new URLSearchParams(location.search).get('key') || '';
 const esc = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const COUNTRY_ZH = {CN:'中国',US:'美国',JP:'日本',KR:'韩国',HK:'香港',TW:'台湾',MO:'澳门',SG:'新加坡',GB:'英国',DE:'德国',FR:'法国',IT:'意大利',ES:'西班牙',CA:'加拿大',AU:'澳大利亚',NZ:'新西兰',RU:'俄罗斯',IN:'印度',BR:'巴西',MX:'墨西哥',AR:'阿根廷',KR:'韩国',TH:'泰国',MY:'马来西亚',ID:'印度尼西亚',PH:'菲律宾',VN:'越南',TR:'土耳其',AE:'阿联酋',SA:'沙特',EG:'埃及',ZA:'南非',NL:'荷兰',SE:'瑞典',NO:'挪威',FI:'芬兰',DK:'丹麦',PL:'波兰',UA:'乌克兰',CH:'瑞士',AT:'奥地利',BE:'比利时',IE:'爱尔兰',PT:'葡萄牙',GR:'希腊',CZ:'捷克',HU:'匈牙利',RO:'罗马尼亚',IL:'以色列',KZ:'哈萨克斯坦'};
 function geoName(it){
@@ -941,7 +1125,7 @@ const siteName = (p) => {
 async function load() {
   const box = document.getElementById('list');
   try {
-    const r = await fetch('/api/feedback/list?key=' + encodeURIComponent(key));
+    const r = await fetch('/api/feedback/list');
     const j = await r.json();
     if (!j.ok) { box.innerHTML = '<div class="empty">加载失败：' + esc(j.error) + '</div>'; return; }
     document.getElementById('count').textContent = '共 ' + j.count + ' 条';
@@ -967,7 +1151,7 @@ async function load() {
       if (it.attachments && it.attachments.length) {
         const att = document.createElement('div');
         for (const a of it.attachments) {
-          const src = '/api/fb-file/' + encodeURIComponent(a.key) + '?key=' + encodeURIComponent(key);
+          const src = '/api/fb-file/' + encodeURIComponent(a.key);
           const fname = esc(String(a.name || 'attachment'));
           if (String(a.type || '').startsWith('image/')) {
             att.innerHTML += '<img src="' + src + '" style="max-width:100%;border-radius:8px;margin-top:8px;display:block" loading="lazy">';
@@ -982,7 +1166,7 @@ async function load() {
       btn.textContent = '删除';
       btn.onclick = async () => {
         if (!confirm('删除这条反馈？')) return;
-        await fetch('/api/feedback?id=' + encodeURIComponent(it.id) + '&key=' + encodeURIComponent(key), { method: 'DELETE' });
+        await fetch('/api/feedback?id=' + encodeURIComponent(it.id), { method: 'DELETE' });
         load();
       };
       d.appendChild(btn);
@@ -1053,16 +1237,14 @@ h2{font-size:16px;margin:24px 0 12px;color:#f1f1f3}
 <div class="panel" id="histList"><div style="color:#9a9aa3;font-size:13px;text-align:center">加载中…</div></div>
 
 <div class="refresh"><button onclick="load()">🔄 刷新</button></div>
-<div class="links"><a href="/admin?key=" id="adminLink">💬 反馈管理</a></div>
+<div class="links"><a href="/admin" id="adminLink">💬 反馈管理</a></div>
 </div><script>
-const key = new URLSearchParams(location.search).get('key') || '';
-document.getElementById('adminLink').href = '/admin?key=' + encodeURIComponent(key);
 const COLORS = ['#FE2C55','#25F4EE','#FFC107','#9C27B0','#FF7A1A','#4CAF50'];
 const COUNTRY_ZH = {CN:'中国',US:'美国',JP:'日本',KR:'韩国',HK:'香港',TW:'台湾',MO:'澳门',SG:'新加坡',GB:'英国',DE:'德国',FR:'法国',IT:'意大利',ES:'西班牙',CA:'加拿大',AU:'澳大利亚',NZ:'新西兰',RU:'俄罗斯',IN:'印度',BR:'巴西',MX:'墨西哥',TH:'泰国',MY:'马来西亚',ID:'印度尼西亚',PH:'菲律宾',VN:'越南',TR:'土耳其',AE:'阿联酋',XX:'未知'};
 async function load(){
   const grid = document.getElementById('grid');
   try{
-    const r = await fetch('/api/stats-all?key=' + encodeURIComponent(key));
+    const r = await fetch('/api/stats-all');
     const j = await r.json();
     if(!j.ok){ grid.innerHTML = '<div class="err">加载失败：' + (j.error || '未知错误') + '</div>'; return; }
     const sites = j.sites;
@@ -1088,7 +1270,7 @@ function escH(s){ return String(s || '').replace(/[&<>"']/g, function(c){ return
 async function loadHistory(){
   const box = document.getElementById('histList');
   try{
-    const r = await fetch('/api/parse-history?key=' + encodeURIComponent(key));
+    const r = await fetch('/api/parse-history');
     const j = await r.json();
     if(!j.ok || !j.items || !j.items.length){ box.innerHTML = '<div style="color:#9a9aa3;font-size:13px;text-align:center">暂无数据（新解析才会记录）</div>'; return; }
     box.innerHTML = '';
@@ -1107,7 +1289,7 @@ async function loadHistory(){
 }
 async function loadGeo(){
   try{
-    const r = await fetch('/api/geo-stats?key=' + encodeURIComponent(key));
+    const r = await fetch('/api/geo-stats');
     const j = await r.json();
     if(!j.ok) return;
     const byCountry = j.byCountry || {};
@@ -1182,7 +1364,7 @@ load();
 
 async function handleParseHistory(request, env) {
   const url = new URL(request.url);
-  if (!checkAdminKey(url, env)) return json({ ok: false, error: '无权访问' }, 403);
+  if (!(await isAdmin(request, env))) return json({ ok: false, error: '无权访问' }, 403);
   const siteNames = { tiktok: 'TikTok站', xhs: '小红书站', douyin: '抖音站', youtube: 'YouTube站', bilibili: 'B站站', kuaishou: '快手站' };
   const all = [];
   if (env.FEEDBACK_KV) {
@@ -1201,7 +1383,7 @@ async function handleParseHistory(request, env) {
 /* ================= 解析者归属地分布 ================= */
 async function handleGeoStats(request, env) {
   const url = new URL(request.url);
-  if (!checkAdminKey(url, env)) return json({ ok: false, error: '无权访问' }, 403);
+  if (!(await isAdmin(request, env))) return json({ ok: false, error: '无权访问' }, 403);
   const byCountry = {};
   const bySite = { tiktok: {}, xhs: {}, douyin: {}, youtube: {}, bilibili: {}, kuaishou: {} };
   if (env.FEEDBACK_KV) {
@@ -1228,7 +1410,7 @@ async function handleParseQuota(request, env) {
   const url = new URL(request.url);
   const ip = request.headers.get('cf-connecting-ip') || '';
   const deviceId = url.searchParams.get('deviceId') || '';
-  const quotaId = ip || deviceId; // 与解析接口一致，按 IP 查
+  const quotaId = ipLimitKey(ip) || deviceId; // 与解析接口一致，按 IP 查
   const bjDate = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
   let used = 0;
   if (quotaId && env.FEEDBACK_KV) {
@@ -1240,7 +1422,7 @@ async function handleParseQuota(request, env) {
 /* ================= 数据总览 ================= */
 async function handleStatsAll(request, env) {
   const url = new URL(request.url);
-  if (!checkAdminKey(url, env)) return json({ ok: false, error: '无权访问' }, 403);
+  if (!(await isAdmin(request, env))) return json({ ok: false, error: '无权访问' }, 403);
   const sites = [
     { key: 'stats_parse_tiktok', name: 'TikTok站' },
     { key: 'stats_parse_xhs', name: '小红书站' },
@@ -2019,10 +2201,38 @@ async function mergePassthrough(resp) {
     status: resp.status,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
-      'Access-Control-Allow-Origin': '*',
       'Cache-Control': 'no-store',
     },
   });
+}
+export const MERGE_LIMIT_HOUR = 5;
+export const MERGE_LIMIT_DAY = 15;
+async function mergeRateCheck(request, env) {
+  const kv = env.FEEDBACK_KV;
+  const ipk = clientIpKey(request);
+  const noop = { deny: null, commit: async () => {} };
+  if (!kv || !ipk) return noop;
+  const now = new Date(Date.now() + 8 * 3600 * 1000).toISOString();
+  const hk = 'mrl_h_' + ipk + '_' + now.slice(0, 13);
+  const dk = 'mrl_d_' + ipk + '_' + now.slice(0, 10);
+  let h = 0, d = 0;
+  try {
+    h = Number((await kv.get(hk)) || 0);
+    d = Number((await kv.get(dk)) || 0);
+  } catch { return noop; }
+  if (d >= MERGE_LIMIT_DAY)
+    return { deny: json({ ok: false, code: 'MERGE_RATE_LIMIT', error: '今天的服务器合并次数已用完（每天 ' + MERGE_LIMIT_DAY + ' 次），明天再来吧' }, 429), commit: noop.commit };
+  if (h >= MERGE_LIMIT_HOUR)
+    return { deny: json({ ok: false, code: 'MERGE_RATE_LIMIT', error: '服务器合并太频繁了（每小时最多 ' + MERGE_LIMIT_HOUR + ' 次），请稍后再试' }, 429), commit: noop.commit };
+  return {
+    deny: null,
+    commit: async () => {
+      try {
+        await kv.put(hk, String(h + 1), { expirationTtl: 7200 });
+        await kv.put(dk, String(d + 1), { expirationTtl: 172800 });
+      } catch {}
+    },
+  };
 }
 async function handleYt1080Start(request, env) {
   const token = mergeToken(env);
@@ -2037,6 +2247,9 @@ async function handleYt1080Start(request, env) {
   const ytVid = ytLink && isYouTubeUrl(ytLink) ? extractVideoId(ytLink) : null;
   if (!ytVid) return json({ ok: false, error: '只支持单个 YouTube 视频链接（youtube.com / youtu.be）' }, 400);
   const safeYtUrl = 'https://www.youtube.com/watch?v=' + ytVid;
+  // 合并任务很吃 EC2：同一 IP（IPv6 按 /64）每小时最多 MERGE_LIMIT_HOUR 次、每天（北京时间）最多 MERGE_LIMIT_DAY 次
+  const mergeRate = await mergeRateCheck(request, env);
+  if (mergeRate.deny) return mergeRate.deny;
   const qualityRaw = parseInt(reqUrl.searchParams.get('quality') || '1080', 10);
   const quality = [360, 720, 1080].includes(qualityRaw) ? qualityRaw : 1080;
   const modeRaw = reqUrl.searchParams.get('mode') || 'merged';
@@ -2054,6 +2267,7 @@ async function handleYt1080Start(request, env) {
         merge_output_format: 'mp4',
       }),
     });
+    if (resp.ok) await mergeRate.commit(); // 只有 EC2 真正接下任务才计数（连不上 / 排队满不扣次数）
     return mergePassthrough(resp);
   } catch (e) {
     return mergeConnectError(e);
@@ -2123,7 +2337,6 @@ async function handleYt1080File(request, env) {
     headers.set('Content-Disposition', 'attachment; filename="' + ascii + '"; filename*=UTF-8\'\'' + rfc5987(fname));
     headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition');
     headers.set('Cache-Control', 'no-store');
-    headers.set('Access-Control-Allow-Origin', '*');
     return new Response(withKnownLength(stream, resp.headers.get('content-length'), resp.headers.get('content-encoding')), { status: 200, headers });
   } catch (e) {
     return mergeConnectError(e);
@@ -2488,7 +2701,7 @@ function routeHumanGated(pathname, request, env) {
   return handleYtHd(request, env); // /api/yt-hd
 }
 
-export default {
+const app = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
@@ -2541,26 +2754,10 @@ export default {
     if (url.pathname === '/api/parse-quota') return handleParseQuota(request, env);
     if (url.pathname === '/api/geo-stats') return handleGeoStats(request, env);
     if (url.pathname === '/api/parse-history') return handleParseHistory(request, env);
-    if (url.pathname === '/dashboard') {
-      if (!checkAdminKey(url, env))
-        return new Response('无权访问：在地址后加上 ?key=你的管理密码，例如 /dashboard?key=xxx', {
-          status: 403,
-          headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-        });
-      return new Response(DASHBOARD_HTML, {
-        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY' },
-      });
-    }
-    if (url.pathname === '/admin') {
-      if (!checkAdminKey(url, env))
-        return new Response('无权访问：在地址后加上 ?key=你的管理密码，例如 /admin?key=xxx', {
-          status: 403,
-          headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-        });
-      return new Response(ADMIN_HTML, {
-        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY' },
-      });
-    }
+    if (url.pathname === '/dashboard') return serveAdminPage(request, env, DASHBOARD_HTML);
+    if (url.pathname === '/api/admin/login') return handleAdminLogin(request, env);
+    if (url.pathname === '/api/admin/logout') return handleAdminLogout(request);
+    if (url.pathname === '/admin') return serveAdminPage(request, env, ADMIN_HTML);
 
     if (env.ASSETS && typeof env.ASSETS.fetch === 'function') {
       try {
@@ -2568,5 +2765,12 @@ export default {
       } catch {}
     }
     return new Response('Not Found', { status: 404 });
+  },
+};
+
+// 所有 /api/* 响应统一走 CORS 白名单（不再是 Access-Control-Allow-Origin: *）
+export default {
+  async fetch(request, env, ctx) {
+    return applyCors(request, env, await app.fetch(request, env, ctx));
   },
 };

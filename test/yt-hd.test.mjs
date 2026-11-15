@@ -610,7 +610,7 @@ test('ytdl re-resolves itag in the same request, forwards Range, and ignores a s
     assert.equal(res.headers.get('Content-Type'), 'video/mp4');
     assert.equal(res.headers.get('Content-Range'), 'bytes 0-99/1000');
     assert.equal(res.headers.get('Content-Length'), '4');
-    assert.equal(res.headers.get('Access-Control-Allow-Origin'), '*');
+    assert.equal(res.headers.get('Access-Control-Allow-Origin'), null); // 无 Origin（同源导航）不回 CORS 头
     assert.equal(res.headers.get('Access-Control-Expose-Headers'), 'Content-Range, Content-Length');
     assert.match(res.headers.get('Content-Disposition') || '', /filename="clip\.mp4"/);
     assert.equal(res.headers.get('Accept-Ranges'), 'bytes');
