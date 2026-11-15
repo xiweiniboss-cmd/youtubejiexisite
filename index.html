@@ -901,7 +901,11 @@ var deviceId = (function(){
         setTimeout(function(){
           try {
             var el = document.getElementById('tsWidget');
-            if (el && el.offsetParent !== null) {
+            // #tsWidget 在没内容时是 display:none（jiexi.css 的 :empty 规则），以前拿它的 offsetParent 判断永远是 null，
+            // 组件从来没渲染出来，反馈一直提示「验证组件加载失败」。改成看弹层本身是否打开，渲染前先把容器撑开。
+            var fbWrapEl = document.getElementById('fbWrap');
+            if (el && fbWrapEl && fbWrapEl.classList.contains('show') && getComputedStyle(fbWrapEl).display !== 'none') {
+              el.style.display = 'block';
               tsWidgetId = turnstile.render(el, { sitekey: siteKey, theme: 'dark', language: 'zh-cn' });
             } else {
               showFbError('验证组件加载失败，请关闭重试。');
