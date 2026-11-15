@@ -14,7 +14,8 @@ function memKV() {
 function fakeD1() {
   const db = new DatabaseSync(':memory:');
   db.exec("CREATE TABLE parse_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, site TEXT NOT NULL, url TEXT NOT NULL DEFAULT '', ok INTEGER NOT NULL DEFAULT 0, status INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', country TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '', device_id TEXT NOT NULL DEFAULT '', ua TEXT NOT NULL DEFAULT '', fp TEXT NOT NULL DEFAULT '')");
-  return { db, prepare(sql) { let a = []; const st = { bind(...x) { a = x; return st; }, async run() { db.prepare(sql).run(...a); return { success: true }; }, async all() { return { results: db.prepare(sql).all(...a) }; } }; return st; } };
+  db.exec("CREATE TABLE rate_counter (k TEXT PRIMARY KEY, n INTEGER NOT NULL DEFAULT 0, last INTEGER NOT NULL DEFAULT 0, exp INTEGER NOT NULL DEFAULT 0)");
+  return { db, prepare(sql) { let a = []; const st = { bind(...x) { a = x; return st; }, async run() { db.prepare(sql).run(...a); return { success: true }; }, async all() { return { results: db.prepare(sql).all(...a) }; }, async first() { return db.prepare(sql).get(...a) || null; } }; return st; } };
 }
 
 test('parse 上游失败 → D1 parse_log 记一行 ok=0（链接不带 si 等参数），不写 pf_ KV，响应照旧 502', async () => {

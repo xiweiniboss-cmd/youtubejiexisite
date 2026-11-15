@@ -78,7 +78,8 @@ function ipLimitKey(ip) {
 // ================= 原子频控（D1 rate_counter，和微博站共用同一张表） =================
 // 冷却 60 秒 + 每 IP（IPv6 按 /64）每天（北京时间）20 次。解析之前用一条 UPSERT 原子地「判断 + 占坑」：
 //   并发一批请求只有第一个能占到坑；失败的解析也算一次（不能拿坏链接无限刷上游接口）。
-// 没绑 PARSE_DB / D1 出错：退回 KV，同样先占坑再解析（KV 非原子，只是兜底）。
+// D1 出错 / 超过 2 秒：直接拒绝（503「服务繁忙，请稍后再试」），不再退回 KV。
+// 只有根本没绑 PARSE_DB（本地 / 测试）才用 KV 先占坑（非原子，只是兜底）；KV 也出错同样拒绝。
 const RL_COOLDOWN_SECS = 60;
 const RL_DAILY_LIMIT = 20;
 const RL_TIMEOUT_MS = 2000;
@@ -89,15 +90,16 @@ function rlWithTimeout(p, ms) {
   let t;
   return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error('timeout')), ms); })]).finally(() => clearTimeout(t));
 }
-function rlDeny(now, last, used) {
-  if (last && now - last < RL_COOLDOWN_SECS * 1000) {
-    const wait = Math.ceil((RL_COOLDOWN_SECS * 1000 - (now - last)) / 1000);
+const RL_BUSY = { ok: false, status: 503, msg: '服务繁忙，请稍后再试' };
+function rlDeny(now, last, used, limit = RL_DAILY_LIMIT, cooldownSecs = RL_COOLDOWN_SECS) {
+  if (cooldownSecs > 0 && last && now - last < cooldownSecs * 1000) {
+    const wait = Math.ceil((cooldownSecs * 1000 - (now - last)) / 1000);
     return { ok: false, status: 429, msg: '解析太频繁，请 ' + wait + ' 秒后再试' };
   }
-  if (used >= RL_DAILY_LIMIT) return { ok: false, status: 429, msg: '今日解析次数已用完（' + RL_DAILY_LIMIT + ' 次），明天再来吧' };
+  if (used >= limit) return { ok: false, status: 429, msg: '今日解析次数已用完（' + limit + ' 次），明天再来吧' };
   return null;
 }
-async function rateTake(env, site, rawIp) {
+async function rateTake(env, site, rawIp, limit = RL_DAILY_LIMIT, cooldownSecs = RL_COOLDOWN_SECS) {
   const ip = ipLimitKey(rawIp);
   if (!ip) return { ok: true };
   const now = Date.now();
@@ -108,11 +110,11 @@ async function rateTake(env, site, rawIp) {
       const got = await rlWithTimeout(db.prepare(
         'INSERT INTO rate_counter (k, n, last, exp) VALUES (?, 1, ?, ?) ON CONFLICT(k) DO UPDATE SET n = n + 1, last = excluded.last ' +
         'WHERE rate_counter.last <= ? AND rate_counter.n < ? RETURNING n'
-      ).bind(k, now, now + 2 * 86400000, now - RL_COOLDOWN_SECS * 1000, RL_DAILY_LIMIT).first(), RL_TIMEOUT_MS);
+      ).bind(k, now, now + 2 * 86400000, now - cooldownSecs * 1000, limit).first(), RL_TIMEOUT_MS);
       if (got) return { ok: true };
       const cur = await rlWithTimeout(db.prepare('SELECT n, last FROM rate_counter WHERE k = ?').bind(k).first(), RL_TIMEOUT_MS);
-      return rlDeny(now, Number(cur && cur.last) || 0, Number(cur && cur.n) || 0) || { ok: false, status: 429, msg: '解析太频繁，请稍后再试' };
-    } catch (e) { /* D1 出错：退回 KV */ }
+      return rlDeny(now, Number(cur && cur.last) || 0, Number(cur && cur.n) || 0, limit, cooldownSecs) || { ok: false, status: 429, msg: '解析太频繁，请稍后再试' };
+    } catch (e) { return RL_BUSY; } // D1 挂了 / 超时：拒绝，不退回 KV
   }
   const kv = env && env.FEEDBACK_KV;
   if (kv) {
@@ -120,13 +122,13 @@ async function rateTake(env, site, rawIp) {
       const ck = 'pcool_' + site + '_' + ip, qk = 'dlimit_' + site + '_' + ip + '_' + rlDate();
       const [lastTs, usedRaw] = await Promise.all([kv.get(ck), kv.get(qk)]);
       const used = Number(usedRaw) || 0;
-      const deny = rlDeny(now, Number(lastTs) || 0, used);
+      const deny = rlDeny(now, Number(lastTs) || 0, used, limit, cooldownSecs);
       if (deny) return deny;
       await Promise.all([
-        kv.put(ck, String(now), { expirationTtl: RL_COOLDOWN_SECS }),
+        cooldownSecs > 0 ? kv.put(ck, String(now), { expirationTtl: Math.max(60, cooldownSecs) }) : null,
         kv.put(qk, String(used + 1), { expirationTtl: 172800 }),
       ]);
-    } catch {}
+    } catch { return RL_BUSY; }
   }
   return { ok: true };
 }
@@ -143,6 +145,50 @@ async function rateUsed(env, site, rawIp) {
   try { return Number((await env.FEEDBACK_KV.get('dlimit_' + site + '_' + ip + '_' + rlDate())) || 0); } catch { return 0; }
 }
 // 人机验证 fail-closed：没配 TURNSTILE_SECRET_KEY 就拒绝解析，除非明确设了 TURNSTILE_DISABLED=1
+
+// ================= yt-hd / yt-direct 计数 + 小票 =================
+// 前端解析成功后会自动打一次 /api/yt-hd，所以它们不跟解析抢同一个坑：
+//   解析成功 → 给「这个视频 ID + 这个 IP」发一张 10 分钟的小票：yt-hd 限用 1 次、yt-direct 限用 2 次，带票不扣次数；
+//   没票（或票用完 / 过期 / 换了 IP 或视频）→ 扣 yt-hd 和 yt-direct 共用的单独计数：每 IP 每天 20 次，不设冷却。
+// 小票存在 D1 rate_counter（n = 已用次数，exp = 过期时间），用一条带条件的 UPDATE 原子核销，并发也只能用够限定次数。
+const YT_TICKET_TTL_MS = 10 * 60 * 1000;
+const YT_TICKET_USES = { hd: 1, direct: 2 };
+const YT_EXTRA_DAILY_LIMIT = 20;
+function ytTicketKey(kind, ip, vid) { return 'ytt:' + kind + ':' + ip + ':' + vid; }
+async function ytTicketIssue(env, rawIp, vid) {
+  const ip = ipLimitKey(rawIp);
+  const db = env && env.PARSE_DB;
+  if (!ip || !vid || !db || typeof db.prepare !== 'function') return;
+  const exp = Date.now() + YT_TICKET_TTL_MS;
+  for (const kind of Object.keys(YT_TICKET_USES)) {
+    try {
+      await rlWithTimeout(db.prepare(
+        'INSERT INTO rate_counter (k, n, last, exp) VALUES (?, 0, 0, ?) ON CONFLICT(k) DO UPDATE SET n = 0, last = 0, exp = excluded.exp'
+      ).bind(ytTicketKey(kind, ip, vid), exp).run(), RL_TIMEOUT_MS);
+    } catch {}
+  }
+}
+async function ytTicketUse(env, kind, rawIp, vid) {
+  const ip = ipLimitKey(rawIp);
+  const db = env && env.PARSE_DB;
+  if (!ip || !vid || !db || typeof db.prepare !== 'function') return false;
+  try {
+    const got = await rlWithTimeout(db.prepare(
+      'UPDATE rate_counter SET n = n + 1, last = ? WHERE k = ? AND n < ? AND exp > ? RETURNING n'
+    ).bind(Date.now(), ytTicketKey(kind, ip, vid), YT_TICKET_USES[kind], Date.now()).first(), RL_TIMEOUT_MS);
+    return !!got;
+  } catch { return false; }
+}
+// 带票放行；没票扣 yt-hd / yt-direct 的单独计数（D1 挂了照样拒绝）
+async function ytExtraTake(request, env, kind, vid) {
+  const ip = request.headers.get('cf-connecting-ip') || '';
+  if (await ytTicketUse(env, kind, ip, vid)) return { ok: true };
+  const rl = await rateTake(env, 'youtube_hd', ip, YT_EXTRA_DAILY_LIMIT, 0);
+  if (!rl.ok && rl.status === 429) return { ok: false, status: 429, msg: '今日高清获取次数已用完（' + YT_EXTRA_DAILY_LIMIT + ' 次），明天再来吧' };
+  return rl;
+}
+// ================= 小票 end =================
+
 function turnstileDisabled(env) {
   return /^(1|true|yes|on)$/i.test(String((env && env.TURNSTILE_DISABLED) || '').trim());
 }
@@ -386,9 +432,9 @@ function isYouTubeUrl(u) {
   }
 }
 export const HUMAN_PASS_COOKIE = 'yt_hp';
-export const HUMAN_PASS_TTL_SECS = 30 * 60;
+export const HUMAN_PASS_TTL_SECS = 5 * 60;
 export const HUMAN_PASS_MAX_AGE_SECS = 2 * 60 * 60; // 续期封顶：距第一次真验证最多 2 小时
-const HUMAN_PASS_RENEW_BELOW_SECS = 10 * 60; // 剩余不足 10 分钟时顺手续期（长下载 / 分段合并不会中途 403）
+const HUMAN_PASS_RENEW_BELOW_SECS = 3 * 60; // 剩余不足 3 分钟时顺手续期（长下载 / 分段合并不会中途 403）
 // 距 2 小时封顶不足 15 分钟时，如果请求里正好带了新的 Turnstile token，就真验一次并换一张全新通行证（重新计 2 小时）
 export const HUMAN_PASS_REFRESH_NEAR_CAP_SECS = 15 * 60;
 export const HUMAN_PATHS = new Set(['/api/parse', '/api/yt-hd', '/api/ytdl', '/api/yt1080-start', '/api/yt-direct']);
@@ -748,6 +794,7 @@ async function handleParse(request, env) {
         await env.FEEDBACK_KV.put(hk, JSON.stringify(hist.slice(0, 20)));
       } catch {}
     }
+    await ytTicketIssue(env, parseIp, result && result.videoId);
     return json({ ok: true, ...result });
   } catch (e) {
     const body = { ok: false, error: e.message || '解析失败' };
@@ -2004,6 +2051,8 @@ async function handleYtHd(request, env) {
   const m = src.match(/(?:[?&]v=|youtu\.be\/|shorts\/|embed\/|live\/)([A-Za-z0-9_-]{11})/) || src.match(/^([A-Za-z0-9_-]{11})$/);
   if (!m) return json({ ok: false, error: '没找到视频 ID' }, 400);
   const vid = m[1];
+  const xrl = await ytExtraTake(request, env, 'hd', vid);
+  if (!xrl.ok) return json({ ok: false, code: 'RATE_LIMITED', error: xrl.msg }, xrl.status);
   const auth = await ytAuthFromEnv(env);
   const tried = [];
   const state = {
@@ -2796,6 +2845,8 @@ async function handleYtDirect(request, env) {
   const m = ytUrl.match(/[?&]v=([A-Za-z0-9_-]{6,20})/) || ytUrl.match(/youtu\.be\/([A-Za-z0-9_-]{6,20})/);
   if (!m) return json({ ok: false, error: '请先粘贴 YouTube 分享链接' }, 400);
   const vid = m[1];
+  const xrl = await ytExtraTake(request, env, 'direct', vid);
+  if (!xrl.ok) return json({ ok: false, code: 'RATE_LIMITED', error: xrl.msg }, xrl.status);
   const results = [];
   // Method 1: InnerTube WEB client
   try {
