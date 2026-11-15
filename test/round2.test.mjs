@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import worker, { MERGE_LIMIT_HOUR, MERGE_LIMIT_DAY } from '../_worker.js';
+// 本地测试默认不配人机验证密钥：显式声明跳过（生产缺密钥会 fail-closed 503）
+{ const _f = worker.fetch.bind(worker); worker.fetch = (r, e, c) => _f(r, { TURNSTILE_DISABLED: '1', ...(e || {}) }, c); }
+
 
 function memKV() {
   const m = new Map();
@@ -20,7 +23,7 @@ const ec2Ok = (n) => new Response(JSON.stringify({ ok: true, job_id: 'job' + n }
 
 test('merge start: reserve-first — counters are incremented BEFORE EC2 is called; lock blocks a 2nd start; hourly cap (IPv6 /64)', async () => {
   const kv = memKV();
-  const env = { YT_MERGE_TOKEN: 't', FEEDBACK_KV: kv };
+  const env = { TURNSTILE_DISABLED: '1', YT_MERGE_TOKEN: 't', FEEDBACK_KV: kv };
   const ipk = '2001:db8:aa:bb::/64';
   let ec2 = 0;
   await withFetch(async () => {
@@ -54,7 +57,7 @@ test('merge start: reserve-first — counters are incremented BEFORE EC2 is call
 
 test('merge start: refund + unlock when EC2 rejects (queue full / 5xx) or is unreachable', async () => {
   const kv = memKV();
-  const env = { YT_MERGE_TOKEN: 't', FEEDBACK_KV: kv };
+  const env = { TURNSTILE_DISABLED: '1', YT_MERGE_TOKEN: 't', FEEDBACK_KV: kv };
   let mode = 'full';
   await withFetch(async () => {
     if (mode === 'down') throw new Error('connect ECONNREFUSED');
@@ -74,7 +77,7 @@ test('merge start: refund + unlock when EC2 rejects (queue full / 5xx) or is unr
 
 test('merge start: concurrent burst from one /64 — only one request reaches EC2', async () => {
   const kv = memKV();
-  const env = { YT_MERGE_TOKEN: 't', FEEDBACK_KV: kv };
+  const env = { TURNSTILE_DISABLED: '1', YT_MERGE_TOKEN: 't', FEEDBACK_KV: kv };
   let ec2 = 0;
   await withFetch(async () => { ec2++; await new Promise((r) => setTimeout(r, 30)); return ec2Ok(ec2); }, async () => {
     const rs = await Promise.all(Array.from({ length: 12 }, (_, i) =>
@@ -99,7 +102,7 @@ test('merge start: daily cap', async () => {
 });
 
 test('CORS: allowlist echo + Vary, foreign origin gets no ACAO, no-Origin same-origin still works', async () => {
-  const env = { FEEDBACK_KV: memKV() };
+  const env = { TURNSTILE_DISABLED: '1', FEEDBACK_KV: memKV() };
   let r = await call('/api/stats', { headers: { Origin: 'https://evil.example' } }, env);
   assert.equal(r.status, 200);
   assert.equal(r.headers.get('Access-Control-Allow-Origin'), null);
@@ -114,7 +117,7 @@ test('CORS: allowlist echo + Vary, foreign origin gets no ACAO, no-Origin same-o
 test('admin: cookie login flow replaces ?key=, attachments served via cookie', async () => {
   const kv = memKV();
   const r2 = new Map([['fb/a/1.jpg', 'image/jpeg']]);
-  const env = { FEEDBACK_KV: kv, FEEDBACK_ADMIN_KEY: 'secret-key', FEEDBACK_BUCKET: { get: async (k) => (r2.has(k) ? { body: 'JPG', writeHttpMetadata: (h) => h.set('Content-Type', r2.get(k)) } : null) } };
+  const env = { TURNSTILE_DISABLED: '1', FEEDBACK_KV: kv, FEEDBACK_ADMIN_KEY: 'secret-key', FEEDBACK_BUCKET: { get: async (k) => (r2.has(k) ? { body: 'JPG', writeHttpMetadata: (h) => h.set('Content-Type', r2.get(k)) } : null) } };
   const file = '/api/fb-file/' + encodeURIComponent('fb/a/1.jpg');
   assert.equal((await call(file + '?key=secret-key', {}, env)).status, 403);
   assert.equal((await call('/admin', {}, env)).status, 401);
@@ -147,7 +150,7 @@ test('ytdl: redirect to a non-allowlisted host is refused without fetching it', 
 });
 
 test('admin: Authorization: Bearer is no longer accepted; lockout applies before compare (11th attempt even with right password is 429)', async () => {
-  const env = { FEEDBACK_KV: memKV(), FEEDBACK_ADMIN_KEY: 'secret-key' };
+  const env = { TURNSTILE_DISABLED: '1', FEEDBACK_KV: memKV(), FEEDBACK_ADMIN_KEY: 'secret-key' };
   for (const p of ['/api/stats-all', '/api/feedback/list', '/api/geo-stats', '/api/parse-history']) {
     const r = await call(p, { headers: { Authorization: 'Bearer secret-key' } }, env);
     assert.equal(r.status, 403, p);

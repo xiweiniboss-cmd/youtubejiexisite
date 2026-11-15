@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import worker from '../_worker.js';
+// 本地测试默认不配人机验证密钥：显式声明跳过（生产缺密钥会 fail-closed 503）
+{ const _f = worker.fetch.bind(worker); worker.fetch = (r, e, c) => _f(r, { TURNSTILE_DISABLED: '1', ...(e || {}) }, c); }
+
 
 // 解析记录 + 拉黑（D1 PARSE_DB）：每次解析记一行（IP/归属地/设备/去令牌链接）；黑名单 IP、设备直接 403「访问受限」；D1 挂了照常解析
 const SCHEMA = `CREATE TABLE parse_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, site TEXT NOT NULL, url TEXT NOT NULL DEFAULT '', ok INTEGER NOT NULL DEFAULT 0, status INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', country TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '', device_id TEXT NOT NULL DEFAULT '', ua TEXT NOT NULL DEFAULT '', fp TEXT NOT NULL DEFAULT '');
@@ -41,7 +44,7 @@ test('解析记一行 D1；拉黑的 IP（含 IPv6 同 /64）和设备 → 403 �
   let upstream = 0;
   globalThis.fetch = async () => { upstream++; return new Response('broken', { status: 500 }); };
   try {
-    const env = { PARSE_DB: d1, REDFOX_API_KEY: 'fake' };
+    const env = { TURNSTILE_DISABLED: '1', PARSE_DB: d1, REDFOX_API_KEY: 'fake' };
     const r = await worker.fetch(req('https://www.youtube.com/watch?v=dQw4w9WgXcQ&si=SECRETTOKEN', '198.51.100.7', DEV), env, ctx);
     assert.equal(r.status, 502);
     while (jobs.length) await jobs.shift();

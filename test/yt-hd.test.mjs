@@ -22,6 +22,9 @@ import worker, {
   directProbeRange,
   DIRECT_LIMITED_MSG,
 } from '../_worker.js';
+// 本地测试默认不配人机验证密钥：显式声明跳过（生产缺密钥会 fail-closed 503）
+{ const _f = worker.fetch.bind(worker); worker.fetch = (r, e, c) => _f(r, { TURNSTILE_DISABLED: '1', ...(e || {}) }, c); }
+
 import vm from 'node:vm';
 import { spawnSync } from 'node:child_process';
 
@@ -984,7 +987,7 @@ function mergeEnvFetch(fileBody, fileHeaders, statusBody) {
   };
   return { f, sent };
 }
-const ENV = { YT_MERGE_TOKEN: 'local-test-token' };
+const ENV = { TURNSTILE_DISABLED: '1', YT_MERGE_TOKEN: 'local-test-token' };
 async function withFetch(f, fn) {
   const orig = globalThis.fetch; globalThis.fetch = f;
   try { return await fn(); } finally { globalThis.fetch = orig; }
@@ -1361,7 +1364,7 @@ test('yt1080-start only forwards a normalized single YouTube video URL to EC2', 
     return new Response(JSON.stringify({ ok: true, job_id: 'job1' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   };
   try {
-    const env = { YT_MERGE_TOKEN: 'local-test-token' };
+    const env = { TURNSTILE_DISABLED: '1', YT_MERGE_TOKEN: 'local-test-token' };
     for (const bad of ['http://169.254.169.254/latest/meta-data/', 'https://example.com/v.mp4', 'https://youtube.com.evil.com/watch?v=dQw4w9WgXcQ', 'https://www.youtube.com/playlist?list=PL123']) {
       const r = await worker.fetch(new Request('https://example.com/api/yt1080-start?url=' + encodeURIComponent(bad), { method: 'POST' }), env);
       assert.equal(r.status, 400, bad);

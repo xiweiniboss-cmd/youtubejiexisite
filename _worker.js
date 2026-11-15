@@ -75,6 +75,79 @@ function ipLimitKey(ip) {
   while (parts.length < 4) parts.push('0');
   return parts.join(':') + '::/64';
 }
+// ================= 原子频控（D1 rate_counter，和微博站共用同一张表） =================
+// 冷却 60 秒 + 每 IP（IPv6 按 /64）每天（北京时间）20 次。解析之前用一条 UPSERT 原子地「判断 + 占坑」：
+//   并发一批请求只有第一个能占到坑；失败的解析也算一次（不能拿坏链接无限刷上游接口）。
+// 没绑 PARSE_DB / D1 出错：退回 KV，同样先占坑再解析（KV 非原子，只是兜底）。
+const RL_COOLDOWN_SECS = 60;
+const RL_DAILY_LIMIT = 20;
+const RL_TIMEOUT_MS = 2000;
+function rlDate() {
+  return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+}
+function rlWithTimeout(p, ms) {
+  let t;
+  return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error('timeout')), ms); })]).finally(() => clearTimeout(t));
+}
+function rlDeny(now, last, used) {
+  if (last && now - last < RL_COOLDOWN_SECS * 1000) {
+    const wait = Math.ceil((RL_COOLDOWN_SECS * 1000 - (now - last)) / 1000);
+    return { ok: false, status: 429, msg: '解析太频繁，请 ' + wait + ' 秒后再试' };
+  }
+  if (used >= RL_DAILY_LIMIT) return { ok: false, status: 429, msg: '今日解析次数已用完（' + RL_DAILY_LIMIT + ' 次），明天再来吧' };
+  return null;
+}
+async function rateTake(env, site, rawIp) {
+  const ip = ipLimitKey(rawIp);
+  if (!ip) return { ok: true };
+  const now = Date.now();
+  const k = site + ':' + ip + ':' + rlDate();
+  const db = env && env.PARSE_DB;
+  if (db && typeof db.prepare === 'function') {
+    try {
+      const got = await rlWithTimeout(db.prepare(
+        'INSERT INTO rate_counter (k, n, last, exp) VALUES (?, 1, ?, ?) ON CONFLICT(k) DO UPDATE SET n = n + 1, last = excluded.last ' +
+        'WHERE rate_counter.last <= ? AND rate_counter.n < ? RETURNING n'
+      ).bind(k, now, now + 2 * 86400000, now - RL_COOLDOWN_SECS * 1000, RL_DAILY_LIMIT).first(), RL_TIMEOUT_MS);
+      if (got) return { ok: true };
+      const cur = await rlWithTimeout(db.prepare('SELECT n, last FROM rate_counter WHERE k = ?').bind(k).first(), RL_TIMEOUT_MS);
+      return rlDeny(now, Number(cur && cur.last) || 0, Number(cur && cur.n) || 0) || { ok: false, status: 429, msg: '解析太频繁，请稍后再试' };
+    } catch (e) { /* D1 出错：退回 KV */ }
+  }
+  const kv = env && env.FEEDBACK_KV;
+  if (kv) {
+    try {
+      const ck = 'pcool_' + site + '_' + ip, qk = 'dlimit_' + site + '_' + ip + '_' + rlDate();
+      const [lastTs, usedRaw] = await Promise.all([kv.get(ck), kv.get(qk)]);
+      const used = Number(usedRaw) || 0;
+      const deny = rlDeny(now, Number(lastTs) || 0, used);
+      if (deny) return deny;
+      await Promise.all([
+        kv.put(ck, String(now), { expirationTtl: RL_COOLDOWN_SECS }),
+        kv.put(qk, String(used + 1), { expirationTtl: 172800 }),
+      ]);
+    } catch {}
+  }
+  return { ok: true };
+}
+async function rateUsed(env, site, rawIp) {
+  const ip = ipLimitKey(rawIp);
+  if (!ip) return 0;
+  const db = env && env.PARSE_DB;
+  if (db && typeof db.prepare === 'function') {
+    try {
+      const cur = await rlWithTimeout(db.prepare('SELECT n FROM rate_counter WHERE k = ?').bind(site + ':' + ip + ':' + rlDate()).first(), RL_TIMEOUT_MS);
+      return Number(cur && cur.n) || 0;
+    } catch {}
+  }
+  try { return Number((await env.FEEDBACK_KV.get('dlimit_' + site + '_' + ip + '_' + rlDate())) || 0); } catch { return 0; }
+}
+// 人机验证 fail-closed：没配 TURNSTILE_SECRET_KEY 就拒绝解析，除非明确设了 TURNSTILE_DISABLED=1
+function turnstileDisabled(env) {
+  return /^(1|true|yes|on)$/i.test(String((env && env.TURNSTILE_DISABLED) || '').trim());
+}
+// ================= 原子频控 end =================
+
 function clientIpKey(request) {
   return ipLimitKey(request.headers.get('cf-connecting-ip') || '');
 }
@@ -407,6 +480,7 @@ function warnMissingSiteKey(env, pathname) {
 export async function checkHuman(request, env) {
   const secret = (env.TURNSTILE_SECRET_KEY || '').trim();
   if (!secret) {
+    if (!turnstileDisabled(env)) return { response: json({ ok: false, error: '人机验证未配置，暂停解析', code: 'HUMAN_UNAVAILABLE' }, 503) };
     if (!_humanUnsetWarned) {
       _humanUnsetWarned = true;
       console.warn('[turnstile] 未配置 TURNSTILE_SECRET_KEY：解析接口暂不做人机验证（fail-open）');
@@ -629,49 +703,20 @@ async function handleParse(request, env) {
 
   // 人机验证在路由里统一做（checkHuman），这里不再重复
 
-  // 解析冷却：同一 IP 60 秒内只能解析一次（防刷 API 烧积分）
-  const PARSE_COOLDOWN_SECS = 60;
+  // 频控：冷却 60 秒 + 每 IP 每天 20 次。解析前原子占坑（D1），并发打不穿，失败也算一次
   const parseIp = request.headers.get('cf-connecting-ip') || '';
-  if (parseIp && env.FEEDBACK_KV) {
-    const lastTs = await env.FEEDBACK_KV.get('pcool_youtube_' + ipLimitKey(parseIp));
-    if (lastTs) {
-      const remain = PARSE_COOLDOWN_SECS - Math.floor((Date.now() - Number(lastTs)) / 1000);
-      if (remain > 0) return json({ ok: false, error: `解析太频繁，请 ${remain} 秒后再试` }, 429);
-    }
-  }
-
-  // 每日解析限额：同一 IP 每天最多 20 次（deviceId 前端可随意改，不能作为限额依据），按北京时间算天
-  const DAILY_LIMIT = 20;
-  const bjDate = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
-  const parseUrl = new URL(request.url);
-  const deviceId = parseUrl.searchParams.get('deviceId') || '';
-  const quotaId = ipLimitKey(parseIp) || deviceId; // 按 IP 计配额：deviceId 由前端传，换一个就能绕过
-  const quotaKey = 'dlimit_youtube_' + quotaId + '_' + bjDate;
-  let usedToday = 0;
-  if (parseIp && env.FEEDBACK_KV) {
-    try { usedToday = Number((await env.FEEDBACK_KV.get(quotaKey)) || 0); } catch {}
-    if (usedToday >= DAILY_LIMIT)
-      return json({ ok: false, error: '今日解析次数已用完（20 次），明天再来吧' }, 429);
-  }
+  const deviceId = new URL(request.url).searchParams.get('deviceId') || '';
+  const rl = await rateTake(env, 'youtube', parseIp);
+  if (!rl.ok) return json({ ok: false, error: rl.msg }, rl.status);
 
   plPass(request); // 人机验证（入口 checkHuman）+ 冷却 + 每日次数都过了：这次解析才记进 D1 parse_log
   try {
     const result = await parseYoutubeViaRedFox(shareText, apiKey, debug);
-    if (parseIp && env.FEEDBACK_KV)
-      await env.FEEDBACK_KV.put('pcool_youtube_' + ipLimitKey(parseIp), String(Date.now()), {
-        expirationTtl: PARSE_COOLDOWN_SECS,
-      });
     // 本站解析次数统计（仅成功计数）
     if (env.FEEDBACK_KV) {
       try {
         const cur = Number((await env.FEEDBACK_KV.get('stats_parse_youtube')) || 0);
         await env.FEEDBACK_KV.put('stats_parse_youtube', String(cur + 1));
-      } catch {}
-    }
-    // 每日限额计数（仅成功计数，48小时过期）
-    if (parseIp && env.FEEDBACK_KV) {
-      try {
-        await env.FEEDBACK_KV.put(quotaKey, String(usedToday + 1), { expirationTtl: 172800 });
       } catch {}
     }
     // 解析者归属地分布（按站点+国家聚合）
@@ -1483,16 +1528,8 @@ async function handleGeoStats(request, env) {
 
 /* ================= 每日解析配额 ================= */
 async function handleParseQuota(request, env) {
-  const DAILY_LIMIT = 20;
-  const url = new URL(request.url);
-  const ip = request.headers.get('cf-connecting-ip') || '';
-  const deviceId = url.searchParams.get('deviceId') || '';
-  const quotaId = ipLimitKey(ip) || deviceId; // 与解析接口一致，按 IP 查
-  const bjDate = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
-  let used = 0;
-  if (quotaId && env.FEEDBACK_KV) {
-    try { used = Number((await env.FEEDBACK_KV.get('dlimit_youtube_' + quotaId + '_' + bjDate)) || 0); } catch {}
-  }
+  const DAILY_LIMIT = RL_DAILY_LIMIT;
+  const used = await rateUsed(env, 'youtube', request.headers.get('cf-connecting-ip') || '');
   return json({ ok: true, limit: DAILY_LIMIT, used, remaining: Math.max(0, DAILY_LIMIT - used) });
 }
 
