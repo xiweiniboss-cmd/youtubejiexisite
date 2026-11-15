@@ -975,12 +975,10 @@ var deviceId = (function(){
     fbPicked = [];
     fbRenderPicked();
   }
-  function fbCompose(msg){
-    var text = msg || '（未写具体描述）';
-    if (fbKind) text = '【' + fbKind + '】\n' + text;
+  // 问题类型和当前输入的链接单独提交（kind / link），不再拼进反馈内容，免得超过 2000 字被拒
+  function fbCurrentLink(){
     var raw = ($('urlInput') && $('urlInput').value || '').trim();
-    if (/https?:\/\//i.test(raw)) text += '\n\n当前输入：\n' + raw.slice(0, 800);
-    return text;
+    return /https?:\/\//i.test(raw) ? raw.slice(0, 800) : '';
   }
   function fbClose(){
     $('fbWrap').classList.remove('show');
@@ -1050,14 +1048,17 @@ var deviceId = (function(){
     btn.disabled = true; btn.textContent = '提交中…';
     try {
       var fd = new FormData();
-      fd.append('message', fbCompose(msg));
+      fd.append('message', msg || '（未写具体描述）');
+      if (fbKind) fd.append('kind', fbKind);
+      var fbLinkVal = fbCurrentLink();
+      if (fbLinkVal) fd.append('link', fbLinkVal);
       fd.append('contact', $('fbContact').value.trim());
       fd.append('page', location.href);
       if (tsToken) fd.append('cf-turnstile-response', tsToken);
       files.forEach(function(ff){ fd.append('files', ff, ff.name); });
       const r = await fetch('/api/feedback', { method: 'POST', body: fd });
-      const j = await r.json();
-      if (j.ok) {
+      const j = await r.json().catch(function(){ return null; });
+      if (j && j.ok) {
         $('fbMsg').value = ''; $('fbContact').value = ''; $('fbFiles').value = '';
         fbKind = '';
         var chips = document.querySelectorAll('.fb-chip');
@@ -1067,7 +1068,7 @@ var deviceId = (function(){
         $('fbDone').style.display = 'block';
         setTimeout(fbClose, 1600);
       } else {
-        fbShowErr('反馈提交失败：' + (j.error || '请稍后重试'));
+        fbShowErr('反馈提交失败：' + ((j && j.error) || ('服务器出错（HTTP ' + r.status + '），请稍后重试')));
       }
     } catch (e) { fbShowErr('网络错误，请稍后重试。'); }
     if (typeof tsWidgetId !== 'undefined' && tsWidgetId !== null) { try { turnstile.reset(tsWidgetId); } catch (e) {} }
