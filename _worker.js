@@ -2990,9 +2990,12 @@ const pf = createPfRecorder('youtube');
 // ==== parse-log v1 BEGIN ====
 // 解析记录 + 拉黑（各解析站共用同一份代码：allfeedback/shared/parse-log.js 是原件，改动后用 shared/pf-sync.mjs 同步）
 // 存储：D1 数据库 parse_log（绑定名 PARSE_DB），表 parse_log / blocklist，建表语句见 allfeedback/shared/parse_log.sql。
-// - 每次调用 /api/parse 记一行：时间、站点、链接（去掉令牌类参数）、成功与否、状态码、失败原因、IP、归属地（request.cf）、设备 ID、UA。
-// - 设备 ID：前端首次访问在 localStorage 生成的随机 UUID，放在请求头 X-Device-Id；格式不对就当没有。不做任何指纹采集。
-// - 拉黑：解析前先查 blocklist（每个 isolate 缓存 60 秒）；命中返回 403「访问受限」。
+// - 每次调用 /api/parse 记一行：时间、站点、链接（去掉令牌类参数）、成功与否、状态码、失败原因、IP、归属地（request.cf）、设备 ID、设备指纹、UA。
+//   只记「有效链接」：站点传入的 valid(input) 返回 false（空输入 / 不是本站链接 / 链接格式不对，站点自己会直接 400）就不记。
+// - 设备 ID：前端首次访问在 localStorage 生成的随机 UUID，放在请求头 X-Device-Id；格式不对就当没有。
+// - 设备指纹：前端用 canvas 渲染、屏幕尺寸/色深、时区、语言、CPU 核数、平台、UA 算 SHA-256 取前 32 位十六进制，
+//   放在请求头 X-Device-Fp；尽力而为（清缓存不变，但换浏览器/升级浏览器会变），格式不对就当没有。
+// - 拉黑：解析前先查 blocklist（IP / 设备 ID / 指纹，每个 isolate 缓存 60 秒）；命中返回 403「访问受限」。
 //   D1 没绑定 / 查询出错 / 超时一律放行（fail open），出错时沿用上一次成功读到的名单。
 // - 写入全部在 waitUntil 里，出错吞掉，不影响解析响应。约 1% 的写入顺手删掉 30 天前的记录。
 const PL_BLOCK_TTL_MS = 60000;
@@ -3001,12 +3004,17 @@ const PL_BLOCK_TIMEOUT_MS = 1500;
 const PL_RETENTION_MS = 30 * 86400 * 1000;
 const PL_PRUNE_RATE = 0.01;
 const PL_BLOCK_MSG = '访问受限';
+const PL_FP_RE = /^[0-9a-f]{32}$/;
 const PL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const PL_KEEP_PARAMS = new Set(['v', 'p', 'id', 'vid', 'bvid', 'aid', 'aweme_id', 'modal_id', 'item_id', 'photoid', 'list', 'index']);
 
 function plDevice(request) {
   const v = String(request.headers.get('x-device-id') || '').trim().toLowerCase();
   return PL_UUID_RE.test(v) ? v : '';
+}
+function plFp(request) {
+  const v = String(request.headers.get('x-device-fp') || '').trim().toLowerCase();
+  return PL_FP_RE.test(v) ? v : '';
 }
 function plIp(request) {
   return String(request.headers.get('cf-connecting-ip') || '').trim().toLowerCase().slice(0, 64);
@@ -3064,6 +3072,7 @@ function plWithTimeout(p, ms) {
 function createParseLog(site, opts) {
   opts = opts || {};
   const now = opts.now || (() => Date.now());
+  const valid = typeof opts.valid === 'function' ? opts.valid : null;
   const rand = opts.random || Math.random;
   const cache = { set: null, at: 0, pending: null };
   const blockLogged = new Map(); // 被拉黑的请求：同一 IP / 设备每分钟最多记一行
@@ -3081,7 +3090,7 @@ function createParseLog(site, opts) {
       cache.at = now() - PL_BLOCK_TTL_MS + PL_BLOCK_RETRY_MS;
     }
   }
-  async function isBlocked(env, ip, device) {
+  async function isBlocked(env, ip, device, fp) {
     const db = env && env.PARSE_DB;
     if (!db || typeof db.prepare !== 'function') return false;
     if (!cache.set || now() - cache.at >= PL_BLOCK_TTL_MS) {
@@ -3092,6 +3101,7 @@ function createParseLog(site, opts) {
     if (!s || !s.size) return false;
     if (ip && (s.has('ip:' + ip) || s.has('ip:' + plIp64(ip)))) return true;
     if (device && s.has('device:' + device)) return true;
+    if (fp && s.has('fp:' + fp)) return true;
     return false;
   }
   function write(env, ctx, row) {
@@ -3099,8 +3109,8 @@ function createParseLog(site, opts) {
     if (!db || typeof db.prepare !== 'function') return null;
     const job = (async () => {
       try {
-        await db.prepare('INSERT INTO parse_log (ts, site, url, ok, status, reason, ip, country, region, city, device_id, ua) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .bind(row.ts, site, row.url, row.ok ? 1 : 0, row.status, row.reason, row.ip, row.country, row.region, row.city, row.device, row.ua).run();
+        await db.prepare('INSERT INTO parse_log (ts, site, url, ok, status, reason, ip, country, region, city, device_id, fp, ua) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .bind(row.ts, site, row.url, row.ok ? 1 : 0, row.status, row.reason, row.ip, row.country, row.region, row.city, row.device, row.fp, row.ua).run();
         if (rand() < PL_PRUNE_RATE) await db.prepare('DELETE FROM parse_log WHERE ts < ?').bind(now() - PL_RETENTION_MS).run();
       } catch {}
     })();
@@ -3111,7 +3121,7 @@ function createParseLog(site, opts) {
     const cf = request.cf || {};
     const s = (v, n) => String(v == null ? '' : v).slice(0, n);
     return {
-      ts: now(), url: plCleanUrl(input), ip: plIp(request), device: plDevice(request),
+      ts: now(), url: plCleanUrl(input), ip: plIp(request), device: plDevice(request), fp: plFp(request),
       country: s(cf.country, 8).toUpperCase().replace(/[^A-Z]/g, ''), region: s(cf.region, 60), city: s(cf.city, 60),
       ua: s(request.headers.get('user-agent'), 200),
     };
@@ -3123,12 +3133,12 @@ function createParseLog(site, opts) {
   async function wrap(request, env, ctx, run) {
     let input = '';
     try { input = await plInput(request); } catch {}
-    const ip = plIp(request), device = plDevice(request);
+    const ip = plIp(request), device = plDevice(request), fp = plFp(request);
     let blocked = false;
-    try { blocked = await isBlocked(env, ip, device); } catch { blocked = false; }
+    try { blocked = await isBlocked(env, ip, device, fp); } catch { blocked = false; }
     if (blocked) {
       try {
-        const k = ip + '|' + device, t = now();
+        const k = ip + '|' + device + '|' + fp, t = now();
         if (!(t - (blockLogged.get(k) || 0) < 60000)) {
           if (blockLogged.size > 500) blockLogged.clear();
           blockLogged.set(k, t);
@@ -3137,6 +3147,10 @@ function createParseLog(site, opts) {
       } catch {}
       return blockedResponse();
     }
+    // 无效链接（空 / 不是本站 / 格式不对）：照常交给站点处理（它会 400），但不记
+    let record = true;
+    if (valid) { try { record = !!valid(input); } catch { record = false; } }
+    if (!record) return run();
     let resp;
     try {
       resp = await run();
@@ -3166,7 +3180,8 @@ function createParseLog(site, opts) {
   return { wrap, isBlocked, write, _cache: cache };
 }
 // ==== parse-log v1 END ====
-const pl = createParseLog('youtube');
+// 只记有效链接：和 handleParse 开头的本地校验同一套判断（空 / 不是本站链接 → 站点自己 400，不记）
+const pl = createParseLog('youtube', { valid: (t) => { const l = (String(t).match(/https?:\/\/[^\s"'<>]+/) || [])[0] || ''; return !!String(t).trim() && (!l || isYouTubeUrl(l)); } });
 
 /* ================= 路由 ================= */
 function routeHumanGated(pathname, request, env, ctx) {

@@ -25,7 +25,7 @@
 .ts-parse.ts-compact{ display:flex; justify-content:center; }
 </style>
 <script id="jx-device">
-// 防滥用设备 ID：首次访问时在本机浏览器生成一个随机 UUID（不采集任何设备指纹），解析时放在请求头 X-Device-Id
+// 防滥用设备 ID：首次访问时在本机浏览器生成一个随机 UUID，解析时放在请求头 X-Device-Id
 var jxDeviceUuid = (function () {
   var re = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
   var v = '';
@@ -44,9 +44,42 @@ var jxDeviceUuid = (function () {
   try { localStorage.setItem('jx_device_uuid', v); } catch (e) {}
   return v;
 })();
+// 设备指纹（尽力而为，不用第三方库）：canvas 渲染 + 屏幕尺寸/色深 + 时区 + 语言 + CPU 核数 + 平台 + UA
+// 拼起来算 SHA-256，取前 32 位十六进制，放在请求头 X-Device-Fp。算不出来（老浏览器 / 非 https）就不带。
+var jxDeviceFp = '';
+(function () {
+  try {
+    if (!window.crypto || !crypto.subtle || !window.TextEncoder) return;
+    var parts = [];
+    try {
+      var c = document.createElement('canvas');
+      c.width = 240; c.height = 60;
+      var g = c.getContext('2d');
+      g.textBaseline = 'top';
+      g.font = '16px Arial, sans-serif';
+      g.fillStyle = '#f60'; g.fillRect(100, 1, 62, 20);
+      g.fillStyle = '#069'; g.fillText('jx-fp 解析 Ωπ ✓', 2, 15);
+      g.fillStyle = 'rgba(102, 204, 0, 0.7)'; g.fillText('jx-fp 解析 Ωπ ✓', 4, 17);
+      g.beginPath(); g.arc(50, 30, 20, 0, Math.PI * 2); g.stroke();
+      parts.push(c.toDataURL());
+    } catch (e) { parts.push('no-canvas'); }
+    var sc = window.screen || {};
+    var sw = sc.width || 0, sh = sc.height || 0;
+    parts.push(Math.max(sw, sh) + 'x' + Math.min(sw, sh) + 'x' + (sc.colorDepth || 0));
+    var tz = '';
+    try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) {}
+    parts.push(tz, navigator.language || '', navigator.hardwareConcurrency || 0, navigator.platform || '', navigator.userAgent || '');
+    crypto.subtle.digest('SHA-256', new TextEncoder().encode(parts.join('|'))).then(function (buf) {
+      var a = new Uint8Array(buf), hex = '';
+      for (var i = 0; i < 16; i++) hex += (a[i] + 256).toString(16).slice(1);
+      jxDeviceFp = hex;
+    }, function () {});
+  } catch (e) {}
+})();
 function jxParseHeaders(h) {
   h = h || {};
   if (jxDeviceUuid) h['X-Device-Id'] = jxDeviceUuid;
+  if (jxDeviceFp) h['X-Device-Fp'] = jxDeviceFp;
   return h;
 }
 </script>
@@ -196,7 +229,7 @@ function jxParseHeaders(h) {
     <div class="jxh-msg" id="jxhMsg" aria-live="polite"></div>
   </section>
 
-  <footer>解析仅供个人学习交流<br>请勿传播他人原创作品<br><span class="jx-privacy">为防滥用，本站会记录解析链接、IP、归属地和设备标识，保留 30 天。</span></footer>
+  <footer>解析仅供个人学习交流<br>请勿传播他人原创作品<br><span class="jx-privacy">为防滥用，本站会记录解析链接、IP、归属地和设备标识与特征，保留 30 天。</span></footer>
 </div>
 
 <button type="button" id="fbBtn" title="问题反馈" aria-label="问题反馈" aria-haspopup="dialog"><span class="fb-mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/><path d="M8 10h8"/><path d="M8 13.5h5"/></svg></span><span class="fb-label">反馈</span></button>

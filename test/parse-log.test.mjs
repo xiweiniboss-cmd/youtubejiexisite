@@ -4,8 +4,8 @@ import { DatabaseSync } from 'node:sqlite';
 import worker from '../_worker.js';
 
 // 解析记录 + 拉黑（D1 PARSE_DB）：每次解析记一行（IP/归属地/设备/去令牌链接）；黑名单 IP、设备直接 403「访问受限」；D1 挂了照常解析
-const SCHEMA = `CREATE TABLE parse_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, site TEXT NOT NULL, url TEXT NOT NULL DEFAULT '', ok INTEGER NOT NULL DEFAULT 0, status INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', country TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '', device_id TEXT NOT NULL DEFAULT '', ua TEXT NOT NULL DEFAULT '');
-CREATE TABLE blocklist (type TEXT NOT NULL CHECK (type IN ('ip','device')), value TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, PRIMARY KEY (type, value));`;
+const SCHEMA = `CREATE TABLE parse_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, site TEXT NOT NULL, url TEXT NOT NULL DEFAULT '', ok INTEGER NOT NULL DEFAULT 0, status INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', country TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '', device_id TEXT NOT NULL DEFAULT '', ua TEXT NOT NULL DEFAULT '', fp TEXT NOT NULL DEFAULT '');
+CREATE TABLE blocklist (type TEXT NOT NULL CHECK (type IN ('ip','device','fp')), value TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, PRIMARY KEY (type, value));`;
 function fakeD1() {
   const db = new DatabaseSync(':memory:');
   db.exec(SCHEMA);
@@ -22,9 +22,12 @@ function fakeD1() {
 }
 const DEV = '11111111-2222-4333-8444-555555555555';
 const BAD_DEV = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
-function req(u, ip, dev) {
+const FP = '0123456789abcdef0123456789abcdef';
+const BAD_FP = 'fedcba9876543210fedcba9876543210';
+function req(u, ip, dev, fp = FP) {
   const h = { 'cf-connecting-ip': ip };
   if (dev) h['x-device-id'] = dev;
+  if (fp) h['x-device-fp'] = fp;
   const r = new Request('https://youtubejiexisite.pages.dev/api/parse?url=' + encodeURIComponent(u), { headers: h });
   Object.defineProperty(r, 'cf', { value: { country: 'CN', region: 'Guangdong', city: 'Shenzhen' } });
   return r;
@@ -32,7 +35,7 @@ function req(u, ip, dev) {
 
 test('解析记一行 D1；拉黑的 IP（含 IPv6 同 /64）和设备 → 403 访问受限且不打上游', async () => {
   const d1 = fakeD1();
-  d1.db.prepare("INSERT INTO blocklist(type,value,note,created_at) VALUES ('ip','203.0.113.66','',1),('ip','2001:db8:1:2::/64','',1),('device',?,'',1)").run(BAD_DEV);
+  d1.db.prepare("INSERT INTO blocklist(type,value,note,created_at) VALUES ('ip','203.0.113.66','',1),('ip','2001:db8:1:2::/64','',1),('device',?,'',1),('fp',?,'',1)").run(BAD_DEV, BAD_FP);
   const jobs = []; const ctx = { waitUntil: (p) => jobs.push(p) };
   const orig = globalThis.fetch;
   let upstream = 0;
@@ -48,12 +51,13 @@ test('解析记一行 D1；拉黑的 IP（含 IPv6 同 /64）和设备 → 403 �
     assert.equal(rows[0].url, 'https://www.youtube.com/watch?v=dQw4w9WgXcQ');
     assert.equal(rows[0].ip, '198.51.100.7');
     assert.equal(rows[0].device_id, DEV);
+    assert.equal(rows[0].fp, FP);
     assert.equal(rows[0].ok, 0);
     assert.equal(rows[0].city, 'Shenzhen');
 
-    for (const [ip, dev] of [['203.0.113.66', DEV], ['2001:db8:1:2:aaaa::9', DEV], ['198.51.100.8', BAD_DEV]]) {
+    for (const [ip, dev, fp] of [['203.0.113.66', DEV, FP], ['2001:db8:1:2:aaaa::9', DEV, FP], ['198.51.100.8', BAD_DEV, FP], ['198.51.100.9', DEV, BAD_FP]]) {
       const before = upstream;
-      const rb = await worker.fetch(req('https://www.youtube.com/watch?v=dQw4w9WgXcQ', ip, dev), env, ctx);
+      const rb = await worker.fetch(req('https://www.youtube.com/watch?v=dQw4w9WgXcQ', ip, dev, fp), env, ctx);
       assert.equal(rb.status, 403, ip + ' 应被拦');
       const j = await rb.json();
       assert.equal(j.ok, false);
@@ -64,6 +68,11 @@ test('解析记一行 D1；拉黑的 IP（含 IPv6 同 /64）和设备 → 403 �
     // 同 /64 之外的 IPv6 不拦
     const r6 = await worker.fetch(req('https://example.com/x', '2001:db8:1:3::9', DEV), env, ctx);
     assert.equal(r6.status, 400);
+    // 无效链接（不是 YouTube / 空）不记
+    const n0 = d1.db.prepare('SELECT count(*) c FROM parse_log').get().c;
+    for (const u of ['https://example.com/y', '']) assert.equal((await worker.fetch(req(u, '198.51.100.30', DEV), env, ctx)).status, 400);
+    while (jobs.length) await jobs.shift();
+    assert.equal(d1.db.prepare('SELECT count(*) c FROM parse_log').get().c, n0, '无效链接不该记');
   } finally { globalThis.fetch = orig; }
 });
 
