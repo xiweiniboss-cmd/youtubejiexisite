@@ -168,7 +168,8 @@ async function adminCheckPassword(request, env, key) {
   if (!secret) return { ok: false, status: 500, error: '未配置管理密码 FEEDBACK_ADMIN_KEY' };
   const kv = env.FEEDBACK_KV;
   const ipk = clientIpKey(request);
-  const fk = 'admfail_' + ipk;
+  // 失败计数按站点分开：一个站被锁不影响其他站（所有站共用一个 KV）
+  const fk = 'admfail_' + new URL(request.url).hostname + '_' + ipk;
   let fails = 0;
   if (kv && ipk) {
     try { fails = Number((await kv.get(fk)) || 0); } catch {}
@@ -180,6 +181,14 @@ async function adminCheckPassword(request, env, key) {
   }
   return { ok: true };
 }
+// 同源判断：有 Sec-Fetch-Site 就必须是 same-origin；有 Origin 就必须等于本站（脚本 / curl 两个头都没有时放行，靠 JSON 限制挡表单）
+function adminSameOrigin(request) {
+  const sfs = request.headers.get('Sec-Fetch-Site');
+  if (sfs && sfs !== 'same-origin') return false;
+  const o = request.headers.get('Origin');
+  if (o && o !== new URL(request.url).origin) return false;
+  return true;
+}
 function adminJson(data, status, cookie) {
   const h = new Headers({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   if (cookie) h.append('Set-Cookie', cookie);
@@ -187,12 +196,12 @@ function adminJson(data, status, cookie) {
 }
 async function handleAdminLogin(request, env) {
   if (request.method !== 'POST') return adminJson({ ok: false, error: '方法不支持' }, 405);
+  // 只收 JSON（跨站表单发不了 application/json），并拒绝跨站来源：防止别的网页替管理员乱输密码把 IP 锁住
+  const ct = request.headers.get('content-type') || '';
+  if (!ct.toLowerCase().includes('application/json')) return adminJson({ ok: false, error: '请求格式错误' }, 415);
+  if (!adminSameOrigin(request)) return adminJson({ ok: false, error: '禁止跨站登录' }, 403);
   let key = '';
-  try {
-    const ct = request.headers.get('content-type') || '';
-    if (ct.includes('application/json')) key = String(((await request.json()) || {}).key || '');
-    else key = String((await request.formData()).get('key') || '');
-  } catch {}
+  try { key = String(((await request.json()) || {}).key || ''); } catch {}
   const r = await adminCheckPassword(request, env, key);
   if (!r.ok) return adminJson({ ok: false, error: r.error }, r.status);
   return adminJson({ ok: true }, 200, await adminSetCookie(env));
@@ -213,6 +222,11 @@ button{margin-top:12px;width:100%;padding:12px;border:none;border-radius:10px;ba
 <body><form id="f"><h1>管理后台登录</h1><input type="password" id="k" autocomplete="current-password" placeholder="管理密码" required>
 <button type="submit">登录</button><div id="err"></div></form>
 <script>
+(function(){
+  var q = new URLSearchParams(location.search).get('err');
+  var M = { wrong: '密码错误', locked: '密码错误次数过多，请 15 分钟后再试', nokey: '本站未配置管理密码', cross: '请直接打开本站后台再登录' };
+  if (q) document.getElementById('err').textContent = M[q] || '登录失败';
+})();
 document.getElementById('f').onsubmit = async function(e){
   e.preventDefault();
   var err = document.getElementById('err'); err.textContent = '';
@@ -228,9 +242,17 @@ async function serveAdminPage(request, env, html) {
   const url = new URL(request.url);
   const legacy = url.searchParams.get('key');
   if (legacy !== null) {
-    const r = await adminCheckPassword(request, env, legacy);
-    const h = new Headers({ Location: url.pathname, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
-    if (r.ok) h.append('Set-Cookie', await adminSetCookie(env));
+    // 跨站带过来的 ?key= 不校验（不计失败次数），防止别的网页替管理员乱试把 IP 锁住
+    let err = '';
+    let cookie = '';
+    if ((request.headers.get('Sec-Fetch-Site') || '') === 'cross-site') err = 'cross';
+    else {
+      const r = await adminCheckPassword(request, env, legacy);
+      if (r.ok) cookie = await adminSetCookie(env);
+      else err = r.status === 429 ? 'locked' : r.status === 500 ? 'nokey' : 'wrong';
+    }
+    const h = new Headers({ Location: url.pathname + (err ? '?err=' + err : ''), 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+    if (cookie) h.append('Set-Cookie', cookie);
     return new Response(null, { status: 302, headers: h });
   }
   if (!(await isAdmin(request, env))) return new Response(ADMIN_LOGIN_HTML, { status: 401, headers: ADMIN_PAGE_HEADERS });
@@ -899,14 +921,39 @@ async function handleYtDl(request, env) {
 }
 
 /* ================= 反馈系统（KV 存储 + 管理后台，与小红书/TikTok/抖音站共用） ================= */
+// 反馈字段长度：message 只算用户自己写的；问题类型 kind、当前输入 link 单独存
+const FB_MSG_MAX = 2000;
+const FB_LEGACY_MAX = 3000; // 兼容旧前端把类型和链接拼进 message
+const FB_KIND_MAX = 20;
+const FB_LINK_MAX = 800;
+const FB_FILE_MAX = 20 * 1024 * 1024;
+// page 只收 http/https 地址，其他（javascript: 等）直接丢掉
+function fbSafePage(p) {
+  p = String(p || '').trim().slice(0, 200);
+  try {
+    const u = new URL(p);
+    return u.protocol === 'https:' || u.protocol === 'http:' ? p : '';
+  } catch {
+    return '';
+  }
+}
 async function handleFeedbackSubmit(request, env) {
   if (!env.FEEDBACK_KV) return json({ ok: false, error: '反馈功能暂未启用' }, 500);
   const ct = request.headers.get('content-type') || '';
   let message = '',
     contact = '',
     page = '',
+    kind = '',
+    link = '',
     tsToken = '',
     files = [];
+  const pick = (get) => {
+    message = String(get('message') || '').trim();
+    contact = String(get('contact') || '').trim().slice(0, 120);
+    page = String(get('page') || '');
+    kind = String(get('kind') || '').replace(/[\r\n]+/g, ' ').trim().slice(0, FB_KIND_MAX);
+    link = String(get('link') || '').trim().slice(0, FB_LINK_MAX);
+  };
   if (ct.includes('multipart/form-data')) {
     let form;
     try {
@@ -914,9 +961,7 @@ async function handleFeedbackSubmit(request, env) {
     } catch {
       return json({ ok: false, error: '请求格式错误' }, 400);
     }
-    message = String(form.get('message') || '').trim();
-    contact = String(form.get('contact') || '').trim().slice(0, 120);
-    page = String(form.get('page') || '').slice(0, 200);
+    pick((k) => form.get(k));
     tsToken = String(form.get('cf-turnstile-response') || '');
     files = form.getAll('files').filter((f) => f && typeof f !== 'string' && f.size > 0);
   } else {
@@ -926,26 +971,36 @@ async function handleFeedbackSubmit(request, env) {
     } catch {
       return json({ ok: false, error: '请求格式错误' }, 400);
     }
-    message = String(body.message || '').trim();
-    contact = String(body.contact || '').trim().slice(0, 120);
-    page = String(body.page || '').slice(0, 200);
-    tsToken = String(body['cf-turnstile-response'] || '');
+    if (!body || typeof body !== 'object') return json({ ok: false, error: '请求格式错误' }, 400);
+    pick((k) => body[k]);
+    tsToken = String(body['cf-turnstile-response'] || body.tsToken || '');
   }
+  page = fbSafePage(page);
+  if (!message && kind) message = '（未写具体描述）';
   if (!message) return json({ ok: false, error: '请填写反馈内容' }, 400);
-  if (message.length > 2000) return json({ ok: false, error: '内容太长，请精简到 2000 字以内' }, 400);
+  // 2000 字只算用户自己写的内容；旧前端会把问题类型和链接拼进 message，没带 kind/link 时放宽到 3000
+  const msgMax = kind || link ? FB_MSG_MAX : FB_LEGACY_MAX;
+  if (message.length > msgMax) return json({ ok: false, error: '内容太长，请精简到 2000 字以内' }, 400);
+  // 附件先全部校验（数量 / 类型 / 大小），一个不合格就整单拒绝，不会先传一半
   if (files.length > 3) return json({ ok: false, error: '最多上传 3 个附件' }, 400);
+  for (const f of files) {
+    if (!SAFE_ATTACH_TYPE.test(f.type || '')) return json({ ok: false, error: '只支持图片和视频附件' }, 400);
+    if (f.size > FB_FILE_MAX) return json({ ok: false, error: '单个附件不能超过 20MB' }, 400);
+  }
 
-  const tsSecret = (env.TURNSTILE_SECRET_KEY || '').trim();
+  const tsSecret = String(env.TURNSTILE_SECRET_KEY || '').trim();
   if (tsSecret) {
     if (!tsToken) return json({ ok: false, error: '请先完成人机验证' }, 400);
-    const tsOk = await verifyTurnstile(tsToken, tsSecret, request.headers.get('cf-connecting-ip'));
+    const tsOk = await verifyTurnstile(tsToken, tsSecret, request.headers.get('cf-connecting-ip') || '');
     if (!tsOk) return json({ ok: false, error: '人机验证未通过，请重试' }, 403);
   }
 
   const COOLDOWN_SECS = 600;
   const clientIp = request.headers.get('cf-connecting-ip') || '';
-  if (clientIp) {
-    const lastTs = await env.FEEDBACK_KV.get('cool_youtube_' + ipLimitKey(clientIp));
+  const coolKey = clientIp ? 'cool_youtube_' + ipLimitKey(clientIp) : '';
+  if (coolKey) {
+    let lastTs = null;
+    try { lastTs = await env.FEEDBACK_KV.get(coolKey); } catch {} // KV 读失败不挡用户
     if (lastTs) {
       const remain = COOLDOWN_SECS - Math.floor((Date.now() - Number(lastTs)) / 1000);
       if (remain > 0)
@@ -958,35 +1013,47 @@ async function handleFeedbackSubmit(request, env) {
 
   const id = 'fb_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
   const attachments = [];
+  const uploaded = [];
+  // 任何一步存储失败：把这次已经传上去的附件删掉，返回 JSON 错误（不再抛异常变成 Cloudflare 错误页）
+  const cleanup = async () => {
+    for (const k of uploaded) {
+      try { await env.FEEDBACK_BUCKET.delete(k); } catch {}
+    }
+  };
+  const storageFail = () => json({ ok: false, code: 'STORAGE_FAILED', error: '存储失败，请稍后重试' }, 500);
   if (files.length) {
     // 没绑 R2（FEEDBACK_BUCKET）：明确告诉用户附件暂不可用，文字反馈不受影响
     if (!env.FEEDBACK_BUCKET)
       return json({ ok: false, code: 'ATTACH_DISABLED', error: '本站暂未开启附件上传（存储未绑定），请去掉附件只提交文字，或把截图发到联系方式里' }, 503);
-    for (const f of files) {
-      const type = f.type || '';
-      if (!SAFE_ATTACH_TYPE.test(type))
-        return json({ ok: false, error: '只支持图片和视频附件' }, 400);
-      if (f.size > 20 * 1024 * 1024)
-        return json({ ok: false, error: '单个附件不能超过 20MB' }, 400);
-      const ext =
-        (String(f.name || '').split('.').pop() || 'bin').replace(/[^a-z0-9]/gi, '').slice(0, 8) ||
-        'bin';
-      const key = `fb/${id}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
-      await env.FEEDBACK_BUCKET.put(key, f.stream(), {
-        httpMetadata: { contentType: type },
-      });
-      attachments.push({ key, type, name: String(f.name || '').slice(0, 80), size: f.size });
+    try {
+      for (const f of files) {
+        const type = f.type || '';
+        const ext =
+          (String(f.name || '').split('.').pop() || 'bin').replace(/[^a-z0-9]/gi, '').slice(0, 8) ||
+          'bin';
+        const key = `fb/${id}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+        await env.FEEDBACK_BUCKET.put(key, f.stream(), {
+          httpMetadata: { contentType: type },
+        });
+        uploaded.push(key);
+        attachments.push({ key, type, name: String(f.name || '').slice(0, 80), size: f.size });
+      }
+    } catch {
+      await cleanup();
+      return storageFail();
     }
   }
 
   const record = {
     id,
-    message: message.slice(0, 2000),
+    message: message.slice(0, msgMax),
+    kind,
+    link,
     contact,
     page,
     attachments,
     ua: (request.headers.get('user-agent') || '').slice(0, 200),
-    ip: request.headers.get('cf-connecting-ip') || '',
+    ip: clientIp,
     geo: {
       country: (request.cf && request.cf.country) || '',
       region: (request.cf && request.cf.region) || '',
@@ -994,11 +1061,17 @@ async function handleFeedbackSubmit(request, env) {
     },
     time: new Date().toISOString(),
   };
-  await env.FEEDBACK_KV.put(id, JSON.stringify(record));
-  if (clientIp)
-    await env.FEEDBACK_KV.put('cool_youtube_' + ipLimitKey(clientIp), String(Date.now()), {
-      expirationTtl: COOLDOWN_SECS,
-    });
+  try {
+    await env.FEEDBACK_KV.put(id, JSON.stringify(record));
+  } catch {
+    await cleanup();
+    return storageFail();
+  }
+  if (coolKey) {
+    try {
+      await env.FEEDBACK_KV.put(coolKey, String(Date.now()), { expirationTtl: COOLDOWN_SECS });
+    } catch {}
+  }
   return json({ ok: true });
 }
 
@@ -1108,7 +1181,7 @@ function geoName(it){
 }
 const siteName = (p) => {
   try {
-    const h = new URL(p).hostname;
+    const h = new URL(p).hostname.toLowerCase();
     if (h.includes('tiktok')) return 'TikTok站';
     if (h.includes('xiaohongshu')) return '小红书站';
     if (h.includes('douyin')) return '抖音站';
@@ -1116,7 +1189,7 @@ const siteName = (p) => {
     if (h.includes('bilibili')) return 'B站站';
     if (h.includes('kuaishou')) return '快手站';
     if (h.includes('weibo')) return '微博站';
-    if (h.includes('DeepSeek')) return 'DeepSeek站';
+    if (h.includes('deepseek')) return 'DeepSeek站';
     return h;
   } catch { return ''; }
 };
@@ -1134,7 +1207,9 @@ async function load() {
       d.className = 'fb';
       const t = new Date(it.time).toLocaleString('zh-CN', { hour12: false });
       d.innerHTML = '<div class="meta"><span class="site">[' + esc(siteName(it.page)) + ']</span> ' + esc(t) + (it.contact ? ' · ' + esc(it.contact) : '') + (it.ip ? ' · IP: ' + esc(it.ip) : '') + (geoName(it) ? ' (' + esc(geoName(it)) + ')' : '') + '</div>' +
-        '<div class="msg">' + esc(it.message) + '</div>';
+        (it.kind ? '<div class="kind" style="font-size:12px;color:#ff8a00;margin-bottom:4px">【' + esc(it.kind) + '】</div>' : '') +
+        '<div class="msg">' + esc(it.message) + '</div>' +
+        (it.link ? '<div class="link" style="font-size:12px;color:#888;margin-top:6px;white-space:pre-wrap;word-break:break-all">当前输入：' + esc(it.link) + '</div>' : '');
       const copyBtn = document.createElement('button');
       copyBtn.textContent = '📋 复制文本';
       copyBtn.style.cssText = 'margin-top:8px;background:#f0f0f2;border:none;border-radius:8px;padding:8px 16px;font-size:13px;color:#333;cursor:pointer';
@@ -1164,7 +1239,10 @@ async function load() {
       btn.textContent = '删除';
       btn.onclick = async () => {
         if (!confirm('删除这条反馈？')) return;
-        await fetch('/api/feedback?id=' + encodeURIComponent(it.id), { method: 'DELETE' });
+        let r = null, j = null;
+        try { r = await fetch('/api/feedback?id=' + encodeURIComponent(it.id), { method: 'DELETE' }); j = await r.json().catch(() => null); } catch (e) {}
+        if (r && (r.status === 401 || r.status === 403)) { alert('登录已过期，请重新登录'); location.href = '/admin'; return; }
+        if (!r || !r.ok || !j || !j.ok) { alert('删除失败：' + ((j && j.error) || (r ? 'HTTP ' + r.status : '网络错误'))); return; }
         load();
       };
       d.appendChild(btn);
