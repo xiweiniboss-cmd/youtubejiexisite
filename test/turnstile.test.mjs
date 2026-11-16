@@ -1,3 +1,4 @@
+import {sqliteD1,testRequest} from './helpers/d1.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -7,6 +8,8 @@ import worker, {
   HUMAN_PASS_REFRESH_NEAR_CAP_SECS, MERGE_JOB_ID_RE,
   signHumanPass, verifyHumanPass, _resetHumanWarn,
 } from '../_worker.js';
+{const fetchWorker=worker.fetch.bind(worker);worker.fetch=(r,e,c)=>fetchWorker(testRequest(r),{PARSE_DB:sqliteD1(),...(e||{})},c);}
+
 
 const SECRET = 'test-turnstile-secret-DO-NOT-ECHO';
 const SV = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
@@ -54,7 +57,7 @@ const PARSE = '/api/parse?url=' + encodeURIComponent('https://youtu.be/dQw4w9WgX
 const reachedParse = (r) => r.resp.status === 500 && /RedFoxHub/.test(r.body.error);
 
 test('turnstile: gated path list is exactly the parse entry points', () => {
-  assert.deepEqual([...HUMAN_PATHS].sort(), ['/api/parse', '/api/yt-direct', '/api/yt-hd', '/api/yt1080-start', '/api/ytdl']);
+  assert.deepEqual([...HUMAN_PATHS].sort(), ['/api/human-pass', '/api/parse', '/api/yt-direct', '/api/yt-hd', '/api/yt1080-start', '/api/ytdl']);
 });
 
 test('turnstile: missing token -> 403 with Chinese error, siteverify not called, handler not reached', async () => {
@@ -334,7 +337,7 @@ test('index.html: humanMsg distinguishes load failure / still loading / expired 
   assert.match(run('humanMsg({ code: "HUMAN_REQUIRED" })'), /^人机验证加载中…/);
   // 组件好好的：旧结果的下载 / 合并因为通行证过期被拦
   run('tsState = "ready"; tsParseWidgetId = 1');
-  assert.equal(run('humanMsg({ code: "HUMAN_REQUIRED" })'), '验证已过期，请重新点开始解析');
+  assert.equal(run('humanMsg({ code: "HUMAN_REQUIRED" })'), '验证已过期，请完成人机验证后重试下载或合并');
   assert.equal(run('humanMsg({ code: "HUMAN_UNAVAILABLE", error: "验证服务暂时连不上，请稍后再试" })'), '验证服务暂时连不上，请稍后再试');
   assert.equal(run('humanMsg({ code: "HUMAN_FAILED", error: "人机验证未通过，请重试" })'), '人机验证未通过，请重试');
   // HUMAN_UNAVAILABLE 也算拒绝 → 重置组件
