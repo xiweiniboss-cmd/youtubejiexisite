@@ -208,7 +208,12 @@ function jxParseHeaders(h) {
     <div id="resList"></div>
     <div class="dlprog" id="dlProg">
       <div class="track"><div class="bar" id="dlProgBar"></div></div>
-      <div class="txt" id="dlProgTxt">准备下载</div>
+      <div class="txt" id="dlProgTxt" aria-live="polite">准备下载</div>
+      <div id="dlControls" style="display:none;margin-top:10px">
+        <button type="button" class="btn" id="dlPause">暂停下载</button>
+        <button type="button" class="btn" id="dlCancel">取消下载</button>
+        <div class="hint" id="dlResumeHint">暂停保留当前页面内已下载的部分；不要刷新或关闭页面。合并处理阶段不能暂停。</div>
+      </div>
     </div>
     <button type="button" class="btn" id="saveBtn" style="display:none" onclick="window.__saveFile()">下载完成，点这里保存</button>
     <div class="hint" id="dlHint" style="display:none">iPhone 会弹出分享菜单，点「存储视频」即可保存到相册；没弹出就点「点这里保存」<br>直链有时效，解析完尽快下载</div>
@@ -391,30 +396,43 @@ var deviceId = (function(){
     }
     return '/api/ytdl?url=' + encodeURIComponent(url) + '&filename=' + encodeURIComponent(filename) + (ua ? '&ua=' + encodeURIComponent(ua) : '');
   }
-  function fetchBlobProgress(url, onProgress){
-    return fetch(url).then(function(res){
-      if(!res.ok) return readProxyError(res);
-      var total = parseInt(res.headers.get('Content-Length') || '0', 10) || 0;
-      var ctype = res.headers.get('Content-Type') || 'video/mp4';
-      if(!res.body || !res.body.getReader) return res.blob();
-      var reader = res.body.getReader();
-      var chunks = [];
-      var received = 0;
-      onProgress(0, total);
-      function pump(){
-        return reader.read().then(function(r){
-          if(r.done){
-            try{ reader.releaseLock(); }catch(e){}
-            return new Blob(chunks, { type: ctype });
-          }
-          chunks.push(r.value);
-          received += r.value.byteLength || r.value.length || 0;
-          onProgress(received, total);
-          return pump();
-        });
+  // 同一时刻只保留一个下载会话；音视频共用控制器，一起暂停、重验、取消。
+  var activeDownload = null;
+  function beginDownload(){
+    if(activeDownload){ showError('已有下载任务，请先继续或取消当前任务'); return null; }
+    var control=window.YTFetch.createControl({
+      beforeResume:ensureHumanPass,
+      onHumanExpired:function(e){ humanDone('',e); },
+      onCapability:function(message){ document.getElementById('dlPause').disabled=control.state==='running'; document.getElementById('dlResumeHint').textContent=message; },
+      onState:function(state,message){
+        var button=document.getElementById('dlPause');
+        button.disabled=(state==='running' && !control.resumable) || state==='verifying' || state==='done' || state==='failed';
+        button.textContent=state==='paused' ? '继续下载' : state==='verifying' ? '正在重新验证…' : '暂停下载';
+        if(state==='paused') document.getElementById('dlProgTxt').textContent=message || '已暂停，已下载部分保留在当前页面';
+        if(state==='verifying') document.getElementById('dlProgTxt').textContent='正在验证，完成后继续下载…';
+        if(state==='running') document.getElementById('dlProgTxt').textContent='正在继续下载…';
       }
-      return pump();
     });
+    activeDownload=control;
+    document.getElementById('dlResumeHint').textContent='暂停保留当前页面内已下载的部分；不要刷新或关闭页面。合并处理阶段不能暂停。';
+    var box=document.getElementById('dlControls'); box.style.display='block';
+    var pause=document.getElementById('dlPause'); pause.disabled=false; pause.textContent='暂停下载';
+    document.getElementById('dlCancel').disabled=false;
+    pause.onclick=function(){ if(control.state==='paused') control.resume(); else control.pause(); };
+    document.getElementById('dlCancel').onclick=function(){ control.cancel(); };
+    return control;
+  }
+  function finishDownload(control){
+    control.finish();
+    if(activeDownload===control){ activeDownload=null; document.getElementById('dlControls').style.display='none'; }
+  }
+  function mergingDownload(control){
+    control.finish(); // 所有媒体已下完，CPU 合并不是可暂停的下载阶段。
+    document.getElementById('dlControls').style.display='none';
+  }
+  window.addEventListener('beforeunload',function(e){ if(activeDownload){ e.preventDefault(); e.returnValue=''; } });
+  function fetchBlobProgress(url,onProgress,control){
+    return window.YTFetch.getProxy(url,null,onProgress,control);
   }
   // 下载完成后保存：iPhone 的分享菜单必须由“点击”直接触发，下载几十秒后再自动调用会被系统静默拒绝，
   // 所以自动尝试一次，失败就亮出「点这里保存」按钮让用户再点一下（新的点击一定能弹出）。
@@ -500,14 +518,17 @@ var deviceId = (function(){
   function hideDlProg(){ document.getElementById('dlProg').style.display = 'none'; }
 
   function downloadResource(url, filename, ua, spec){
+    var control=beginDownload(); if(!control) return;
     setParseBtn('正在准备下载…', true); __hkHideBtn();
     resetDlProg();
     var proxyUrl = ytdlProxyUrl(url, filename, ua, spec);
-    ensureHumanPass().then(function(){ return fetchBlobProgress(proxyUrl, setDlProg); }).then(function(blob){
+    control.guard(ensureHumanPass()).then(function(){ return fetchBlobProgress(proxyUrl, setDlProg, control); }).then(function(blob){
+      finishDownload(control);
       hideDlProg();
       resetParseBtn();
       __hkSave(blob, filename);
     }).catch(function(e){
+      control.fail(e); finishDownload(control);
       resetParseBtn();
       hideDlProg();
       // 通行证过期（旧结果过了 5 分钟 / 2 小时）：提示重新验证后重试，不重复解析扣次数
@@ -561,7 +582,8 @@ var deviceId = (function(){
   }
   var _merging = false;
   function mergeDownload(v, a, title, btn, ua, vid){
-    if (_merging) return; _merging = true;
+    if (_merging) return;
+    var control=beginDownload(); if(!control) return; _merging = true;
     var old = btn.textContent; btn.disabled = true; __hkHideBtn(); hideError();
     var bar = document.getElementById('dlProgBar'), txt = document.getElementById('dlProgTxt');
     document.getElementById('dlProg').style.display = 'block';
@@ -572,13 +594,13 @@ var deviceId = (function(){
       stage('下载画面和声音 ' + (tot ? Math.round(g / tot * 100) + '%（' + fmtMB(g) + ' / ' + fmtMB(tot) + '）' : fmtMB(g)), tot ? Math.round(g / tot * 90) : 5);
     }
     stage('准备下载…', 0);
-    var pre = window.YTMerge.preload(function(t){ if (!vt) stage(t, 2); }).catch(function(e){ return e; });
     var vSpec = streamSpec(v, vid, ua), aSpec = streamSpec(a, vid, ua);
-    ensureHumanPass().then(function(){ return Promise.all([
-      window.YTFetch.get(v.url, 'video/mp4', function(g, t){ vg = g; vt = t; prog(); }, ua, vSpec),
-      window.YTFetch.get(a.url, 'audio/mp4', function(g, t){ ag = g; at = t; prog(); }, ua, aSpec)
+    control.guard(ensureHumanPass()).then(function(){ return Promise.all([
+      window.YTFetch.get(v.url, 'video/mp4', function(g, t){ vg = g; vt = t; prog(); }, ua, vSpec, control),
+      window.YTFetch.get(a.url, 'audio/mp4', function(g, t){ ag = g; at = t; prog(); }, ua, aSpec, control)
     ]); }).then(function(r){
-      return pre.then(function(){
+      mergingDownload(control);
+      return window.YTMerge.preload(function(t){ stage(t,92); }).then(function(){
         return window.YTMerge.merge(r[0], r[1], function(t){ stage(t, 95); });
       });
     }).then(function(out){
@@ -586,11 +608,12 @@ var deviceId = (function(){
       setTimeout(hideDlProg, 1500);
       __hkSave(out, fileName(title + '_' + (v.height || resHeight(v) || 'HD') + 'P', 'mp4'));
     }).catch(function(e){
+      control.fail(e); finishDownload(control);
       hideDlProg();
       if (humanDone('', e)) { showError('合并下载失败：' + humanMsg(e)); return; }
       if (isDirectLimited(e) && autoServerMerge(vid, v.height || resHeight(v))) return;
       showError('合并下载失败：' + formatDlError(e) + '\n\n手机里合并不了时，用「服务器合并」。');
-    }).then(function(){ _merging = false; btn.disabled = false; btn.textContent = old; });
+    }).then(function(){ finishDownload(control); _merging = false; btn.disabled = false; btn.textContent = old; });
   }
 
   // 失败文案跟着接口的 code 走（BOT_CHECK / LOGIN_REQUIRED），按真实高度显示按钮。
@@ -1158,6 +1181,7 @@ var deviceId = (function(){
   }).catch(function(){ $('parseCount').textContent = '-'; });
 
   parseBtn.onclick = function(){
+    if(activeDownload){ showError('请先完成或取消当前下载任务'); return; }
     var text = urlInput.value.trim();
     hideError();
     resultBox.style.display = 'none';
@@ -1203,6 +1227,7 @@ var deviceId = (function(){
   (function(){
     var parseCore = parseBtn.onclick;
     parseBtn.onclick = function(){
+      if(activeDownload){ showError('请先完成或取消当前下载任务'); return; }
       if (!urlInput.value.trim() || parseBtn.disabled) return parseCore();
       hideError();
       setParseBtn('人机验证中…', true);
@@ -1284,15 +1309,18 @@ var deviceId = (function(){
     return /\.mp4$/i.test(n) ? n : n.replace(/\.(webm|mkv|m4v|mov)$/i, '') + '.mp4';
   }
   function downloadMerged(jobId, filename, onStatus){
+    var control=beginDownload(); if(!control) return;
     var report = function(html){ setMergeStatus(html); if (typeof onStatus === 'function') onStatus(html); };
     setMergeBtn('正在下载成品…', true);
     resetDlProg();
-    fetchBlobProgress('/api/yt1080-file?id=' + encodeURIComponent(jobId), setDlProg).then(function(blob){
+    control.guard(ensureHumanPass()).then(function(){ return fetchBlobProgress('/api/yt1080-file?id=' + encodeURIComponent(jobId), setDlProg, control); }).then(function(blob){
+      finishDownload(control);
       hideDlProg();
       resetMergeBtn();
       report('合并完成，文件 ' + fmtMB(blob.size) + '，正在弹出保存…');
       __hkSave(blob, mergedName(filename, blob.type));
     }).catch(function(e){
+      control.fail(e); finishDownload(control);
       resetMergeBtn();
       hideDlProg();
       if (e && e.code === 'MERGE_NOT_IPHONE') { report(e.message); return; }
@@ -1300,6 +1328,7 @@ var deviceId = (function(){
     });
   }
   function startServerMerge(ytUrl, quality, mode, label, onStatus){
+    if(activeDownload){ showError('请先继续或取消当前下载任务'); return; }
     setMergeBtn('人机验证中…', true);
     ensureHumanPass().then(function(){ startServerMergeReady(ytUrl,quality,mode,label,onStatus); }, function(e){
       resetMergeBtn(); setMergeStatus(e.message || tsNeedMsg()); if(onStatus) onStatus(e.message || tsNeedMsg());

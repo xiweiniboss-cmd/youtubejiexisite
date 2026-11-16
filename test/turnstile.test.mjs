@@ -357,7 +357,7 @@ test('index.html: load-state UI strings, 8s timeout, compact widget centered, do
   assert.match(html, /if \(humanDone\('', e\)\) \{ showError\('合并下载失败：' \+ humanMsg\(e\)\); return; \}/);
   assert.match(html, /status\(humanMsg\(j\)\)/);
   const ym = readFileSync(new URL('../ytmerge.js', import.meta.url), 'utf8');
-  assert.match(ym, /if \(code\) e2\.code = code;/, 'chunked downloads keep the HUMAN_* code');
+  assert.match(ym, /if\(code\) e\.code = code;/, 'chunked downloads keep the HUMAN_* code');
 });
 
 // ---- 合并任务 id 白名单 ----

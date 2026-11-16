@@ -1383,3 +1383,61 @@ test('yt1080-start only forwards a normalized single YouTube video URL to EC2', 
     globalThis.fetch = orig;
   }
 });
+
+// 暂停续传：不能把非零分段当文件头，也不能绕过原来的 iPhone 格式保护。
+test('yt1080-file: initial Range and If-Range are forwarded, 206 and representation headers survive', async()=>{
+  let calls=0;
+  const part=MP4_H264_AAC.subarray(0,128);
+  const r=await withFetch(async(url,init)=>{
+    calls++;assert.equal(init.headers.Range,'bytes=0-127');assert.equal(init.headers['If-Range'],'"file-v1"');
+    return new Response(part,{status:206,headers:{'Content-Type':'video/mp4','Content-Length':String(part.length),'Content-Range':`bytes 0-127/${MP4_H264_AAC.length}`,ETag:'"file-v1"','Accept-Ranges':'bytes'}});
+  },()=>worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001',{headers:{Range:'bytes=0-127','If-Range':'"file-v1"'}}),ENV));
+  assert.equal(r.status,206);assert.equal(calls,1);assert.equal(r.headers.get('ETag'),'"file-v1"');
+  assert.equal(r.headers.get('Content-Range'),`bytes 0-127/${MP4_H264_AAC.length}`);assert.deepEqual(Buffer.from(await r.arrayBuffer()),part);
+});
+
+test('yt1080-file: nonzero range probes only the prefix for codec validation and returns only requested bytes',async()=>{
+  const calls=[],start=1000,end=1499,part=MP4_H264_AAC.subarray(start,end+1);
+  const r=await withFetch(async(url,init)=>{
+    calls.push(init.headers.Range);const probe=init.headers.Range==='bytes=0-524287';
+    return new Response(probe?MP4_H264_AAC:part,{status:206,headers:{'Content-Type':'video/mp4','Content-Length':String(probe?MP4_H264_AAC.length:part.length),'Content-Range':probe?`bytes 0-${MP4_H264_AAC.length-1}/${MP4_H264_AAC.length}`:`bytes ${start}-${end}/${MP4_H264_AAC.length}`,ETag:'"v1"'}});
+  },()=>worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001',{headers:{Range:`bytes=${start}-${end}`}}),ENV));
+  assert.equal(r.status,206);assert.deepEqual(calls,[`bytes=${start}-${end}`,'bytes=0-524287']);assert.deepEqual(Buffer.from(await r.arrayBuffer()),part);
+});
+
+test('yt1080-file: nonzero range still rejects incompatible codecs and cancels the outstanding media body',async()=>{
+  let cancelled=false;
+  const r=await withFetch(async(url,init)=>{
+    if(init.headers.Range==='bytes=0-524287')return new Response(MP4_H264_OPUS,{headers:{'Content-Type':'video/mp4',ETag:'"v1"'}});
+    return new Response(new ReadableStream({start(c){c.enqueue(new Uint8Array(8));},cancel(){cancelled=true;}}),{status:206,headers:{'Content-Type':'video/mp4',ETag:'"v1"','Content-Range':`bytes 100-107/${MP4_H264_OPUS.length}`}});
+  },()=>worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001',{headers:{Range:'bytes=100-107'}}),ENV));
+  assert.equal(r.status,415);assert.equal((await r.json()).code,'MERGE_NOT_IPHONE');assert.equal(cancelled,true);
+});
+
+test('yt1080-file: changed prefix validator fails closed and cancels media instead of blessing a different representation',async()=>{
+  let cancelled=false;
+  const r=await withFetch(async(url,init)=>{
+    if(init.headers.Range==='bytes=0-524287')return new Response(MP4_H264_AAC,{headers:{'Content-Type':'video/mp4',ETag:'"changed"'}});
+    return new Response(new ReadableStream({start(c){c.enqueue(new Uint8Array(8));},cancel(){cancelled=true;}}),{status:206,headers:{'Content-Type':'video/mp4',ETag:'"old"','Content-Range':`bytes 100-107/${MP4_H264_AAC.length}`}});
+  },()=>worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001',{headers:{Range:'bytes=100-107'}}),ENV));
+  assert.equal(r.status,502);assert.equal(cancelled,true);assert.match((await r.json()).error,/已变化/);
+});
+
+test('yt1080-file: an upstream ignoring Range remains 200, never a fabricated 206',async()=>{
+  let calls=0;
+  const r=await withFetch(async()=>{calls++;return new Response(MP4_H264_AAC,{headers:{'Content-Type':'video/mp4'}});},
+    ()=>worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001',{headers:{Range:'bytes=100-199'}}),ENV));
+  assert.equal(r.status,200);assert.equal(calls,1);assert.deepEqual(Buffer.from(await r.arrayBuffer()),MP4_H264_AAC);
+});
+
+test('yt1080-file: malformed, multipart, backwards and unsafe ranges never reach merge origin',async()=>{
+  for(const range of ['bytes=-10','bytes=0-9,20-29','bytes=20-10','bytes=9007199254740993-','bytes=0-9007199254740993']){
+    const r=await withFetch(async()=>assert.fail('must not call origin'),()=>worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001',{headers:{Range:range}}),ENV));
+    assert.equal(r.status,400,range);await r.body.cancel();
+  }
+});
+
+test('yt1080-file: upstream 416 remains an error and never gets turned into a video',async()=>{
+  const r=await withFetch(async()=>Response.json({error:'out of range'},{status:416}),()=>worker.fetch(new Request('https://example.com/api/yt1080-file?id=job-0001',{headers:{Range:'bytes=100-199'}}),ENV));
+  assert.equal(r.status,416);assert.match(r.headers.get('Content-Type'),/json/);await r.body.cancel();
+});
