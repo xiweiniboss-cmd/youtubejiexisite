@@ -1,3 +1,4 @@
+import {humanUI} from './helpers/frontend-human.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
@@ -261,4 +262,22 @@ test('actual D1 stream leases are released on pause and resumed ranges reuse one
   assert.ok(maxSlots>1&&maxSlots<=3);await c.resume();await matches(await p,o.bytes);await until(()=>slots()===0);
   assert.equal(d.db.prepare("SELECT COUNT(*) AS c FROM rate_counter WHERE k LIKE 'ydt:%'").get().c,1);
   assert.equal(d.db.prepare("SELECT COUNT(*) AS c FROM rate_counter WHERE k LIKE 'youtube:%' OR k LIKE 'ytx:%'").get().c,0);
+});
+
+// This joins the real download controls and actual humanReady/ensureHumanPass, not a no-op verification mock.
+test('real resume UI reveals expired verification, preserves partials, then saves the exact file',async()=>{
+  const h=humanUI({used:true});await h.init();h.run('tsPassUntil = Date.now() + 60000');
+  const o=origin();let paused=false,x;
+  x=ui(o.fetch,{ensureHumanPass:h.ctx.ensureHumanPass,setDlProg:n=>{if(n>=6&&!paused){paused=true;x.elements.dlPause.onclick();}}});
+  x.context.downloadResource('https://media.example/file','test.mp4');
+  await until(()=>x.context.activeDownload?.state==='paused');await until(()=>o.live===0);
+  h.run('tsPassUntil = Date.now() - 1');const oldCalls=o.calls.length;
+  x.elements.dlPause.onclick();await h.flush();
+  assert.equal(x.context.activeDownload.state,'verifying');assert.equal(h.scrolls,1);
+  assert.equal(o.calls.length,oldCalls,'no resumed media before verification');
+  await h.solve();await until(()=>x.saved.length===1);
+  await matches(x.saved[0].blob,o.bytes);
+  assert.ok(o.calls.slice(oldCalls).some(c=>/^bytes=[1-9]/.test(c.range)&&c.ifRange==='"same-file"'));
+  assert.equal(h.calls.filter(c=>c.url.startsWith('/api/human-pass')).length,2);
+  assert.equal(h.calls.some(c=>/api\/parse|yt1080-start/.test(c.url)),false);
 });

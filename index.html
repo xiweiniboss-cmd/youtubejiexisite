@@ -826,13 +826,13 @@ var deviceId = (function(){
   /* 解析区人机验证（与反馈共用一次脚本加载，重复引入会卡死组件） */
   // 加载状态：idle（还没问服务器）→ off（服务器不要求）/ loading → ready（组件出来了）/ failed（脚本、site key 或 8 秒内没渲染出来）
   var TS_MSG_LOADING = '人机验证加载中…';
-  var TS_MSG_LOAD_FAIL = '人机验证组件加载失败，请检查网络或 VPN 后刷新';
+  var TS_MSG_LOAD_FAIL = '人机验证组件加载失败，请检查网络或 VPN 后重试，不要刷新下载页面';
   var TS_MSG_EXPIRED = '验证已过期，请完成人机验证后重试下载或合并';
-  var TS_MSG_REJECTED = '人机验证未通过，请刷新页面重试';
+  var TS_MSG_REJECTED = '人机验证未通过，请重试，不要刷新下载页面';
   var TS_RENDER_TIMEOUT_MS = 8000;
   var tsState = 'idle', tsRequired = false, tsLoadTimer = null;
-  function tsSetState(st){
-    if (tsState === 'ready' && st !== 'ready') return; // 已经渲染出来就不再回退（晚到的超时 / 报错不覆盖）
+  function tsSetState(st, retry){
+    if (!retry && tsState === 'ready' && st !== 'ready') return; // 已经渲染出来就不再回退（晚到的超时 / 报错不覆盖）
     tsState = st;
     if (tsLoadTimer && (st === 'ready' || st === 'failed' || st === 'rejected' || st === 'off')) { clearTimeout(tsLoadTimer); tsLoadTimer = null; }
     var el = document.getElementById('tsParseState');
@@ -858,7 +858,7 @@ var deviceId = (function(){
       return new Promise(function(resolve, reject){
         if (window.turnstile) { resolve(j.siteKey); return; }
         var s = document.createElement('script');
-        s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+        s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
         s.async = true; s.defer = true;
         s.onload = function(){ resolve(j.siteKey); };
         s.onerror = function(){ reject(new Error('script load failed')); };
@@ -872,7 +872,10 @@ var deviceId = (function(){
   // 组件里有 token 就一律带上（服务器只在没有通行证、或通行证快到 2 小时封顶时才真去 siteverify，否则不消耗它）；
   // 没 token 时，本地通行证有效期内照常请求；服务器回 HUMAN_* 就清零重新验证。
   var TS_PASS_MS = 4 * 60 * 1000, tsPassUntil = 0;
-  function resetParseTs(){ if (tsParseWidgetId !== null) { try { turnstile.reset(tsParseWidgetId); } catch(e){} } }
+  function resetParseTs(){
+    if (tsParseWidgetId === null) return false;
+    try { turnstile.reset(tsParseWidgetId); return true; } catch(e){ return false; }
+  }
   // 返回要拼到接口地址后的参数：'' = 不带 token（未配置 / 组件没出来 / 通行证有效），null = 还没完成验证
   function humanQuery(){
     if (tsParseWidgetId === null) return '';
@@ -935,7 +938,7 @@ var deviceId = (function(){
         callback: ready,
         'before-interactive-callback': ready,
         'after-interactive-callback': ready,
-        'unsupported-callback': function(){ tsSetState('failed'); },
+        'unsupported-callback': function(){ tsSetState('failed', true); },
         'expired-callback': function(){ resetParseTs(); },
         'timeout-callback': function(){ resetParseTs(); },
         'error-callback': function(code){
@@ -944,8 +947,7 @@ var deviceId = (function(){
           var hasFrame = !!(box && box.querySelector('iframe, input[name="cf-turnstile-response"]'));
           // 2005xx 是网络类错误（连不上 Cloudflare），归到加载失败
           var netErr = /^2005/.test(String(code || ''));
-          if (tsState !== 'ready') tsSetState(hasFrame && !netErr ? 'rejected' : 'failed');
-          else showError('人机验证失败，请重试（刷新页面也可以）');
+          tsSetState(hasFrame && !netErr ? 'rejected' : 'failed', true);
         }
       });
     } catch(e){ tsSetState('failed'); }
@@ -956,10 +958,26 @@ var deviceId = (function(){
   });
   return _tsInitP;
   }
-  // 点「开始解析」时调用：按需加载组件，等到有 token（或服务器不要求 / 本地通行证有效）再继续
+  // 旧下载的结果区离解析组件很远；过期后必须重新唤醒原组件并让用户看得见，不能在屏外空等两分钟。
+  // 不搬动 iframe、不刷新页面，已下载的分段仍由原控制器保留。
+  function revealParseTs(){
+    var box = $('tsParseWidget');
+    if (box && box.scrollIntoView) box.scrollIntoView({behavior:'smooth', block:'center'});
+    var hint = $('tsParseState');
+    if (hint) { hint.className='hint ts-state'; hint.textContent='请在此处完成人机验证，完成后会自动继续；不要刷新页面。'; hint.style.display='block'; }
+  }
+  // 解析、下载和恢复共用：有通行证/新 token 不重置；过期且无 token 才主动重置一次。
   function humanReady(){
     if (tsState === 'off' || (tsParseWidgetId === null && Date.now() < tsPassUntil)) return Promise.resolve();
+    var hadWidget = tsParseWidgetId !== null;
     return initParseTs().then(function(){
+      if (tsParseWidgetId !== null && (humanQuery() === null || tsState === 'failed' || tsState === 'rejected')) {
+        if (hadWidget) {
+          tsSetState('loading', true);
+          if (!resetParseTs()) throw new Error('人机验证组件重试失败，请检查网络后再点继续；不要刷新页面');
+        }
+        revealParseTs();
+      }
       return new Promise(function(resolve, reject){
         var t0 = Date.now();
         (function poll(){
@@ -967,8 +985,8 @@ var deviceId = (function(){
             if (tsRequired && (tsState === 'failed' || tsState === 'rejected')) return reject(new Error(tsNeedMsg()));
             return resolve();
           }
-          if (tsState === 'rejected') return reject(new Error(tsNeedMsg()));
-          if (humanQuery() !== null) return resolve();
+          if (tsState === 'rejected' || tsState === 'failed') return reject(new Error(tsNeedMsg()));
+          if (humanQuery() !== null) { tsSetState('ready'); return resolve(); }
           if (Date.now() - t0 > 120000) return reject(new Error('请先完成人机验证'));
           setTimeout(poll, 300);
         })();
