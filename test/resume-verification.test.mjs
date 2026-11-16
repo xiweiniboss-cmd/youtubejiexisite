@@ -34,7 +34,7 @@ test('widget errors after previously being ready reject promptly; next click ret
   const x=humanUI();await x.init();let rejected=false;
   const p=assert.rejects(x.ctx.ensureHumanPass(),/人机验证/).then(()=>{rejected=true;});await x.flush();
   x.callbacks['error-callback']('200500');await x.advance(300);await p;assert.equal(rejected,true);
-  const retry=x.ctx.ensureHumanPass();await x.flush();assert.equal(x.resets,2);
+  const retry=x.ctx.ensureHumanPass();await x.flush();assert.equal(x.resets,1);assert.equal(x.renders,2,'failed challenge is recreated');
   await x.solve('retry');await retry;
   assert.equal(x.calls.filter(c=>c.url.startsWith('/api/human-pass')).length,1);
 });

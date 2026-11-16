@@ -824,12 +824,12 @@ var deviceId = (function(){
   };
 
   /* 解析区人机验证（与反馈共用一次脚本加载，重复引入会卡死组件） */
-  // 加载状态：idle（还没问服务器）→ off（服务器不要求）/ loading → ready（组件出来了）/ failed（脚本、site key 或 8 秒内没渲染出来）
+  // 加载状态：idle（还没问服务器）→ off（服务器不要求）/ loading → ready（组件出来了）/ failed（脚本、site key 或网络加载超时）
   var TS_MSG_LOADING = '人机验证加载中…';
   var TS_MSG_LOAD_FAIL = '人机验证组件加载失败，请检查网络或 VPN 后重试，不要刷新下载页面';
   var TS_MSG_EXPIRED = '验证已过期，请完成人机验证后重试下载或合并';
   var TS_MSG_REJECTED = '人机验证未通过，请重试，不要刷新下载页面';
-  var TS_RENDER_TIMEOUT_MS = 8000;
+  var TS_RENDER_TIMEOUT_MS = 30000;
   var tsState = 'idle', tsRequired = false, tsLoadTimer = null;
   function tsSetState(st, retry){
     if (!retry && tsState === 'ready' && st !== 'ready') return; // 已经渲染出来就不再回退（晚到的超时 / 报错不覆盖）
@@ -844,26 +844,45 @@ var deviceId = (function(){
     else if (st === 'rejected') { el.className = 'hint ts-state ts-fail'; el.textContent = TS_MSG_REJECTED; el.style.display = 'block'; }
     else { el.textContent = ''; el.style.display = 'none'; }
   }
+  // 所有网络等待都有上限；超时后不让迟到响应推进旧下载。
+  function tsBounded(work, ms, message){
+    return new Promise(function(resolve, reject){
+      var ended=false, deadline=Date.now()+ms;
+      var timer=setTimeout(function(){ finish(new Error(message)); }, ms);
+      function finish(error, value){
+        if(ended) return;
+        ended=true; clearTimeout(timer);
+        if(error) reject(error); else resolve(value);
+      }
+      Promise.resolve(work).then(function(value){
+        if(Date.now() >= deadline) finish(new Error(message)); else finish(null,value);
+      }, function(error){ finish(error); });
+    });
+  }
   var _tsScriptPromise = null;
   function ensureTurnstileScript(){
     if (_tsScriptPromise) return _tsScriptPromise;
-    _tsScriptPromise = fetch('/api/turnstile-key').then(function(r){ return r.json(); }).then(function(j){
+    var script=null, live=true;
+    var load=fetch('/api/turnstile-key').then(function(r){ if(!r.ok) throw new Error('site key unavailable'); return r.json(); }).then(function(j){
+      if(!live) throw new Error('verification load ended');
       tsRequired = !!(j && j.required);
       if (!j.ok || !j.siteKey) { var ne = new Error('no site key'); ne.noKey = true; throw ne; }
-      if (tsState === 'idle') {
-        tsSetState('loading');
-        // 国内网络常见情况：脚本不报错也不加载（一直挂着），8 秒还没渲染出来就提示
-        tsLoadTimer = setTimeout(function(){ tsLoadTimer = null; if (tsState === 'loading') tsSetState('failed'); }, TS_RENDER_TIMEOUT_MS);
-      }
+      if (tsState === 'idle' || tsState === 'failed') tsSetState('loading', true);
       return new Promise(function(resolve, reject){
         if (window.turnstile) { resolve(j.siteKey); return; }
-        var s = document.createElement('script');
-        s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-        s.async = true; s.defer = true;
-        s.onload = function(){ resolve(j.siteKey); };
-        s.onerror = function(){ reject(new Error('script load failed')); };
-        document.head.appendChild(s);
+        script = document.createElement('script');
+        script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+        script.async = true; script.defer = true;
+        script.onload = function(){ if(live) resolve(j.siteKey); };
+        script.onerror = function(){ reject(new Error('script load failed')); };
+        document.head.appendChild(script);
       });
+    });
+    _tsScriptPromise = tsBounded(load, TS_RENDER_TIMEOUT_MS, TS_MSG_LOAD_FAIL).catch(function(e){
+      live=false;
+      if(script && script.remove) script.remove();
+      _tsScriptPromise=null; // 下次明确点击可重试，不能永久缓存 rejected promise
+      throw e;
     });
     return _tsScriptPromise;
   }
@@ -892,18 +911,31 @@ var deviceId = (function(){
     if (rejected || (q && used)) resetParseTs();
     return rejected;
   }
+  var _humanPassPending = null;
   function ensureHumanPass(){
-    return humanReady().then(function(){
+    if(_humanPassPending) return _humanPassPending;
+    var attempt=humanReady().then(function(){
       var q = humanQuery();
       if (q === null) throw new Error(tsNeedMsg());
-      return fetch('/api/human-pass' + (q ? '?' + q.slice(1) : ''), {credentials:'same-origin'}).then(function(r){
-        var used = r.headers.get('X-Human-Token') === 'used';
-        return r.json().then(function(j){
-          var rejected = humanDone(q, j, used);
-          if (rejected || !r.ok) { var e=new Error(humanMsg(j)); e.code=j.code; throw e; }
-        });
+      var controller=new AbortController();
+      var message='验证通行证请求超时，请检查网络后再点继续；已下载部分保留，不要刷新页面';
+      // 截止点覆盖 fetch 和读取 body；即使浏览器忽略 abort，迟到响应也不能续传。
+      var request=fetch('/api/human-pass' + (q ? '?' + q.slice(1) : ''), {credentials:'same-origin',signal:controller.signal}).then(function(r){
+        return r.json().then(function(j){ return {response:r,body:j}; });
+      });
+      return tsBounded(request,30000,message).then(function(result){
+        var r=result.response, j=result.body;
+        var rejected = humanDone(q, j, r.headers.get('X-Human-Token') === 'used');
+        if (rejected || !r.ok) { var e=new Error(humanMsg(j)); e.code=j.code; throw e; }
+      },function(e){
+        controller.abort();
+        // token 可能已经被服务器消耗。失败不授予本地通行证，下次拿新 token。
+        tsPassUntil=0; resetParseTs();
+        throw e;
       });
     });
+    _humanPassPending=attempt.then(function(value){ _humanPassPending=null; return value; },function(e){ _humanPassPending=null; throw e; });
+    return _humanPassPending;
   }
   // HUMAN_* 拒绝时给用户看的话：组件没出来 → 加载失败；组件好好的 → 通行证过期（旧结果的下载 / 合并）；其余用服务器原文
   // 本地还没拿到 token 就点了按钮：按组件状态给提示
@@ -922,32 +954,49 @@ var deviceId = (function(){
     }
     return String((body && (body.error || body.message)) || '人机验证未通过，请重试');
   }
+  var tsWidgetEpoch=0;
+  function retireParseTs(){
+    tsWidgetEpoch++;
+    var id=tsParseWidgetId;
+    tsParseWidgetId=null; _tsInitP=null;
+    if(id !== null) { try { turnstile.remove(id); } catch(e){} }
+  }
   var _tsInitP = null;
   function initParseTs(){
   if (_tsInitP) return _tsInitP;
   _tsInitP = ensureTurnstileScript().then(function(siteKey){
+    var epoch=++tsWidgetEpoch;
+    tsSetState('loading',true);
     try {
       var box = $('tsParseWidget');
       // 320 宽的手机放不下 300px 标准组件，改用紧凑版（并居中）
       var compact = !!(box && box.clientWidth && box.clientWidth < 300);
       if (compact) box.className += ' ts-compact';
-      var ready = function(){ tsSetState('ready'); };
+      var current=function(){ return epoch === tsWidgetEpoch; };
+      var ready = function(){ if(current()) tsSetState('ready'); };
       tsParseWidgetId = turnstile.render('#tsParseWidget', {
         sitekey: siteKey, theme: 'dark', language: 'zh-cn',
         size: compact ? 'compact' : 'flexible',
+        // 失败留在可恢复的暂停态，避免厂商后台自动重试十几分钟后突然恢复旧操作。
+        retry: 'never', 'refresh-expired': 'manual', 'refresh-timeout': 'manual',
         callback: ready,
         'before-interactive-callback': ready,
         'after-interactive-callback': ready,
-        'unsupported-callback': function(){ tsSetState('failed', true); },
-        'expired-callback': function(){ resetParseTs(); },
-        'timeout-callback': function(){ resetParseTs(); },
+        'unsupported-callback': function(){ if(current()){ tsSetState('failed', true); tsWidgetEpoch++; } },
+        'expired-callback': function(){ if(current()){ tsSetState('rejected', true); tsWidgetEpoch++; } },
+        'timeout-callback': function(){ if(current()){ tsSetState('failed', true); tsWidgetEpoch++; } },
         'error-callback': function(code){
+          if(!current()) return true;
           // 组件已经渲染出来（iframe 在封闭 shadow 里查不到，用隐藏的 cf-turnstile-response 判断）
           // 但 Turnstile 自己判失败（如域名没授权 110200）→ 不是网络问题
           var hasFrame = !!(box && box.querySelector('iframe, input[name="cf-turnstile-response"]'));
           // 2005xx 是网络类错误（连不上 Cloudflare），归到加载失败
           var netErr = /^2005/.test(String(code || ''));
           tsSetState(hasFrame && !netErr ? 'rejected' : 'failed', true);
+          tsWidgetEpoch++; // 即使同一轮立刻迟到 success，也不覆盖这次失败
+          var hint=$('tsParseState');
+          if(hint && /^\d{6}$/.test(String(code))) hint.textContent += '（错误码 '+code+'）';
+          return true;
         }
       });
     } catch(e){ tsSetState('failed'); }
@@ -967,31 +1016,49 @@ var deviceId = (function(){
     if (hint) { hint.className='hint ts-state'; hint.textContent='请在此处完成人机验证，完成后会自动继续；不要刷新页面。'; hint.style.display='block'; }
   }
   // 解析、下载和恢复共用：有通行证/新 token 不重置；过期且无 token 才主动重置一次。
+  var _humanReadyPending=null;
   function humanReady(){
-    if (tsState === 'off' || (tsParseWidgetId === null && Date.now() < tsPassUntil)) return Promise.resolve();
+    if(_humanReadyPending) return _humanReadyPending;
+    if (tsState === 'off' || Date.now() < tsPassUntil) return Promise.resolve();
+    // 一次明确点击对应一次有截止时间的挑战；失败的 iframe 移除后重新创建。
+    if(tsState === 'failed' || tsState === 'rejected') retireParseTs();
     var hadWidget = tsParseWidgetId !== null;
-    return initParseTs().then(function(){
-      if (tsParseWidgetId !== null && (humanQuery() === null || tsState === 'failed' || tsState === 'rejected')) {
-        if (hadWidget) {
-          tsSetState('loading', true);
-          if (!resetParseTs()) throw new Error('人机验证组件重试失败，请检查网络后再点继续；不要刷新页面');
-        }
-        revealParseTs();
+    var attempt=new Promise(function(resolve,reject){
+      var ended=false, initialized=false, timer=null, deadline=Date.now()+120000;
+      function finish(error){
+        if(ended) return;
+        ended=true; clearTimeout(timer);
+        if(error){ retireParseTs(); reject(error); } else resolve();
       }
-      return new Promise(function(resolve, reject){
-        var t0 = Date.now();
-        (function poll(){
-          if (tsState === 'off' || tsParseWidgetId === null) {
-            if (tsRequired && (tsState === 'failed' || tsState === 'rejected')) return reject(new Error(tsNeedMsg()));
-            return resolve();
+      function poll(){
+        if(ended) return;
+        // 先查真实时间，再查 token，避免后台节流后的迟到成功复活已超时的恢复。
+        if(Date.now() >= deadline) return finish(new Error('请先完成人机验证：本次等待已超时，请检查网络后再点继续；已下载部分保留，不要刷新页面'));
+        if(initialized){
+          if(tsState === 'off') return finish();
+          if(tsState === 'rejected' || tsState === 'failed') return finish(new Error(tsNeedMsg()));
+          if(tsParseWidgetId !== null && humanQuery() !== null){ tsSetState('ready'); return finish(); }
+        }
+        timer=setTimeout(poll,300);
+      }
+      poll();
+      initParseTs().then(function(){
+        if(ended) return;
+        initialized=true;
+        if(tsState === 'off'){ clearTimeout(timer); poll(); return; }
+        if(tsParseWidgetId === null){ tsSetState('failed',true); return; }
+        if(humanQuery() === null || tsState === 'failed' || tsState === 'rejected'){
+          if(hadWidget){
+            tsSetState('loading',true);
+            if(!resetParseTs()) return finish(new Error('人机验证组件重试失败，请检查网络后再点继续；不要刷新页面'));
           }
-          if (tsState === 'rejected' || tsState === 'failed') return reject(new Error(tsNeedMsg()));
-          if (humanQuery() !== null) { tsSetState('ready'); return resolve(); }
-          if (Date.now() - t0 > 120000) return reject(new Error('请先完成人机验证'));
-          setTimeout(poll, 300);
-        })();
-      });
+          revealParseTs();
+        }
+        clearTimeout(timer); poll();
+      },finish);
     });
+    _humanReadyPending=attempt.then(function(value){ _humanReadyPending=null; return value; },function(e){ _humanReadyPending=null; throw e; });
+    return _humanReadyPending;
   }
 
     /* 反馈表单 */

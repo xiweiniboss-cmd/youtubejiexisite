@@ -97,10 +97,10 @@ test('frontend: stale 25min grace is removed; download/merge reverify without pa
 test('frontend: successful re-verification renews pass without charging parse; rejected pass resets and surfaces prompt',async()=>{
  const html=readFileSync(new URL('../index.html',import.meta.url),'utf8'),code=html.match(/  function ensureHumanPass\(\)[\s\S]*?(?=  \/\/ HUMAN_)/)[0];
  let urls=[],done=0,deny=false;
- const box={Promise,Error,humanReady:async()=>{},humanQuery:()=> '&turnstile=new%20token',tsNeedMsg:()=> '请先验证',
+ const box={Promise,Error,AbortController,setTimeout,clearTimeout,Date,_humanPassPending:null,humanReady:async()=>{},humanQuery:()=> '&turnstile=new%20token',tsNeedMsg:()=> '请先验证',
   humanDone(q,j,used){done++;assert.equal(q,'&turnstile=new%20token');assert.equal(used,!deny);return !!j.code},humanMsg:()=> '验证已过期',
   fetch:async url=>{urls.push(url);return{ok:!deny,headers:{get:()=>deny?null:'used'},json:async()=>deny?{code:'HUMAN_REQUIRED'}:{ok:true}}}};
- vm.createContext(box);vm.runInContext(code,box);await box.ensureHumanPass();
+ vm.createContext(box);vm.runInContext(html.slice(html.indexOf('  function tsBounded'),html.indexOf('  var _tsScriptPromise'))+code,box);await box.ensureHumanPass();
  assert.deepEqual(urls,['/api/human-pass?turnstile=new%20token']);assert.equal(done,1);
  deny=true;await assert.rejects(box.ensureHumanPass(),/验证已过期/);assert.equal(done,2);assert.ok(urls.every(x=>!x.includes('/api/parse')));
 });

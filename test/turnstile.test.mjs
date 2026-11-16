@@ -346,10 +346,10 @@ test('index.html: humanMsg distinguishes load failure / still loading / expired 
   assert.equal(run('resets'), 1);
 });
 
-test('index.html: load-state UI strings, 8s timeout, compact widget centered, download errors use humanMsg', () => {
+test('index.html: load-state UI strings, bounded 30s weak-network timeout, compact widget centered, download errors use humanMsg', () => {
   const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
   assert.match(html, /<div id="tsParseWidget" class="ts-parse"><\/div>\n\s*<div id="tsParseState"/);
-  assert.match(html, /var TS_RENDER_TIMEOUT_MS = 8000;/);
+  assert.match(html, /var TS_RENDER_TIMEOUT_MS = 30000;/);
   assert.match(html, /\.ts-parse\.ts-compact\{ display:flex; justify-content:center; \}/);
   assert.match(html, /if \(compact\) box\.className \+= ' ts-compact';/);
   assert.ok(!/\}\)\.catch\(function\(\)\{\}\);\n\n\s*\/\* 反馈表单/.test(html), 'widget load failure is no longer swallowed');
