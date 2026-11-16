@@ -316,18 +316,18 @@ test('index.html: humanQuery / humanDone lifecycle (second parse works, rejectio
 test('index.html: tsNeedMsg — rejected / load failed / plain need-verify', () => {
   const { run } = frontendHuman();
   run('tsState = "rejected"');
-  assert.equal(run('tsNeedMsg()'), '人机验证未通过，请刷新页面重试');
+  assert.equal(run('tsNeedMsg()'), '人机验证未通过，请重试，不要刷新下载页面');
   run('tsState = "failed"');
-  assert.equal(run('tsNeedMsg()'), '人机验证组件加载失败，请检查网络或 VPN 后刷新');
+  assert.equal(run('tsNeedMsg()'), '人机验证组件加载失败，请检查网络或 VPN 后重试，不要刷新下载页面');
   run('tsState = "ready"');
   assert.equal(run('tsNeedMsg()'), '请先完成人机验证');
   run('tsState = "rejected"');
-  assert.equal(run('humanMsg({ code: "HUMAN_REQUIRED" })'), '人机验证未通过，请刷新页面重试');
+  assert.equal(run('humanMsg({ code: "HUMAN_REQUIRED" })'), '人机验证未通过，请重试，不要刷新下载页面');
 });
 
 test('index.html: humanMsg distinguishes load failure / still loading / expired pass / server text', () => {
   const { run } = frontendHuman();
-  const LOAD_FAIL = '人机验证组件加载失败，请检查网络或 VPN 后刷新';
+  const LOAD_FAIL = '人机验证组件加载失败，请检查网络或 VPN 后重试，不要刷新下载页面';
   // 组件没出来（脚本挂了 / site key 缺失 / 8 秒没渲染）
   run('tsState = "failed"; tsParseWidgetId = null');
   assert.equal(run('humanMsg({ code: "HUMAN_REQUIRED", error: "请先完成人机验证" })'), LOAD_FAIL);

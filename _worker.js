@@ -2597,29 +2597,47 @@ async function handleYt1080File(request, env) {
     // 上游 200 却是 JSON/HTML（错误页）：原样下发，前端 __hkSave 靠 blob.type 识别成错误。
     if (/json|html/i.test(upType) || !resp.body) return mergePassthrough(resp);
     // 不靠后缀名：看文件开头。webm 或 AV1/Opus 的 MP4 → 中文错误；avc1 或判断不了 → 放行。
-    let head, stream;
-    if (resp.status === 206 && offset > 0) {
-      // 续传不从文件头开始；单独检查同一成品的前缀，不把随机中段当容器头。
-      try {
-        const prefix = await fetch(fileUrl,{headers:{...baseHeaders,Range:'bytes=0-524287'},signal:request.signal});
-        if (!prefix.ok || !prefix.body) { try {await prefix.body?.cancel();}catch{} throw new Error('成品校验失败'); }
-        const probe = await peekStream(prefix.body,512 * 1024);
-        head = probe.head;
-        try { await probe.stream.cancel(); } catch {}
-        const prefixRange=prefix.headers.get('Content-Range') || '';
-        if (prefix.status===206 && !/^bytes 0-\d+\/\d+$/.test(prefixRange)) throw new Error('成品文件头范围不一致');
-        for (const key of ['ETag','Last-Modified']) {
-          const expected=resp.headers.get(key);
-          if(expected && prefix.headers.get(key)!==expected) throw new Error('成品文件已变化');
+    const probeLimit = 512 * 1024;
+    let head, stream = resp.body;
+    try {
+      if (resp.status === 206) {
+        const parseRange = (value) => {
+          const m = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(value || '');
+          if (!m) throw new Error('成品文件头范围不一致');
+          const [start, end, total] = m.slice(1).map(Number);
+          if (![start,end,total].every(Number.isSafeInteger) || start > end || end >= total) throw new Error('成品文件头范围不一致');
+          return {start,end,total};
+        };
+        const part = parseRange(resp.headers.get('Content-Range'));
+        if (part.start !== offset) throw new Error('成品下载范围不一致');
+        const needed = Math.min(probeLimit, part.total);
+        if (part.start === 0) ({head,stream} = await peekStream(resp.body,probeLimit));
+        if (part.start > 0 || head.length < needed) {
+          // 非零续传和短起始 Range 都可能看不到 moov/音轨，不能把截断的文件头当作通过。
+          const prefix = await fetch(fileUrl,{headers:{...baseHeaders,Range:'bytes=0-524287'},signal:request.signal});
+          let probe;
+          try {
+            if (!prefix.ok || !prefix.body || /json|html/i.test(prefix.headers.get('Content-Type') || '')) throw new Error('成品校验失败');
+            probe = await peekStream(prefix.body,probeLimit);
+            const prefixPart = prefix.status === 206 ? parseRange(prefix.headers.get('Content-Range')) : null;
+            if (prefix.status !== 200 && prefix.status !== 206) throw new Error('成品校验失败');
+            if (prefixPart && (prefixPart.start !== 0 || prefixPart.end + 1 < needed)) throw new Error('成品文件头不完整');
+            for (const key of ['ETag','Last-Modified']) {
+              const expected = resp.headers.get(key);
+              if (expected && prefix.headers.get(key) !== expected) throw new Error('成品文件已变化');
+            }
+            const prefixTotal = prefixPart ? prefixPart.total : Number(prefix.headers.get('Content-Length'));
+            if (prefixTotal && prefixTotal !== part.total) throw new Error('成品文件长度已变化');
+            if (probe.head.length < needed) throw new Error('成品文件头不完整');
+            head = probe.head;
+          } finally {
+            try { await (probe ? probe.stream : prefix.body)?.cancel(); } catch {}
+          }
         }
-        const tailTotal=(resp.headers.get('Content-Range') || '').split('/')[1];
-        const prefixTotal=prefix.status===206 ? prefixRange.split('/')[1] : prefix.headers.get('Content-Length');
-        if(tailTotal && prefixTotal && tailTotal!==prefixTotal) throw new Error('成品文件长度已变化');
-        stream = resp.body;
-      } catch (e) { try { await resp.body.cancel(); } catch {} throw e; }
-    } else {
-      ({head,stream} = await peekStream(resp.body,512 * 1024));
-    }
+      } else {
+        ({head,stream} = await peekStream(resp.body,probeLimit));
+      }
+    } catch (e) { try { await stream.cancel(); } catch {} throw e; }
     const sn = sniffMergedHead(head);
     if (sn.ok === false) {
       try { await stream.cancel(); } catch { /* ignore */ }
