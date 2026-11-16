@@ -2359,11 +2359,17 @@ async function peekStream(body, limit) {
   const reader = body.getReader();
   const chunks = [];
   let got = 0, done = false;
-  while (got < limit) {
-    const r = await reader.read();
-    if (r.done) { done = true; break; }
-    chunks.push(r.value);
-    got += r.value.byteLength;
+  try {
+    while (got < limit) {
+      const r = await reader.read();
+      if (r.done) { done = true; break; }
+      chunks.push(r.value);
+      got += r.value.byteLength;
+    }
+  } catch (e) {
+    try { await reader.cancel(e); } catch {}
+    try { reader.releaseLock(); } catch {}
+    throw e;
   }
   const head = new Uint8Array(got);
   let o = 0;
@@ -2571,18 +2577,49 @@ async function handleYt1080File(request, env) {
   const id = new URL(request.url).searchParams.get('id') || '';
   const bad = badJobId(id);
   if (bad) return bad;
+  const range = request.headers.get('Range');
+  if (range && !/^bytes=\d+-\d*$/.test(range)) return json({ok:false,error:'下载范围无效'},400);
+  const offset = range ? Number(range.match(/^bytes=(\d+)-/)[1]) : 0;
+  const end = range ? range.split('-')[1] : '';
+  if (!Number.isSafeInteger(offset) || (end && (!Number.isSafeInteger(Number(end)) || Number(end)<offset))) return json({ok:false,error:'下载范围无效'},400);
   const token = mergeToken(env);
   if (!token) return json({ ok: false, error: '未配置合并服务口令' }, 500);
   try {
-    const resp = await fetch(mergeBase(env) + '/yt1080-jobs/' + encodeURIComponent(id) + '/file', {
-      headers: { 'X-Merge-Token': token, 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', 'Accept': 'application/json' },
-    });
+    const fileUrl = mergeBase(env) + '/yt1080-jobs/' + encodeURIComponent(id) + '/file';
+    const baseHeaders = { 'X-Merge-Token': token, 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', 'Accept': 'application/json' };
+    const upHeaders = {...baseHeaders};
+    if (range) upHeaders.Range = range;
+    const ifRange = request.headers.get('If-Range');
+    if (ifRange && ifRange.length <= 512) upHeaders['If-Range'] = ifRange;
+    const resp = await fetch(fileUrl, {headers:upHeaders,signal:request.signal});
     if (!resp.ok) return mergePassthrough(resp);
     const upType = resp.headers.get('content-type') || '';
     // 上游 200 却是 JSON/HTML（错误页）：原样下发，前端 __hkSave 靠 blob.type 识别成错误。
     if (/json|html/i.test(upType) || !resp.body) return mergePassthrough(resp);
     // 不靠后缀名：看文件开头。webm 或 AV1/Opus 的 MP4 → 中文错误；avc1 或判断不了 → 放行。
-    const { head, stream } = await peekStream(resp.body, 512 * 1024);
+    let head, stream;
+    if (resp.status === 206 && offset > 0) {
+      // 续传不从文件头开始；单独检查同一成品的前缀，不把随机中段当容器头。
+      try {
+        const prefix = await fetch(fileUrl,{headers:{...baseHeaders,Range:'bytes=0-524287'},signal:request.signal});
+        if (!prefix.ok || !prefix.body) { try {await prefix.body?.cancel();}catch{} throw new Error('成品校验失败'); }
+        const probe = await peekStream(prefix.body,512 * 1024);
+        head = probe.head;
+        try { await probe.stream.cancel(); } catch {}
+        const prefixRange=prefix.headers.get('Content-Range') || '';
+        if (prefix.status===206 && !/^bytes 0-\d+\/\d+$/.test(prefixRange)) throw new Error('成品文件头范围不一致');
+        for (const key of ['ETag','Last-Modified']) {
+          const expected=resp.headers.get(key);
+          if(expected && prefix.headers.get(key)!==expected) throw new Error('成品文件已变化');
+        }
+        const tailTotal=(resp.headers.get('Content-Range') || '').split('/')[1];
+        const prefixTotal=prefix.status===206 ? prefixRange.split('/')[1] : prefix.headers.get('Content-Length');
+        if(tailTotal && prefixTotal && tailTotal!==prefixTotal) throw new Error('成品文件长度已变化');
+        stream = resp.body;
+      } catch (e) { try { await resp.body.cancel(); } catch {} throw e; }
+    } else {
+      ({head,stream} = await peekStream(resp.body,512 * 1024));
+    }
     const sn = sniffMergedHead(head);
     if (sn.ok === false) {
       try { await stream.cancel(); } catch { /* ignore */ }
@@ -2597,9 +2634,9 @@ async function handleYt1080File(request, env) {
     if (sn.kind === 'mp4') headers.set('Content-Type', 'video/mp4');
     else if (!upType) headers.set('Content-Type', 'application/octet-stream');
     headers.set('Content-Disposition', 'attachment; filename="' + ascii + '"; filename*=UTF-8\'\'' + rfc5987(fname));
-    headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition');
+    headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition, Content-Range, ETag, Last-Modified');
     headers.set('Cache-Control', 'no-store');
-    return new Response(withKnownLength(stream, resp.headers.get('content-length'), resp.headers.get('content-encoding')), { status: 200, headers });
+    return new Response(withKnownLength(stream, resp.headers.get('content-length'), resp.headers.get('content-encoding')), { status: resp.status === 206 ? 206 : 200, headers });
   } catch (e) {
     return mergeConnectError(e);
   }

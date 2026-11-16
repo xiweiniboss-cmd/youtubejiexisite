@@ -70,10 +70,54 @@ window.YTMerge = (function(){
   return { merge: merge, preload: getFF };
 })();
 
-// 分段下载（经 /api/ytdl 代理 + Range）：googlevideo 对无声 1080P 整段下载会限速，分段并发快很多。
-// spec = {v, itag, client} 时每次 Range 都让 Worker 在同一次请求里重新签发直链，避免 ip= 和出口对不上。
+// 可暂停的内存分段下载：仅当前页面有效；已收字节保留，暂停会中断所有活动请求。
+// 不把忽略 Range 的 200 或变化的表示拼接到旧文件上。
 window.YTFetch = (function(){
   var CH = 8 * 1024 * 1024, PAR = 3;
+  function error(message, code){ var e = new Error(message); if(code) e.code = code; return e; }
+  function createControl(options){
+    options = options || {};
+    var revision=0, resumable=true, rejectCancelled;
+    var cancelled=new Promise(function(_,reject){ rejectCancelled=reject; });
+    cancelled.catch(function(){});
+    var state = 'running', reason = null, active = new Set(), readers = new Set(), waiters = [], resuming = false;
+    function emit(message){ if(options.onState) options.onState(state, message || ''); }
+    function wake(){ var ws=waiters.splice(0); ws.forEach(function(w){ w(); }); }
+    function abort(){ active.forEach(function(c){ c.abort(); }); readers.forEach(function(r){ r.cancel().catch(function(){}); }); }
+    var control = {
+      get state(){ return state; },
+      get reason(){ return reason; },
+      get revision(){ return revision; },
+      get resumable(){ return resumable; },
+      noResume: function(message){ resumable=false; if(options.onCapability) options.onCapability(message); },
+      pause: function(message){ if(state !== 'running') return; state='paused'; revision++; abort(); emit(message); },
+      resume: async function(){
+        if(state !== 'paused' || resuming) return;
+        resuming=true; state='verifying'; emit();
+        try {
+          if(options.beforeResume) await control.guard(options.beforeResume());
+          if(state !== 'verifying') return;
+          state='running'; emit(); wake();
+        } catch(e){ if(state === 'verifying'){ state='paused'; emit(e.message || '请完成验证后再点继续'); } }
+        finally { resuming=false; }
+      },
+      expired: function(e){ if(options.onHumanExpired) options.onHumanExpired(e); control.pause('验证已过期，请完成验证后点继续'); },
+      guard: function(promise){ return Promise.race([promise,cancelled]); },
+      cancel: function(){ control.fail(error('下载已取消', 'DOWNLOAD_CANCELLED')); },
+      fail: function(e){ if(state==='done' || state==='failed') return; reason=e; state='failed'; rejectCancelled(e); abort(); wake(); emit(e.message); },
+      finish: function(){ if(state==='failed') return; state='done'; wake(); emit(); },
+      ready: async function(){
+        while(state==='paused' || state==='verifying') await new Promise(function(resolve){ waiters.push(resolve); });
+        if(reason) throw reason;
+        if(state==='done') throw error('下载已经结束');
+      },
+      add: function(c){ active.add(c); if(state!=='running') c.abort(); },
+      remove: function(c){ active.delete(c); },
+      reader: function(r){ readers.add(r); if(state!=='running') r.cancel().catch(function(){}); },
+      unreader: function(r){ readers.delete(r); }
+    };
+    return control;
+  }
   function proxyFor(u, ua, spec){
     if (spec && spec.v && spec.itag) {
       var q = '/api/ytdl?v=' + encodeURIComponent(spec.v) + '&itag=' + encodeURIComponent(spec.itag);
@@ -85,59 +129,89 @@ window.YTFetch = (function(){
     }
     return '/api/ytdl?url=' + encodeURIComponent(u) + '&filename=part.bin' + (ua ? '&ua=' + encodeURIComponent(ua) : '');
   }
-  async function getRange(proxyUrl, s, e){
-    var res = await fetch(proxyUrl, { headers: { Range: 'bytes=' + s + '-' + e } });
-    if (!(res.status === 206 || res.status === 200)) {
-      var msg = 'HTTP ' + res.status, code = '';
-      try {
-        var t = await res.text();
-        var j = JSON.parse(t);
-        if (j && j.error) msg = String(j.error);
-        if (j && j.code) code = String(j.code);
-      } catch (err) {}
-      var e2 = new Error(msg);
-      if (code) e2.code = code;
-      throw e2;
-    }
-    return res;
+  async function responseError(res){
+    var msg='HTTP '+res.status, code=res.status===416 ? 'RANGE_NOT_SATISFIABLE' : '';
+    try { var j=JSON.parse(await res.text()); if(j.error) msg=String(j.error); if(j.code) code=String(j.code); } catch(e){}
+    return error(msg,code);
   }
-  async function readAll(res, onChunk){
-    var rd = res.body.getReader(), parts = [];
-    for(;;){ var r = await rd.read(); if (r.done) break; parts.push(r.value); onChunk(r.value.length); }
-    return parts;
+  function validator(res){
+    var tag=res.headers.get('ETag');
+    if(tag && !/^W\//i.test(tag)) return {name:'ETag',value:tag};
+    var date=res.headers.get('Last-Modified');
+    return date ? {name:'Last-Modified',value:date} : null;
   }
-  // 返回 Blob；onProg(本文件已收字节, 本文件总字节)
-  // spec 跟这一路流绑定，视频和音频并行时不能共用一个全局参数。
-  async function get(u, type, onProg, ua, spec){
-    var proxyUrl = proxyFor(u, ua || '', spec || null);
-    var got = 0, total = 0;
-    var first = await getRange(proxyUrl, 0, CH - 1);
-    var cr = first.headers.get('Content-Range') || '';
-    var m = cr.match(/\/(\d+)\s*$/);
-    if (first.status === 200 || !m) {           // 不支持 Range：整段读
-      total = +first.headers.get('Content-Length') || 0;
-      var all = await readAll(first, function(n){ got += n; onProg(got, total); });
-      return new Blob(all, { type: type });
-    }
-    total = +m[1];
-    var slots = [];
-    slots[0] = await readAll(first, function(n){ got += n; onProg(got, total); });
-    var jobs = [];
-    for (var s = CH, k = 1; s < total; s += CH, k++) jobs.push({ k: k, s: s, e: Math.min(total, s + CH) - 1 });
-    async function worker(){
-      while (jobs.length) {
-        var j = jobs.shift(), tries = 0;
-        for(;;){
-          var mine = 0;
-          try { var res = await getRange(proxyUrl, j.s, j.e); slots[j.k] = await readAll(res, function(n){ mine += n; got += n; onProg(got, total); }); break; }
-          catch (err) { got -= mine; if (/^HUMAN_/.test(err.code || '') || ++tries >= 3) throw err; await new Promise(function(r){ setTimeout(r, 800 * tries); }); }
+  async function getProxy(proxyUrl, type, onProg, control){
+    control=control || createControl(); onProg=onProg || function(){};
+    var got=0, total=null, identity=null, known=false, ranged=false, slots=[];
+    function progress(){ onProg(got,total || 0); }
+    async function part(job){
+      var failures=0;
+      while(job.end===null || job.start+job.bytes<=job.end){
+        await control.ready();
+        var offset=job.start+job.bytes;
+        if(known && (job.bytes>0 || (control.revision>0 && got>0)) && !identity) throw error('上游未提供文件校验信息，无法安全续传，请取消后重新下载', 'RESUME_UNSAFE');
+        var controller=new AbortController(), reader=null, res=null;
+        control.add(controller);
+        try {
+          var headers={Range:'bytes='+offset+'-'+(job.end===null?'':job.end)};
+          if(identity) headers['If-Range']=identity.value;
+          res=await fetch(proxyUrl,{headers:headers,signal:controller.signal,credentials:'same-origin'});
+          if(!res.ok) throw await responseError(res);
+          var cr=(res.headers.get('Content-Range') || '').match(/^bytes (\d+)-(\d+)\/(\d+)$/);
+          var v=validator(res);
+          if(res.status===206){
+            if(!cr || ![+cr[1],+cr[2],+cr[3]].every(Number.isSafeInteger) || +cr[1]!==offset || +cr[2]<offset || +cr[2]>=+cr[3] || (job.end!==null && +cr[2]>job.end)) throw error('下载分段范围不一致，已停止以防文件损坏','RANGE_INVALID');
+            if(known && total!==+cr[3]) throw error('下载文件已变化，请取消后重新下载','FILE_CHANGED');
+            if(!known){ total=+cr[3]; if(total>CH*512) throw error('文件超过单任务分段上限','DOWNLOAD_TOO_LARGE'); ranged=true; job.end=Math.min(job.end,total-1); }
+            else if(+cr[2]!==job.end) throw error('下载分段不完整，已停止以防文件损坏','RANGE_INVALID');
+          } else if(res.status===200 && offset===0 && !known){
+            total=Number(res.headers.get('Content-Length')) || null;
+            ranged=false; job.end=total===null ? null : total-1;
+          } else { throw error('服务器未按断点返回文件，无法安全续传，请取消后重新下载','RANGE_UNSUPPORTED'); }
+          if(known && identity && res.headers.get(identity.name)!==identity.value) throw error('下载文件校验已变化，请取消后重新下载','FILE_CHANGED');
+          if(!known){ identity=v; known=true; if(!identity || !ranged) control.noResume('此下载源未提供安全续传所需的范围或校验信息，只能下载完成或取消。'); if(!type) type=res.headers.get('Content-Type') || 'video/mp4'; }
+          progress();
+          reader=res.body && res.body.getReader ? res.body.getReader() : null;
+          if(!reader) throw error('浏览器不支持流式下载');
+          control.reader(reader);
+          for(;;){
+            var r=await reader.read();
+            if(controller.signal.aborted || control.state!=='running') throw error('已暂停','PAUSED');
+            if(r.done) break;
+            var n=r.value.byteLength;
+            if(job.end!==null && job.start+job.bytes+n>job.end+1) throw error('下载分段长度错误','RANGE_INVALID');
+            job.chunks.push(r.value); job.bytes+=n; got+=n; progress();
+          }
+          if(job.end===null){ job.end=job.start+job.bytes-1; total=job.bytes; progress(); return; }
+          if(job.start+job.bytes!==job.end+1) throw error('下载连接提前结束');
+          return;
+        } catch(e){
+          if(control.reason) throw control.reason;
+          if(controller.signal.aborted || control.state==='paused' || control.state==='verifying') continue;
+          if(/^HUMAN_/.test(e.code || '')){ control.expired(e); continue; }
+          if(e.code || ++failures>=3) throw e;
+        } finally {
+          if(reader){ control.unreader(reader); try{ await reader.cancel(); }catch(e){} try{ reader.releaseLock(); }catch(e){} }
+          else if(res && res.body){ try{ await res.body.cancel(); }catch(e){} }
+          controller.abort(); control.remove(controller);
         }
       }
     }
-    var ws = []; for (var i = 0; i < PAR; i++) ws.push(worker());
-    await Promise.all(ws);
-    var flat = []; slots.forEach(function(p){ flat = flat.concat(p); });
-    return new Blob(flat, { type: type });
+    try {
+      var first={start:0,end:CH-1,bytes:0,chunks:[]}; slots.push(first);
+      await part(first);
+      if(ranged && total>CH){
+        var jobs=[];
+        for(var start=CH;start<total;start+=CH){ var j={start:start,end:Math.min(total,start+CH)-1,bytes:0,chunks:[]}; slots.push(j); jobs.push(j); }
+        async function worker(){ while(jobs.length){ var job=jobs.shift(); await part(job); } }
+        var ws=[], parallel=Math.min(PAR,jobs.length); for(var i=0;i<parallel;i++) ws.push(worker());
+        await Promise.all(ws);
+      }
+      var flat=[]; slots.forEach(function(j){ flat=flat.concat(j.chunks); j.chunks=[]; });
+      if(total!==null && got!==total) throw error('下载文件长度不完整','RANGE_INVALID');
+      return new Blob(flat,{type:type || 'video/mp4'});
+    } catch(e){ control.fail(e); slots.forEach(function(j){ j.chunks=[]; }); throw e; }
   }
-  return { get: get };
+  async function get(u,type,onProg,ua,spec,control){ return getProxy(proxyFor(u,ua || '',spec || null),type,onProg,control); }
+  return {get:get,getProxy:getProxy,createControl:createControl};
 })();
