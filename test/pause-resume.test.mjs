@@ -281,3 +281,23 @@ test('real resume UI reveals expired verification, preserves partials, then save
   assert.equal(h.calls.filter(c=>c.url.startsWith('/api/human-pass')).length,2);
   assert.equal(h.calls.some(c=>/api\/parse|yt1080-start/.test(c.url)),false);
 });
+
+test('real paused download survives weak-network failure and late callbacks; only explicit retry resumes missing bytes',async()=>{
+  const h=humanUI({used:true});await h.init();h.run('tsPassUntil = Date.now()+60000');
+  const o=origin();let paused=false,x;
+  x=ui(o.fetch,{ensureHumanPass:h.ctx.ensureHumanPass,setDlProg:n=>{if(n>=6&&!paused){paused=true;x.elements.dlPause.onclick();}}});
+  x.context.downloadResource('https://media.example/file','weaknet.mp4');
+  await until(()=>x.context.activeDownload?.state==='paused');await until(()=>o.live===0);
+  h.run('tsPassUntil = 0');const mark=o.calls.length;
+  x.elements.dlPause.onclick();await h.flush();const old=h.callbacks;
+  old['error-callback']('300010');await h.advance(300);
+  await until(()=>x.context.activeDownload.state==='paused');
+  assert.equal(o.calls.length,mark);assert.equal(x.saved.length,0);
+  old.callback('late');await h.advance(600000);await h.flush();
+  assert.equal(x.context.activeDownload.state,'paused');assert.equal(o.calls.length,mark,'late vendor recovery cannot resume old action');
+  x.elements.dlPause.onclick();await h.flush();await h.solve('fresh-retry');
+  await until(()=>x.saved.length===1);await matches(x.saved[0].blob,o.bytes);
+  assert.ok(o.calls.slice(mark).some(c=>/^bytes=[1-9]/.test(c.range)&&c.ifRange==='"same-file"'));
+  assert.equal(h.calls.filter(c=>c.url.startsWith('/api/human-pass')).length,2);
+  assert.equal(h.calls.some(c=>/api\/parse|yt1080-start/.test(c.url)),false);
+});
