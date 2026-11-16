@@ -8,7 +8,8 @@ import worker from '../_worker.js';
 
 // 解析记录 + 拉黑（D1 PARSE_DB）：每次解析记一行（IP/归属地/设备/去令牌链接）；黑名单 IP、设备直接 403「访问受限」；D1 挂了照常解析
 const SCHEMA = `CREATE TABLE parse_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, site TEXT NOT NULL, url TEXT NOT NULL DEFAULT '', ok INTEGER NOT NULL DEFAULT 0, status INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', country TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '', device_id TEXT NOT NULL DEFAULT '', ua TEXT NOT NULL DEFAULT '', fp TEXT NOT NULL DEFAULT '');
-CREATE TABLE blocklist (type TEXT NOT NULL CHECK (type IN ('ip','device','fp')), value TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, PRIMARY KEY (type, value));`;
+CREATE TABLE blocklist (type TEXT NOT NULL CHECK (type IN ('ip','device','fp')), value TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, PRIMARY KEY (type, value));
+CREATE TABLE rate_counter (k TEXT PRIMARY KEY, n INTEGER NOT NULL DEFAULT 0, last INTEGER NOT NULL DEFAULT 0, exp INTEGER NOT NULL DEFAULT 0);`;
 function fakeD1() {
   const db = new DatabaseSync(':memory:');
   db.exec(SCHEMA);

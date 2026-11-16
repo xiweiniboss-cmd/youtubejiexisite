@@ -432,7 +432,7 @@ test('turnstile: valid pass + token, far from cap -> siteverify NOT called, toke
 test('turnstile: valid pass near 2h cap + fresh token -> siteverify once, brand-new pass with new first-verify time', async () => {
   const now = Math.floor(Date.now() / 1000);
   const first = now - HUMAN_PASS_MAX_AGE_SECS + 10 * 60; // 离封顶只剩 10 分钟（< 15 分钟）
-  const pass = await signHumanPass(SECRET, now - 5 * 60, first);
+  const pass = await signHumanPass(SECRET, now - 60, first);
   const before = await verifyHumanPass(pass.value, SECRET, now);
   assert.ok(before && before.first === first);
   assert.ok(HUMAN_PASS_REFRESH_NEAR_CAP_SECS >= 10 * 60);
@@ -458,7 +458,7 @@ test('turnstile: valid pass near 2h cap + fresh token -> siteverify once, brand-
 test('turnstile: near cap with a bad token or siteverify down -> old pass still honoured, no new first-verify time', async () => {
   const now = Math.floor(Date.now() / 1000);
   const first = now - HUMAN_PASS_MAX_AGE_SECS + 10 * 60;
-  const pass = await signHumanPass(SECRET, now - 25 * 60, first); // 剩 5 分钟 → 也会滑动续期（但不超过封顶）
+  const pass = await signHumanPass(SECRET, now - 3 * 60, first); // 剩 2 分钟 → 也会滑动续期（但不超过封顶）
   for (const opts of [{}, { throwOnVerify: true }]) {
     const f = fakeFetch([], opts);
     await withFetch(f.fn, async () => {
