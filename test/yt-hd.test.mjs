@@ -1,3 +1,4 @@
+import {sqliteD1,testRequest} from './helpers/d1.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -22,6 +23,10 @@ import worker, {
   directProbeRange,
   DIRECT_LIMITED_MSG,
 } from '../_worker.js';
+const openResponses=[];
+{const fetchWorker=worker.fetch.bind(worker);worker.fetch=async(r,e,c)=>{const resp=await fetchWorker(testRequest(r),{PARSE_DB:sqliteD1(),...(e||{})},c);openResponses.push(resp);return resp;};}
+test.afterEach(async()=>{for(const r of openResponses.splice(0)){if(r.body&&!r.bodyUsed)await r.body.cancel();}});
+
 // 本地测试默认不配人机验证密钥：显式声明跳过（生产缺密钥会 fail-closed 503）
 { const _f = worker.fetch.bind(worker); worker.fetch = (r, e, c) => _f(r, { TURNSTILE_DISABLED: '1', ...(e || {}) }, c); }
 
@@ -614,7 +619,7 @@ test('ytdl re-resolves itag in the same request, forwards Range, and ignores a s
     assert.equal(res.headers.get('Content-Range'), 'bytes 0-99/1000');
     assert.equal(res.headers.get('Content-Length'), '4');
     assert.equal(res.headers.get('Access-Control-Allow-Origin'), null); // 无 Origin（同源导航）不回 CORS 头
-    assert.equal(res.headers.get('Access-Control-Expose-Headers'), 'Content-Range, Content-Length');
+    assert.equal(res.headers.get('Access-Control-Expose-Headers'), 'Content-Range, Content-Length, ETag, Last-Modified');
     assert.match(res.headers.get('Content-Disposition') || '', /filename="clip\.mp4"/);
     assert.equal(res.headers.get('Accept-Ranges'), 'bytes');
     assert.equal(await res.text(), 'ftyp');

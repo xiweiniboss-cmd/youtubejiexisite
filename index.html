@@ -135,7 +135,7 @@ function jxParseHeaders(h) {
           </div>
         </div>
         <button type="button" class="btn" id="parseBtn">开始解析</button>
-        <!-- 人机验证：配了 TURNSTILE_SITE_KEY 才显示；验证一次后 30 分钟内解析 / 合并不用再点 -->
+        <!-- 人机验证：配了 TURNSTILE_SITE_KEY 才显示；验证一次后 5 分钟内解析 / 合并不用再点 -->
         <div id="tsParseWidget" class="ts-parse"></div>
         <div id="tsParseState" class="hint ts-state" style="display:none" aria-live="polite"></div>
         <!-- 服务器合并：清晰度 + 提交。地址和口令只在 Pages 环境变量 YT_MERGE_BASE / YT_MERGE_TOKEN，不进前端 -->
@@ -503,14 +503,14 @@ var deviceId = (function(){
     setParseBtn('正在准备下载…', true); __hkHideBtn();
     resetDlProg();
     var proxyUrl = ytdlProxyUrl(url, filename, ua, spec);
-    fetchBlobProgress(proxyUrl, setDlProg).then(function(blob){
+    ensureHumanPass().then(function(){ return fetchBlobProgress(proxyUrl, setDlProg); }).then(function(blob){
       hideDlProg();
       resetParseBtn();
       __hkSave(blob, filename);
     }).catch(function(e){
       resetParseBtn();
       hideDlProg();
-      // 通行证过期（旧结果过了 30 分钟 / 2 小时）：提示重新点开始解析，不当成直链失效
+      // 通行证过期（旧结果过了 5 分钟 / 2 小时）：提示重新验证后重试，不重复解析扣次数
       if (humanDone('', e)) { showError('下载失败：' + humanMsg(e)); return; }
       // 纯音频没有画面高度，不替它去合并视频。
       if (isDirectLimited(e) && spec && spec.v && spec.height > 0 && autoServerMerge(spec.v, spec.height)) return;
@@ -574,10 +574,10 @@ var deviceId = (function(){
     stage('准备下载…', 0);
     var pre = window.YTMerge.preload(function(t){ if (!vt) stage(t, 2); }).catch(function(e){ return e; });
     var vSpec = streamSpec(v, vid, ua), aSpec = streamSpec(a, vid, ua);
-    Promise.all([
+    ensureHumanPass().then(function(){ return Promise.all([
       window.YTFetch.get(v.url, 'video/mp4', function(g, t){ vg = g; vt = t; prog(); }, ua, vSpec),
       window.YTFetch.get(a.url, 'audio/mp4', function(g, t){ ag = g; at = t; prog(); }, ua, aSpec)
-    ]).then(function(r){
+    ]); }).then(function(r){
       return pre.then(function(){
         return window.YTMerge.merge(r[0], r[1], function(t){ stage(t, 95); });
       });
@@ -804,7 +804,7 @@ var deviceId = (function(){
   // 加载状态：idle（还没问服务器）→ off（服务器不要求）/ loading → ready（组件出来了）/ failed（脚本、site key 或 8 秒内没渲染出来）
   var TS_MSG_LOADING = '人机验证加载中…';
   var TS_MSG_LOAD_FAIL = '人机验证组件加载失败，请检查网络或 VPN 后刷新';
-  var TS_MSG_EXPIRED = '验证已过期，请重新点开始解析';
+  var TS_MSG_EXPIRED = '验证已过期，请完成人机验证后重试下载或合并';
   var TS_MSG_REJECTED = '人机验证未通过，请刷新页面重试';
   var TS_RENDER_TIMEOUT_MS = 8000;
   var tsState = 'idle', tsRequired = false, tsLoadTimer = null;
@@ -845,10 +845,10 @@ var deviceId = (function(){
     return _tsScriptPromise;
   }
   var tsParseWidgetId = null;
-  // 服务器验证通过后会下发 30 分钟的通行证 Cookie（HttpOnly，前端读不到），这里记个略短的本地时间：
+  // 服务器验证通过后会下发 5 分钟的通行证 Cookie（HttpOnly，前端读不到），这里记个略短的本地时间：
   // 组件里有 token 就一律带上（服务器只在没有通行证、或通行证快到 2 小时封顶时才真去 siteverify，否则不消耗它）；
   // 没 token 时，本地通行证有效期内照常请求；服务器回 HUMAN_* 就清零重新验证。
-  var TS_PASS_MS = 25 * 60 * 1000, tsPassUntil = 0;
+  var TS_PASS_MS = 4 * 60 * 1000, tsPassUntil = 0;
   function resetParseTs(){ if (tsParseWidgetId !== null) { try { turnstile.reset(tsParseWidgetId); } catch(e){} } }
   // 返回要拼到接口地址后的参数：'' = 不带 token（未配置 / 组件没出来 / 通行证有效），null = 还没完成验证
   function humanQuery(){
@@ -865,6 +865,19 @@ var deviceId = (function(){
     else if (q && used) tsPassUntil = Date.now() + TS_PASS_MS;
     if (rejected || (q && used)) resetParseTs();
     return rejected;
+  }
+  function ensureHumanPass(){
+    return humanReady().then(function(){
+      var q = humanQuery();
+      if (q === null) throw new Error(tsNeedMsg());
+      return fetch('/api/human-pass' + (q ? '?' + q.slice(1) : ''), {credentials:'same-origin'}).then(function(r){
+        var used = r.headers.get('X-Human-Token') === 'used';
+        return r.json().then(function(j){
+          var rejected = humanDone(q, j, used);
+          if (rejected || !r.ok) { var e=new Error(humanMsg(j)); e.code=j.code; throw e; }
+        });
+      });
+    });
   }
   // HUMAN_* 拒绝时给用户看的话：组件没出来 → 加载失败；组件好好的 → 通行证过期（旧结果的下载 / 合并）；其余用服务器原文
   // 本地还没拿到 token 就点了按钮：按组件状态给提示
@@ -1287,6 +1300,12 @@ var deviceId = (function(){
     });
   }
   function startServerMerge(ytUrl, quality, mode, label, onStatus){
+    setMergeBtn('人机验证中…', true);
+    ensureHumanPass().then(function(){ startServerMergeReady(ytUrl,quality,mode,label,onStatus); }, function(e){
+      resetMergeBtn(); setMergeStatus(e.message || tsNeedMsg()); if(onStatus) onStatus(e.message || tsNeedMsg());
+    });
+  }
+  function startServerMergeReady(ytUrl, quality, mode, label, onStatus){
     if(mergeTimer){ clearInterval(mergeTimer); mergeTimer = null; }
     function status(html){
       setMergeStatus(html);

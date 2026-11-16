@@ -7,7 +7,7 @@
 // 人机验证：TURNSTILE_SITE_KEY（公开）+ TURNSTILE_SECRET_KEY（保密），各站共用同一套
 //   配了 TURNSTILE_SECRET_KEY 才校验（不配 = 跳过，并在日志里打一次警告）。
 //   受保护：/api/parse /api/yt-hd /api/ytdl /api/yt1080-start /api/yt-direct。
-//   前端带 ?turnstile=<token> 时 Worker 调 siteverify，通过后下发 30 分钟的签名通行证 Cookie yt_hp
+//   前端带 ?turnstile=<token> 时 Worker 调 siteverify，通过后下发 5 分钟的签名通行证 Cookie yt_hp
 //   （HMAC-SHA256，密钥由 TURNSTILE_SECRET_KEY 派生，不需要新变量），之后的解析 / 高清 / 下载 / 合并凭 Cookie 放行。
 //   /api/yt1080-status、/api/yt1080-file 只认已有任务 id（任务只能经受保护的 yt1080-start 创建），不拦，
 //   这样「合并历史（保留 1 小时）」里的成品在通行证过期后也能下载；任务 id 必须是 6–64 位 [A-Za-z0-9_-]，否则 400 不转发。
@@ -79,7 +79,7 @@ function ipLimitKey(ip) {
 // 冷却 60 秒 + 每 IP（IPv6 按 /64）每天（北京时间）20 次。解析之前用一条 UPSERT 原子地「判断 + 占坑」：
 //   并发一批请求只有第一个能占到坑；失败的解析也算一次（不能拿坏链接无限刷上游接口）。
 // D1 出错 / 超过 2 秒：直接拒绝（503「服务繁忙，请稍后再试」），不再退回 KV。
-// 只有根本没绑 PARSE_DB（本地 / 测试）才用 KV 先占坑（非原子，只是兜底）；KV 也出错同样拒绝。
+// 缺少 PARSE_DB 同样拒绝；本地测试需提供 D1，预览不再回退 KV。
 const RL_COOLDOWN_SECS = 60;
 const RL_DAILY_LIMIT = 20;
 const RL_TIMEOUT_MS = 2000;
@@ -101,7 +101,7 @@ function rlDeny(now, last, used, limit = RL_DAILY_LIMIT, cooldownSecs = RL_COOLD
 }
 async function rateTake(env, site, rawIp, limit = RL_DAILY_LIMIT, cooldownSecs = RL_COOLDOWN_SECS) {
   const ip = ipLimitKey(rawIp);
-  if (!ip) return { ok: true };
+  if (!ip) return RL_BUSY;
   const now = Date.now();
   const k = site + ':' + ip + ':' + rlDate();
   const db = env && env.PARSE_DB;
@@ -116,25 +116,11 @@ async function rateTake(env, site, rawIp, limit = RL_DAILY_LIMIT, cooldownSecs =
       return rlDeny(now, Number(cur && cur.last) || 0, Number(cur && cur.n) || 0, limit, cooldownSecs) || { ok: false, status: 429, msg: '解析太频繁，请稍后再试' };
     } catch (e) { return RL_BUSY; } // D1 挂了 / 超时：拒绝，不退回 KV
   }
-  const kv = env && env.FEEDBACK_KV;
-  if (kv) {
-    try {
-      const ck = 'pcool_' + site + '_' + ip, qk = 'dlimit_' + site + '_' + ip + '_' + rlDate();
-      const [lastTs, usedRaw] = await Promise.all([kv.get(ck), kv.get(qk)]);
-      const used = Number(usedRaw) || 0;
-      const deny = rlDeny(now, Number(lastTs) || 0, used, limit, cooldownSecs);
-      if (deny) return deny;
-      await Promise.all([
-        cooldownSecs > 0 ? kv.put(ck, String(now), { expirationTtl: Math.max(60, cooldownSecs) }) : null,
-        kv.put(qk, String(used + 1), { expirationTtl: 172800 }),
-      ]);
-    } catch { return RL_BUSY; }
-  }
-  return { ok: true };
+  return RL_BUSY; // Missing D1 is a configuration failure, including public previews.
 }
 async function rateUsed(env, site, rawIp) {
   const ip = ipLimitKey(rawIp);
-  if (!ip) return 0;
+  if (!ip) return null;
   const db = env && env.PARSE_DB;
   if (db && typeof db.prepare === 'function') {
     try {
@@ -142,7 +128,7 @@ async function rateUsed(env, site, rawIp) {
       return Number(cur && cur.n) || 0;
     } catch {}
   }
-  try { return Number((await env.FEEDBACK_KV.get('dlimit_' + site + '_' + ip + '_' + rlDate())) || 0); } catch { return 0; }
+  return null; // Unknown quota must not look like a fresh allowance.
 }
 // 人机验证 fail-closed：没配 TURNSTILE_SECRET_KEY 就拒绝解析，除非明确设了 TURNSTILE_DISABLED=1
 
@@ -158,31 +144,33 @@ function ytTicketKey(kind, ip, vid) { return 'ytt:' + kind + ':' + ip + ':' + vi
 async function ytTicketIssue(env, rawIp, vid) {
   const ip = ipLimitKey(rawIp);
   const db = env && env.PARSE_DB;
-  if (!ip || !vid || !db || typeof db.prepare !== 'function') return;
+  if (!ip || !vid || !db || typeof db.prepare !== 'function') return false;
   const exp = Date.now() + YT_TICKET_TTL_MS;
   for (const kind of Object.keys(YT_TICKET_USES)) {
     try {
       await rlWithTimeout(db.prepare(
         'INSERT INTO rate_counter (k, n, last, exp) VALUES (?, 0, 0, ?) ON CONFLICT(k) DO UPDATE SET n = 0, last = 0, exp = excluded.exp'
       ).bind(ytTicketKey(kind, ip, vid), exp).run(), RL_TIMEOUT_MS);
-    } catch {}
+    } catch { return false; }
   }
+  return true;
 }
 async function ytTicketUse(env, kind, rawIp, vid) {
   const ip = ipLimitKey(rawIp);
   const db = env && env.PARSE_DB;
-  if (!ip || !vid || !db || typeof db.prepare !== 'function') return false;
+  if (!ip || !vid || !db || typeof db.prepare !== 'function') throw new Error('ticket storage unavailable');
   try {
     const got = await rlWithTimeout(db.prepare(
       'UPDATE rate_counter SET n = n + 1, last = ? WHERE k = ? AND n < ? AND exp > ? RETURNING n'
     ).bind(Date.now(), ytTicketKey(kind, ip, vid), YT_TICKET_USES[kind], Date.now()).first(), RL_TIMEOUT_MS);
     return !!got;
-  } catch { return false; }
+  } catch { throw new Error('ticket storage unavailable'); }
 }
 // 带票放行；没票扣 yt-hd / yt-direct 的单独计数（D1 挂了照样拒绝）
 async function ytExtraTake(request, env, kind, vid) {
   const ip = request.headers.get('cf-connecting-ip') || '';
-  if (await ytTicketUse(env, kind, ip, vid)) return { ok: true };
+  try { if (await ytTicketUse(env, kind, ip, vid)) return { ok: true }; }
+  catch { return RL_BUSY; }
   const rl = await rateTake(env, 'youtube_hd', ip, YT_EXTRA_DAILY_LIMIT, 0);
   if (!rl.ok && rl.status === 429) return { ok: false, status: 429, msg: '今日高清获取次数已用完（' + YT_EXTRA_DAILY_LIMIT + ' 次），明天再来吧' };
   return rl;
@@ -420,7 +408,7 @@ async function verifyTurnstile(token, secret, ip) {
   }
 }
 
-// ---------- 人机验证通行证（一次 siteverify 通过后，30 分钟内的解析 / 高清 / 下载 / 合并都不用再点验证） ----------
+// ---------- 人机验证通行证（一次 siteverify 通过后，5 分钟内的解析 / 高清 / 下载 / 合并都不用再点验证） ----------
 const YT_HOSTS = ['youtube.com', 'youtu.be', 'youtube-nocookie.com'];
 function isYouTubeUrl(u) {
   try {
@@ -437,7 +425,7 @@ export const HUMAN_PASS_MAX_AGE_SECS = 2 * 60 * 60; // 续期封顶：距第一�
 const HUMAN_PASS_RENEW_BELOW_SECS = 3 * 60; // 剩余不足 3 分钟时顺手续期（长下载 / 分段合并不会中途 403）
 // 距 2 小时封顶不足 15 分钟时，如果请求里正好带了新的 Turnstile token，就真验一次并换一张全新通行证（重新计 2 小时）
 export const HUMAN_PASS_REFRESH_NEAR_CAP_SECS = 15 * 60;
-export const HUMAN_PATHS = new Set(['/api/parse', '/api/yt-hd', '/api/ytdl', '/api/yt1080-start', '/api/yt-direct']);
+export const HUMAN_PATHS = new Set(['/api/human-pass', '/api/parse', '/api/yt-hd', '/api/ytdl', '/api/yt1080-start', '/api/yt-direct']);
 const HUMAN_MSG_REQUIRED = '请先完成人机验证';
 const HUMAN_MSG_FAILED = '人机验证未通过，请重试';
 const HUMAN_MSG_UNAVAILABLE = '验证服务暂时连不上，请稍后再试';
@@ -794,7 +782,7 @@ async function handleParse(request, env) {
         await env.FEEDBACK_KV.put(hk, JSON.stringify(hist.slice(0, 20)));
       } catch {}
     }
-    await ytTicketIssue(env, parseIp, result && result.videoId);
+    if (!(await ytTicketIssue(env, parseIp, result && result.videoId))) return json({ok:false,error:RL_BUSY.msg},503);
     return json({ ok: true, ...result });
   } catch (e) {
     const body = { ok: false, error: e.message || '解析失败' };
@@ -852,7 +840,8 @@ function ytdlMediaResponse(resp, filename) {
   const cr = resp.headers.get('content-range');
   if (cr) h.set('Content-Range', cr);
   h.set('Accept-Ranges', 'bytes');
-  h.set('Access-Control-Expose-Headers', 'Content-Range, Content-Length');
+  for (const k of ['ETag', 'Last-Modified']) { const v=resp.headers.get(k); if(v) h.set(k,v); }
+  h.set('Access-Control-Expose-Headers', 'Content-Range, Content-Length, ETag, Last-Modified');
   h.set('Content-Disposition', 'attachment; filename="' + filename + '"');
   h.set('Cache-Control', 'no-store');
   return new Response(resp.body, { status: resp.status === 206 ? 206 : 200, headers: h });
@@ -868,6 +857,8 @@ function ytdlUpstreamHeaders(request, ua, extra) {
   }
   const range = request.headers.get('Range');
   if (range && /^bytes=\d+-\d*$/.test(range)) upHeaders.Range = range;
+  const ifRange = request.headers.get('If-Range');
+  if (ifRange && ifRange.length <= 512) upHeaders['If-Range'] = ifRange;
   return upHeaders;
 }
 
@@ -969,7 +960,108 @@ async function proxyResolvedYtDl(request, env, vid, itag, clientKey, filename, f
   }
 }
 
+// D1 is the authority for download tasks and active streams (across isolates).
+// A video/legacy URL in a two-hour window is one task; Range/audio requests do not
+// consume parse quota. At most 20 tasks/day, 512 requests/task, 6 active streams/IP
+// (the normal UI downloads video and audio with 3 ranges each).
+export const YTDL_CONCURRENCY = 6;
+export const YTDL_TASK_LIMIT = 20;
+export const YTDL_REQUEST_LIMIT = 512;
+const YTDL_LEASE_MS = 10 * 60 * 1000;
+export async function ytdlReserve(request, env, identity) {
+  const ip = clientIpKey(request), db = env && env.PARSE_DB;
+  const denyBusy = () => ({ deny: json({ ok: false, code: 'DOWNLOAD_UNAVAILABLE', error: RL_BUSY.msg }, 503) });
+  if (!ip || !db || typeof db.prepare !== 'function') return denyBusy();
+  const now = Date.now(), expiry = now + YTDL_LEASE_MS;
+  const a = crypto.getRandomValues(new Uint32Array(2));
+  const owner = a[0] * 65536 + (a[1] & 65535);
+  let slotKey = '';
+  const release = async () => {
+    if (!slotKey) return;
+    try { await rlWithTimeout(db.prepare('DELETE FROM rate_counter WHERE k = ? AND n = ?').bind(slotKey, owner).run(), RL_TIMEOUT_MS); }
+    catch { console.warn('[ytdl] lease release failed; bounded lease retained'); }
+  };
+  try {
+    for (let i = 0; i < YTDL_CONCURRENCY; i++) {
+      const key = 'yds:' + ip + ':' + i;
+      const got = await rlWithTimeout(db.prepare(
+        'INSERT INTO rate_counter(k,n,last,exp) VALUES(?,?,?,?) ON CONFLICT(k) DO UPDATE SET n=excluded.n,last=excluded.last,exp=excluded.exp WHERE rate_counter.exp <= ? RETURNING n'
+      ).bind(key, owner, now, expiry, now).first(), RL_TIMEOUT_MS);
+      if (got) { slotKey = key; break; }
+    }
+    if (!slotKey) return { deny: json({ok:false,code:'DOWNLOAD_CONCURRENCY',error:'同时下载的分段过多，请稍后重试'},429) };
+    const hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(identity))), b => b.toString(16).padStart(2,'0')).join('');
+    const prefix = 'ydt:' + ip + ':' + rlDate() + ':';
+    const key = prefix + Math.floor(now / (2 * 3600000)) + ':' + hash;
+    const got = await rlWithTimeout(db.prepare(
+      'INSERT INTO rate_counter(k,n,last,exp) SELECT ?,1,?,? WHERE EXISTS(SELECT 1 FROM rate_counter WHERE k=?) OR (SELECT COUNT(*) FROM rate_counter WHERE k>=? AND k<?)<? ' +
+      'ON CONFLICT(k) DO UPDATE SET n=n+1,last=excluded.last WHERE rate_counter.n<? RETURNING n'
+    ).bind(key, now, now+2*86400000, key, prefix, prefix+'\uffff', YTDL_TASK_LIMIT, YTDL_REQUEST_LIMIT).first(), RL_TIMEOUT_MS);
+    if (!got) {
+      await release();
+      return {deny:json({ok:false,code:'DOWNLOAD_RATE_LIMIT',error:'下载任务或分段请求次数已达上限，请稍后再试'},429)};
+    }
+    return { release, expiry };
+  } catch {
+    await release();
+    return denyBusy();
+  }
+}
+// Keep the lease until the body ends/cancels/errors, not merely until headers.
+// The hard stream deadline precedes lease expiry; a stuck stream cannot overlap
+// a reclaimed slot. Clients may continue large downloads with a new Range.
+export function ytdlLeasedResponse(resp, lease, request) {
+  const reader = resp.body.getReader();
+  let finished = false, timer, controller;
+  const finish = async () => {
+    if (finished) return;
+    finished = true; clearTimeout(timer);
+    request.signal.removeEventListener('abort', abort);
+    await lease.release();
+  };
+  const abort = () => {
+    if (finished) return;
+    try { controller.error(new Error('下载已中断，请继续下载')); } catch {}
+    void reader.cancel('download aborted').catch(() => {}).then(finish);
+  };
+  const body = new ReadableStream({
+    start(c) {
+      controller = c;
+      timer = setTimeout(abort, Math.max(1, lease.expiry - Date.now() - 1000));
+      request.signal.addEventListener('abort', abort, {once:true});
+      if (request.signal.aborted) abort();
+    },
+    async pull(c) {
+      try {
+        const chunk = await reader.read();
+        if (finished) return;
+        if (chunk.done) { await finish(); c.close(); }
+        else c.enqueue(chunk.value);
+      } catch(e) { await finish(); try { c.error(e); } catch {} }
+    },
+    async cancel(reason) { try { await reader.cancel(reason); } finally { await finish(); } }
+  }, {highWaterMark:0});
+  return new Response(body, resp);
+}
 async function handleYtDl(request, env) {
+  const u = new URL(request.url), vid = (u.searchParams.get('v')||'').trim(), itag=(u.searchParams.get('itag')||'').trim();
+  const media = u.searchParams.get('url')||'';
+  if (vid || itag) {
+    if (!/^[A-Za-z0-9_-]{11}$/.test(vid) || !/^\d{1,4}$/.test(itag) || +itag<=0) return json({ok:false,error:'无效的视频或画质参数'},400);
+  } else {
+    try { new URL(media); } catch { return json({ok:false,error:'无效的下载地址'},400); }
+    if (!isAllowedMediaUrl(media)) return json({ok:false,error:'不支持的下载地址'},400);
+  }
+  const lease = await ytdlReserve(request, env, vid ? 'v:'+vid : 'u:'+media);
+  if (lease.deny) return lease.deny;
+  try {
+    const resp = await handleYtDlUnchecked(request, env);
+    if (!resp.ok || !resp.body) { await lease.release(); return resp; }
+    return ytdlLeasedResponse(resp, lease, request);
+  } catch(e) { await lease.release(); throw e; }
+}
+
+async function handleYtDlUnchecked(request, env) {
   const u = new URL(request.url);
   const filename = ytdlFilename(u.searchParams.get('filename'));
   const vid = String(u.searchParams.get('v') || '').trim();
@@ -1577,6 +1669,7 @@ async function handleGeoStats(request, env) {
 async function handleParseQuota(request, env) {
   const DAILY_LIMIT = RL_DAILY_LIMIT;
   const used = await rateUsed(env, 'youtube', request.headers.get('cf-connecting-ip') || '');
+  if (used === null) return json({ok:false,error:RL_BUSY.msg},503);
   return json({ ok: true, limit: DAILY_LIMIT, used, remaining: Math.max(0, DAILY_LIMIT - used) });
 }
 
@@ -2370,60 +2463,35 @@ async function mergePassthrough(resp) {
 }
 export const MERGE_LIMIT_HOUR = 5;
 export const MERGE_LIMIT_DAY = 15;
-export const MERGE_LOCK_SECS = 60; // KV 最短 TTL 就是 60 秒
-// 同一 isolate 内的「正在提交」集合：JS 单线程，这一层是原子的，挡住同一实例上的并发突发
-const mergeInflight = new Set();
-function mergeLimitJson(error) {
-  return json({ ok: false, code: 'MERGE_RATE_LIMIT', error }, 429);
-}
-// 先占位再转发：
-//   1) 同一 IP（IPv6 /64）同一时间只允许一个合并提交：isolate 内 Set + KV 锁键 mlock_<ip>（TTL 60 秒）；
-//   2) 检查每小时 / 每天次数后立刻 +1（占位），再去请求 EC2；
-//   3) EC2 连不上 / 拒绝 / 排队满：退还次数并释放锁；EC2 接下任务：锁留到 TTL 自然过期（同一 IP 约 1 分钟只能提交一次）。
-// Workers KV 不是原子的、跨地域最终一致，这样只能大幅收窄并发窗口，不能 100% 杜绝；要彻底原子需要 Durable Object。
-async function mergeRateReserve(request, env) {
-  const kv = env.FEEDBACK_KV;
-  const ipk = clientIpKey(request);
-  const none = async () => {};
-  if (!ipk) return { deny: null, settle: none };
-  if (mergeInflight.has(ipk)) return { deny: mergeLimitJson('你上一个合并任务还在提交中，请等它返回后再试（约 1 分钟）'), settle: none };
-  mergeInflight.add(ipk);
-  const unlockMem = () => { mergeInflight.delete(ipk); };
-  if (!kv) return { deny: null, settle: async () => { unlockMem(); } };
-  const now = new Date(Date.now() + 8 * 3600 * 1000).toISOString();
-  const lk = 'mlock_' + ipk;
-  const hk = 'mrl_h_' + ipk + '_' + now.slice(0, 13);
-  const dk = 'mrl_d_' + ipk + '_' + now.slice(0, 10);
-  let h = 0, d = 0;
+export const MERGE_LOCK_SECS = 60; // D1 原子提交冷却
+function mergeLimitJson(error) { return json({ok:false,code:'MERGE_RATE_LIMIT',error},429); }
+// One conditional INSERT checks the daily/hourly limits and the 60s cooldown
+// atomically. A row is a reservation, so rejected jobs can refund exactly their
+// own row without racing another request's counters. No KV/isolate fallback.
+export async function mergeRateReserve(request, env) {
+  const db=env && env.PARSE_DB, ip=clientIpKey(request), none=async()=>{};
+  const busy=()=>({deny:json({ok:false,code:'MERGE_UNAVAILABLE',error:RL_BUSY.msg},503),settle:none});
+  if (!ip || !db || typeof db.prepare!=='function') return busy();
+  const now=Date.now(), prefix='ymr:'+ip+':', end=prefix+'\uffff';
+  const dayStart=Math.floor((now+8*3600000)/86400000)*86400000-8*3600000;
+  const hourStart=Math.floor(now/3600000)*3600000;
+  const key=prefix+crypto.randomUUID();
   try {
-    if (await kv.get(lk)) { unlockMem(); return { deny: mergeLimitJson('你上一个合并任务刚提交，请约 1 分钟后再提交下一个'), settle: none }; }
-    h = Number((await kv.get(hk)) || 0);
-    d = Number((await kv.get(dk)) || 0);
-  } catch {
-    return { deny: null, settle: async () => { unlockMem(); } }; // KV 出错不挡用户
-  }
-  if (d >= MERGE_LIMIT_DAY) { unlockMem(); return { deny: mergeLimitJson('今天的服务器合并次数已用完（每天 ' + MERGE_LIMIT_DAY + ' 次），明天再来吧'), settle: none }; }
-  if (h >= MERGE_LIMIT_HOUR) { unlockMem(); return { deny: mergeLimitJson('服务器合并太频繁了（每小时最多 ' + MERGE_LIMIT_HOUR + ' 次），请稍后再试'), settle: none }; }
-  let reserved = false;
-  try {
-    await kv.put(lk, String(Date.now()), { expirationTtl: MERGE_LOCK_SECS });
-    await kv.put(hk, String(h + 1), { expirationTtl: 7200 });
-    await kv.put(dk, String(d + 1), { expirationTtl: 172800 });
-    reserved = true;
-  } catch {}
-  const dec = async (k, ttl) => {
-    const cur = Number((await kv.get(k)) || 0);
-    await kv.put(k, String(Math.max(0, cur - 1)), { expirationTtl: ttl });
-  };
-  return {
-    deny: null,
-    // accepted=true：EC2 已接下任务，保留占位和锁；false：退还次数、删锁
-    settle: async (accepted) => {
-      unlockMem();
-      if (accepted || !reserved) return;
-      try { await dec(hk, 7200); await dec(dk, 172800); await kv.delete(lk); } catch {}
-    },
-  };
+    const row=await rlWithTimeout(db.prepare(
+      'INSERT INTO rate_counter(k,n,last,exp) SELECT ?,1,?,? WHERE '+
+      '(SELECT COUNT(*) FROM rate_counter WHERE k>=? AND k<? AND last>=?)<? AND '+
+      '(SELECT COUNT(*) FROM rate_counter WHERE k>=? AND k<? AND last>=?)<? AND '+
+      'NOT EXISTS(SELECT 1 FROM rate_counter WHERE k>=? AND k<? AND last>?) RETURNING n'
+    ).bind(key,now,now+2*86400000,prefix,end,dayStart,MERGE_LIMIT_DAY,prefix,end,hourStart,MERGE_LIMIT_HOUR,prefix,end,now-MERGE_LOCK_SECS*1000).first(),RL_TIMEOUT_MS);
+    if (!row) return {deny:mergeLimitJson('服务器合并次数已达上限或任务刚提交，请稍后再试（每小时5次、每天15次，间隔60秒）'),settle:none};
+    let settled=false;
+    return {deny:null,settle:async(accepted)=>{
+      if(settled)return; settled=true;
+      if(accepted)return;
+      try{await rlWithTimeout(db.prepare('DELETE FROM rate_counter WHERE k=?').bind(key).run(),RL_TIMEOUT_MS);}
+      catch{console.warn('[merge] reservation refund failed; quota retained');}
+    }};
+  }catch{return busy();}
 }
 async function handleYt1080Start(request, env) {
   const token = mergeToken(env);
@@ -2461,7 +2529,9 @@ async function handleYt1080Start(request, env) {
     await mergeRate.settle(resp.ok); // 只有 EC2 真正接下任务才保留占位（拒绝 / 排队满 / 5xx 退还）
     return mergePassthrough(resp);
   } catch (e) {
-    await mergeRate.settle(false); // 连不上 EC2：退还
+    // A lost response does not prove the upstream rejected the job. Retain quota
+    // and cooldown on network failures to prevent ambiguous retries duplicating work.
+    await mergeRate.settle(true); // 结果不明：保留占位
     return mergeConnectError(e);
   }
 }
@@ -3141,6 +3211,7 @@ const pl = createParseLog('youtube', { valid: (t) => { const l = (String(t).matc
 
 /* ================= 路由 ================= */
 function routeHumanGated(pathname, request, env, ctx) {
+  if (pathname === '/api/human-pass') return json({ok:true});
   // 预览部署（<分支或哈希>.youtubejiexisite.pages.dev）不提供解析 / 下载类接口（预览没配人机验证，免得变成公开接口）
   if (plIsPreview(request, env)) return plPreviewResponse();
   if (pathname === '/api/parse') return pl.wrap(request, env, ctx, () => handleParse(request, env));
