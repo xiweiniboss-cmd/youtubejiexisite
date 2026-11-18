@@ -52,3 +52,10 @@ test('actual feedback route refuses cross-midnight write until 600 seconds',asyn
   set(before+600000);assert.equal((await b.default.fetch(request(),e)).status,200);assert.equal(records.size,2);
  }finally{globalThis.fetch=old;}
 }));
+test('youtube parse uses no interval cooldown: back-to-back parses pass, daily 20 still holds',async()=>clock(async set=>{
+ assert.match(source,/rateTake\(env, 'youtube', parseIp, RL_DAILY_LIMIT, PARSE_COOLDOWN_SECS\)/);
+ assert.match(source,/const PARSE_COOLDOWN_SECS = 0;/);
+ const e={PARSE_DB:sqliteD1()};
+ for(let i=0;i<20;i++)assert.equal((await a.rateTake(e,'youtube',ip,20,0)).ok,true);
+ const r=await b.rateTake(e,'youtube',ip,20,0);assert.equal(r.status,429);assert.match(r.msg,/今日解析次数已用完/);
+}));

@@ -76,13 +76,14 @@ function ipLimitKey(ip) {
   return parts.join(':') + '::/64';
 }
 // ================= 原子频控（D1 rate_counter，和微博站共用同一张表） =================
-// 冷却 60 秒 + 每 IP（IPv6 按 /64）每天（北京时间）20 次。每日计数按日分键，冷却跨日检查。
+// 通用：冷却 60 秒（YouTube 解析已设为 0）+ 每 IP（IPv6 按 /64）每天（北京时间）20 次。每日计数按日分键，冷却跨日检查。
 // 解析之前用一条条件 UPSERT 原子地「判断 + 占坑」（含既有历史记录，无需迁移）：
 //   并发一批请求只有第一个能占到坑；失败的解析也算一次（不能拿坏链接无限刷上游接口）。
 // D1 出错 / 超过 2 秒：直接拒绝（503「服务繁忙，请稍后再试」），不再退回 KV。
 // 缺少 PARSE_DB 同样拒绝；本地测试需提供 D1，预览不再回退 KV。
 const RL_COOLDOWN_SECS = 60;
 const RL_DAILY_LIMIT = 20;
+const PARSE_COOLDOWN_SECS = 0; // YouTube 解析不设间隔（2026-11-19 博士要求）；反馈仍走自己的 600 秒
 const RL_TIMEOUT_MS = 2000;
 function rlDate() {
   return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
@@ -745,10 +746,10 @@ async function handleParse(request, env) {
 
   // 人机验证在路由里统一做（checkHuman），这里不再重复
 
-  // 频控：冷却 60 秒 + 每 IP 每天 20 次。解析前原子占坑（D1），并发打不穿，失败也算一次
+  // 频控：不设间隔冷却，只保留每 IP 每天 20 次。解析前原子占坑（D1），并发打不穿，失败也算一次
   const parseIp = request.headers.get('cf-connecting-ip') || '';
   const deviceId = new URL(request.url).searchParams.get('deviceId') || '';
-  const rl = await rateTake(env, 'youtube', parseIp);
+  const rl = await rateTake(env, 'youtube', parseIp, RL_DAILY_LIMIT, PARSE_COOLDOWN_SECS);
   if (!rl.ok) return json({ ok: false, error: rl.msg }, rl.status);
 
   plPass(request); // 人机验证（入口 checkHuman）+ 冷却 + 每日次数都过了：这次解析才记进 D1 parse_log
