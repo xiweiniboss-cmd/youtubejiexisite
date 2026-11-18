@@ -755,6 +755,12 @@ async function handleParse(request, env) {
   plPass(request); // 人机验证（入口 checkHuman）+ 冷却 + 每日次数都过了：这次解析才记进 D1 parse_log
   try {
     const result = await parseYoutubeViaRedFox(shareText, apiKey, debug);
+    // 预览卡片（allfeedback「解析记录」）：上游没给封面时用视频 ID 拼 i.ytimg.com 缩略图
+    plMeta(request, {
+      cover: result.cover || (/^[A-Za-z0-9_-]{11}$/.test(result.videoId || '') ? 'https://i.ytimg.com/vi/' + result.videoId + '/hqdefault.jpg' : ''),
+      title: result.title,
+      media: 'video',
+    });
     // 本站解析次数统计（仅成功计数）
     if (env.FEEDBACK_KV) {
       try {
@@ -3261,8 +3267,8 @@ async function handleYtDirect(request, env) {
   return json({ ok: true, videoId: vid, results: results });
 }
 
-// ==== parse-log v2 BEGIN ====
-// 解析记录 + 拉黑（各解析站共用同一份代码：allfeedback/shared/parse-log.js 是原件，改动后用 shared/pf-sync.mjs 同步）
+// ==== parse-log v3 BEGIN ====
+// 解析记录 + 拉黑 + 预览信息（各解析站共用同一份代码：allfeedback/shared/parse-log.js 是原件，改动后用 shared/pf-sync.mjs 同步）
 // 存储：D1 数据库 parse_log（绑定名 PARSE_DB），表 parse_log / blocklist，建表语句见 allfeedback/shared/parse_log.sql。
 // - 每次解析记一行：时间、站点、链接（去掉令牌类参数）、成功与否、状态码、失败原因（里面的链接也去令牌）、IP、归属地（request.cf）、
 //   设备 ID、设备指纹、UA。失败行（ok=0）同时就是 allfeedback「解析失败」的数据来源，所以接了本模块的站不再需要 pf-recorder。
@@ -3278,6 +3284,10 @@ async function handleYtDirect(request, env) {
 //   被拉黑的请求按命中的名单项每分钟最多记一行（换设备头也不会多写）。
 // - 下载 / 媒体代理用 pl.guard(...) 包一层：只查黑名单，不记。
 // - 写入全部在 waitUntil 里、最多等 10 秒、出错吞掉，不影响解析响应。保留 30 天：由微博 Worker 的每日定时任务分批删除。
+// - 预览卡片（v3）：解析成功处调用 plMeta(request, { cover, title, media })，成功行一起存 cover / title / media 三列：
+//   cover 只收 https 图片链接（// 开头补 https:，http: 升成 https:），超过 500 字丢弃；title 去控制字符、合并空白、≤120 字；
+//   media 只收 video / image / images / mix / audio / live。三列由 shared/migrations/2026-11-19-preview.sql 加上；
+//   迁移前写入会报「没有这一列」，此时退回旧列再写一次（本 isolate 10 分钟内直接写旧列），记录不会丢。
 // - 开关：PARSE_LOG_OFF=1 时不写记录（黑名单照常检查）。
 // - 预览部署（<分支或哈希>.<项目>.pages.dev）不提供解析：直接 403。确实要测，给预览环境加 PARSE_ON_PREVIEW=1。
 const PL_BLOCK_TTL_MS = 60000;
@@ -3291,10 +3301,43 @@ const PL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-
 const PL_KEEP_PARAMS = new Set(['v', 'p', 'id', 'vid', 'bvid', 'aid', 'aweme_id', 'modal_id', 'item_id', 'photoid', 'list', 'index']);
 const PL_URL_RE = /https?:\/\/[^\s"'<>\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]+/gi;
 const PL_PASSED = new WeakSet();
+const PL_META = new WeakMap();
+const PL_MEDIA = new Set(['video', 'image', 'images', 'mix', 'audio', 'live']);
+const PL_NOCOL_RETRY_MS = 600000;
+const PL_COLS = 'ts, site, url, ok, status, reason, ip, country, region, city, device_id, fp, ua';
 
 // 站点在人机验证 + 频控都通过后调用：之后这次解析才会被记录
 function plPass(request) {
   try { if (request && typeof request === 'object') PL_PASSED.add(request); } catch {}
+}
+// 去掉控制字符、零宽 / 方向控制符，合并空白
+function plText(v) {
+  return String(v == null ? '' : v).replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+// 预览信息白名单：{ cover, title, media }，不合格的字段给空串
+function plCleanMeta(meta) {
+  const m = meta && typeof meta === 'object' ? meta : {};
+  let cover = typeof m.cover === 'string' ? plText(m.cover) : '';
+  if (/^\/\//.test(cover)) cover = 'https:' + cover;
+  else if (/^http:\/\//i.test(cover)) cover = 'https://' + cover.slice(7);
+  if (cover) {
+    try {
+      const u = new URL(cover);
+      cover = u.protocol === 'https:' && !u.username && !u.password && u.hostname ? u.toString() : '';
+    } catch { cover = ''; }
+  }
+  if (cover.length > 500) cover = '';
+  const title = Array.from(typeof m.title === 'string' || typeof m.title === 'number' ? plText(m.title) : '').slice(0, 120).join('');
+  const media = String(m.media == null ? '' : m.media).trim().toLowerCase();
+  return { cover, title, media: PL_MEDIA.has(media) ? media : '' };
+}
+// 站点在解析成功、拿到结果后调用：这次成功记录会带上封面 / 标题 / 类型。出错一律吞掉，不影响解析
+function plMeta(request, meta) {
+  try {
+    if (!request || typeof request !== 'object') return;
+    const m = plCleanMeta(meta);
+    if (m.cover || m.title || m.media) PL_META.set(request, m);
+  } catch {}
 }
 function plDevice(request) {
   const v = String(request.headers.get('x-device-id') || '').trim().toLowerCase();
@@ -3388,6 +3431,7 @@ function createParseLog(site, opts) {
   const now = opts.now || (() => Date.now());
   const valid = typeof opts.valid === 'function' ? opts.valid : null;
   const cache = { set: null, at: 0, pending: null };
+  let noMetaAt = -Infinity; // 上次发现 parse_log 还没有 cover/title/media 列的时间（迁移前）
   const blockLogged = new Map(); // 命中的名单项 → 上次记录时间（每分钟最多记一行）
 
   function refresh(db) {
@@ -3432,10 +3476,22 @@ function createParseLog(site, opts) {
     if (!db || typeof db.prepare !== 'function' || plFlag(env.PARSE_LOG_OFF)) return null;
     const job = (async () => {
       try {
-        await plWithTimeout(
-          db.prepare('INSERT INTO parse_log (ts, site, url, ok, status, reason, ip, country, region, city, device_id, fp, ua) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-            .bind(row.ts, site, row.url, row.ok ? 1 : 0, row.status, row.reason, row.ip, row.country, row.region, row.city, row.device, row.fp, row.ua).run(),
-          PL_WRITE_TIMEOUT_MS);
+        const vals = [row.ts, site, row.url, row.ok ? 1 : 0, row.status, row.reason, row.ip, row.country, row.region, row.city, row.device, row.fp, row.ua];
+        const meta = row.meta;
+        const legacy = () => plWithTimeout(
+          db.prepare('INSERT INTO parse_log (' + PL_COLS + ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(...vals).run(), PL_WRITE_TIMEOUT_MS);
+        if (!meta || !(meta.cover || meta.title || meta.media) || now() - noMetaAt < PL_NOCOL_RETRY_MS) { await legacy(); return; }
+        try {
+          await plWithTimeout(
+            db.prepare('INSERT INTO parse_log (' + PL_COLS + ', cover, title, media) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+              .bind(...vals, meta.cover, meta.title, meta.media).run(),
+            PL_WRITE_TIMEOUT_MS);
+        } catch (e) {
+          // 迁移前没有这三列：退回旧列再写一次（只在明确是「缺列」时重试，超时等别的错误不重试，避免重复写）
+          if (!/no column named|no such column|has no column/i.test(String((e && e.message) || e))) throw e;
+          noMetaAt = now();
+          await legacy();
+        }
       } catch {}
     })();
     if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(job);
@@ -3461,7 +3517,8 @@ function createParseLog(site, opts) {
     if (await check(request, env, ctx)) return blockedResponse();
     return run();
   }
-  // 用法：return pl.wrap(request, env, ctx, () => handleParse(request, env));  handleParse 里过了人机验证和频控后调 plPass(request)
+  // 用法：return pl.wrap(request, env, ctx, () => handleParse(request, env));  handleParse 里过了人机验证和频控后调 plPass(request)，
+  // 解析成功拿到结果后调 plMeta(request, { cover, title, media })
   async function wrap(request, env, ctx, run) {
     if (plIsPreview(request, env)) return plPreviewResponse();
     let input = '';
@@ -3498,10 +3555,13 @@ function createParseLog(site, opts) {
         const job = (async () => {
           let body = null;
           if (clone) { try { body = await clone.json(); } catch {} }
-          // 失败：非 2xx，或 ok:false，或 code 不是 0 / 200（TikTok 成功 code=0，微博成功 code=200）
-          const failed = status >= 300 || !!(body && (body.ok === false || (typeof body.code === 'number' && body.code !== 0 && body.code !== 200)));
-          const msg = failed ? plScrub((body && (body.error || body.msg || body.message)) || ('HTTP ' + status)) : '';
-          await write(env, ctx, { ...row, ok: !failed, status, reason: msg });
+          // 失败：非 2xx，或 ok:false，或 code 不是 0 / 200（TikTok 成功 code=0，微博成功 code=200）；
+          // 微博 code=200 但 msg='empty'（没有图片 / 视频）也算失败（v3 起并入原件，以前只在微博站的副本里）
+          const empty = !!(body && body.code === 200 && body.msg === 'empty');
+          const failed = empty || status >= 300 || !!(body && (body.ok === false || (typeof body.code === 'number' && body.code !== 0 && body.code !== 200)));
+          const msg = empty ? '没有解析到图片或视频' : failed ? plScrub((body && (body.error || body.msg || body.message)) || ('HTTP ' + status)) : '';
+          const meta = failed ? null : PL_META.get(request) || null;
+          await write(env, ctx, { ...row, ok: !failed, status, reason: msg, meta });
         })().catch(() => {});
         if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(job);
       }
@@ -3510,7 +3570,7 @@ function createParseLog(site, opts) {
   }
   return { wrap, guard, isBlocked, write, _cache: cache };
 }
-// ==== parse-log v2 END ====
+// ==== parse-log v3 END ====
 // 只记有效链接：和 handleParse 开头的本地校验同一套判断（空 / 不是本站链接 → 站点自己 400，不记）
 const pl = createParseLog('youtube', { valid: (t) => { const l = (String(t).match(/https?:\/\/[^\s"'<>]+/) || [])[0] || ''; return !!String(t).trim() && (!l || isYouTubeUrl(l)); } });
 
