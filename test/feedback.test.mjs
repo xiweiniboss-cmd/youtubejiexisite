@@ -1,5 +1,6 @@
 // 反馈系统修复（2026-11-15）：附件先校验、存储失败回滚、kind/link 分开存、page 只收 http(s)、登录同源 + 按站点锁定、后台删除检查返回
 import { test } from 'node:test';
+import {sqliteD1} from './helpers/d1.mjs';
 import assert from 'node:assert/strict';
 import worker from '../_worker.js';
 // 本地测试默认不配人机验证密钥：显式声明跳过（生产缺密钥会 fail-closed 503）
@@ -10,7 +11,7 @@ function mk() {
   const store = new Map(), r2 = new Map();
   const KV = { get: async k => store.get(k) ?? null, put: async (k, v) => { store.set(k, String(v)); }, delete: async k => { store.delete(k); }, list: async ({ prefix } = {}) => ({ keys: [...store.keys()].filter(k => !prefix || k.startsWith(prefix)).map(name => ({ name })) }) };
   const B = { put: async (k, v, o) => { r2.set(k, o); }, delete: async k => { r2.delete(k); }, get: async () => null };
-  return { store, r2, env: { FEEDBACK_KV: KV, FEEDBACK_BUCKET: B, FEEDBACK_ADMIN_KEY: 'adm-secret-123', ASSETS: { fetch: async () => new Response('asset') } } };
+  return { store, r2, env: { PARSE_DB: sqliteD1(), FEEDBACK_KV: KV, FEEDBACK_BUCKET: B, FEEDBACK_ADMIN_KEY: 'adm-secret-123', ASSETS: { fetch: async () => new Response('asset') } } };
 }
 const H = 'https://site-a.pages.dev';
 const call = (path, init, env, host = H) => worker.fetch(new Request(host + path, init), env);

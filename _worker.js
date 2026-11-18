@@ -1122,7 +1122,47 @@ function fbSafePage(p) {
     return '';
   }
 }
-async function handleFeedbackSubmit(request, env) {
+// Keep one buffered multipart request per isolate. 20MiB of attachments in total
+// (still <=3 files), plus 1MiB envelope, bounds copies within Worker memory.
+export const FEEDBACK_BODY_MAX = 21 * 1024 * 1024;
+export const FEEDBACK_TOTAL_FILE_MAX = 20 * 1024 * 1024;
+let feedbackReading=false;
+async function feedbackBodyRequest(request,signal,env) {
+  const max=/multipart\/form-data/i.test(request.headers.get('Content-Type')||'')?FEEDBACK_BODY_MAX:16*1024;
+  const declared=request.headers.get('Content-Length');
+  if(declared!==null&&(!/^\d+$/.test(declared)||!Number.isSafeInteger(+declared)||+declared>max))throw new ResourceError(413,'反馈内容过大，附件合计不能超过20MB');
+  if(!request.body)throw new ResourceError(400,'请求格式错误');
+  const allowance=declared===null?max:+declared,day=rlDate(),exp=Date.now()+2*86400000;
+  await resourceSpend(env,`res:feedback:input:${day}:ip:${clientIpKey(request)}`,allowance,64*1024*1024,exp);
+  await resourceSpend(env,`res:feedback:input:${day}:all`,allowance,2*1024*1024*1024,exp);
+  const reader=request.body.getReader(),chunks=[];let size=0;
+  let rejectAbort;
+  const aborted=new Promise((_,reject)=>{rejectAbort=()=>{reject(new ResourceError(408,'上传超时，请重试'));void reader.cancel('feedback deadline').catch(()=>{});};});
+  signal.addEventListener('abort',rejectAbort,{once:true});
+  if(signal.aborted)rejectAbort();
+  try{
+    for(;;){const r=await Promise.race([reader.read(),aborted]);if(signal.aborted)throw new ResourceError(408,'上传超时，请重试');if(r.done)break;size+=r.value.byteLength;if(size>allowance){void reader.cancel('feedback body cap').catch(()=>{});throw new ResourceError(413,'反馈内容过大，附件合计不能超过20MB');}chunks.push(r.value);}
+    return new Request(request.url,{method:'POST',headers:request.headers,body:new Blob(chunks),signal});
+  }finally{signal.removeEventListener('abort',rejectAbort);}
+}
+async function handleFeedbackSubmit(request,env) {
+  if(!env.FEEDBACK_KV)return json({ok:false,error:'反馈功能暂未启用'},500);
+  let lease,deadline,reading=false;
+  // No request body is consumed before the shared attempt gate and leases.
+  try{
+    if(feedbackReading)throw new ResourceError(429,'正在处理上传，请稍后重试');
+    // Set synchronously, before the first await, to bound all copies per isolate.
+    feedbackReading=true;reading=true;
+    await resourceRate(request,env,'feedback');
+    lease=await resourceLease(request,env,'feedback',1,2,45000);
+    deadline=resourceDeadline(request,30000);
+    const bodyRequest=await feedbackBodyRequest(request,deadline.signal,env);
+    const parsed=await handleFeedbackSubmitUnchecked(bodyRequest,env,request);
+    return parsed;
+  }catch(e){return resourceResponse(e);}finally{deadline?.close();if(lease)await lease.release();if(reading)feedbackReading=false;if(!request.bodyUsed)void request.body?.cancel().catch(()=>{});}
+}
+
+async function handleFeedbackSubmitUnchecked(request, env, originalRequest) {
   if (!env.FEEDBACK_KV) return json({ ok: false, error: '反馈功能暂未启用' }, 500);
   const ct = request.headers.get('content-type') || '';
   let message = '',
@@ -1168,33 +1208,30 @@ async function handleFeedbackSubmit(request, env) {
   if (message.length > msgMax) return json({ ok: false, error: '内容太长，请精简到 2000 字以内' }, 400);
   // 附件先全部校验（数量 / 类型 / 大小），一个不合格就整单拒绝，不会先传一半
   if (files.length > 3) return json({ ok: false, error: '最多上传 3 个附件' }, 400);
+  if (files.reduce((n,f)=>n+f.size,0)>FEEDBACK_TOTAL_FILE_MAX) return json({ok:false,error:'附件合计不能超过20MB'},400);
   for (const f of files) {
     if (!SAFE_ATTACH_TYPE.test(f.type || '')) return json({ ok: false, error: '只支持图片和视频附件' }, 400);
     if (f.size > FB_FILE_MAX) return json({ ok: false, error: '单个附件不能超过 20MB' }, 400);
   }
 
   const tsSecret = String(env.TURNSTILE_SECRET_KEY || '').trim();
+  if (!tsSecret && !turnstileDisabled(env)) return json({ok:false,error:'人机验证未配置，暂停反馈'},503);
   if (tsSecret) {
     if (!tsToken) return json({ ok: false, error: '请先完成人机验证' }, 400);
     const tsOk = await verifyTurnstile(tsToken, tsSecret, request.headers.get('cf-connecting-ip') || '');
     if (!tsOk) return json({ ok: false, error: '人机验证未通过，请重试' }, 403);
   }
 
-  const COOLDOWN_SECS = 600;
+  if(request.signal.aborted)throw new ResourceError(408,'上传超时，请重试');
   const clientIp = request.headers.get('cf-connecting-ip') || '';
-  const coolKey = clientIp ? 'cool_youtube_' + ipLimitKey(clientIp) : '';
-  if (coolKey) {
-    let lastTs = null;
-    try { lastTs = await env.FEEDBACK_KV.get(coolKey); } catch {} // KV 读失败不挡用户
-    if (lastTs) {
-      const remain = COOLDOWN_SECS - Math.floor((Date.now() - Number(lastTs)) / 1000);
-      if (remain > 0)
-        return json(
-          { ok: false, error: `提交太频繁，请 ${Math.max(1, Math.ceil(remain / 60))} 分钟后再试` },
-          429
-        );
-    }
-  }
+  // Atomic shared cooldown immediately before storage, not KV get-then-put.
+  // Failed storage retains the reservation: ambiguous writes cannot be retried
+  // indefinitely to amplify R2 operations. Attempts have a separate entry budget.
+  const admission = await rateTake(env,'youtube_feedback',clientIp,20,600);
+  if(!admission.ok)return json({ok:false,error:admission.msg},admission.status);
+  const uploadBytes=files.reduce((n,f)=>n+f.size,0),day=rlDate(),exp=Date.now()+2*86400000;
+  await resourceSpend(env,`res:feedback:bytes:${day}:ip:${clientIpKey(request)}`,uploadBytes,60*1024*1024,exp);
+  await resourceSpend(env,`res:feedback:bytes:${day}:all`,uploadBytes,512*1024*1024,exp);
 
   const id = 'fb_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
   const attachments = [];
@@ -1217,9 +1254,12 @@ async function handleFeedbackSubmit(request, env) {
           (String(f.name || '').split('.').pop() || 'bin').replace(/[^a-z0-9]/gi, '').slice(0, 8) ||
           'bin';
         const key = `fb/${id}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
-        await env.FEEDBACK_BUCKET.put(key, f.stream(), {
-          httpMetadata: { contentType: type },
-        });
+        if(request.signal.aborted)throw new ResourceError(408,'上传超时，请重试');
+        const write=env.FEEDBACK_BUCKET.put(key, f.stream(), {httpMetadata:{contentType:type}});
+        try{await rlWithTimeout(write,5000);}catch(e){
+          // A timed-out put may still finish; remove that late object too.
+          void Promise.resolve(write).then(()=>env.FEEDBACK_BUCKET.delete(key)).catch(()=>{});throw e;
+        }
         uploaded.push(key);
         attachments.push({ key, type, name: String(f.name || '').slice(0, 80), size: f.size });
       }
@@ -1240,22 +1280,21 @@ async function handleFeedbackSubmit(request, env) {
     ua: (request.headers.get('user-agent') || '').slice(0, 200),
     ip: clientIp,
     geo: {
-      country: (request.cf && request.cf.country) || '',
-      region: (request.cf && request.cf.region) || '',
-      city: (request.cf && request.cf.city) || '',
+      country: (originalRequest.cf && originalRequest.cf.country) || '',
+      region: (originalRequest.cf && originalRequest.cf.region) || '',
+      city: (originalRequest.cf && originalRequest.cf.city) || '',
     },
     time: new Date().toISOString(),
   };
   try {
-    await env.FEEDBACK_KV.put(id, JSON.stringify(record));
+    if(request.signal.aborted)throw new ResourceError(408,'上传超时，请重试');
+    const write=env.FEEDBACK_KV.put(id,JSON.stringify(record));
+    try{await rlWithTimeout(write,5000);}catch(e){
+      void Promise.resolve(write).then(()=>env.FEEDBACK_KV.delete?.(id)).catch(()=>{});throw e;
+    }
   } catch {
     await cleanup();
     return storageFail();
-  }
-  if (coolKey) {
-    try {
-      await env.FEEDBACK_KV.put(coolKey, String(Date.now()), { expirationTtl: COOLDOWN_SECS });
-    } catch {}
   }
   return json({ ok: true });
 }
@@ -2438,7 +2477,9 @@ export function rewriteQueueFull(status, parsed) {
   return json(body, 503);
 }
 async function mergePassthrough(resp) {
-  const text = await resp.text();
+  const capped = await readBodyCapped(resp, 16 * 1024);
+  if (capped.over) return json({ok:false,error:'合并服务响应过大'},502);
+  const text = capped.text;
   if (mergeOriginDown(resp.status, text)) {
     return json({ ok: false, code: 'MERGE_ORIGIN_DOWN', error: mergeOriginDownMessage(resp.status, text) }, 502);
   }
@@ -2541,6 +2582,224 @@ async function handleYt1080Start(request, env) {
     return mergeConnectError(e);
   }
 }
+// Resource budgets share the existing D1 authority; never fall back to KV or
+// isolate memory. Partial charges are deliberately retained after failures.
+export const MERGE_READ_POLICY = Object.freeze({
+  statusPerMinute: 120, statusGlobalMinute: 600,
+  filePerMinute: 120, fileGlobalMinute: 600, filePerJobDay: 512,
+  filePerDay: 4096, fileGlobalDay: 20000,
+  streamsPerIp: 6, streamsGlobal: 12, streamMs: 10 * 60 * 1000,
+  maxFileBytes: 1024 ** 3, bytesPerIpDay: 8 * 1024 ** 3, bytesGlobalDay: 80 * 1024 ** 3,
+});
+class ResourceError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+function resourceResponse(e) {
+  return json({ok:false,code:e.status === 429 ? 'RESOURCE_RATE_LIMIT' : e.status === 413 ? 'RESOURCE_TOO_LARGE' : 'RESOURCE_UNAVAILABLE',error:e.message || RL_BUSY.msg}, e.status || 503);
+}
+function resourceDb(env) {
+  if (!env?.PARSE_DB || typeof env.PARSE_DB.prepare !== 'function') throw new ResourceError(503, RL_BUSY.msg);
+  return env.PARSE_DB;
+}
+export async function resourceSpend(env, key, amount, limit, exp) {
+  const db = resourceDb(env);
+  if (!Number.isSafeInteger(amount) || amount < 0 || amount > limit) throw new ResourceError(413, '请求数据量过大，请分段下载或缩小附件');
+  let got;
+  try {
+    got = await rlWithTimeout(db.prepare(
+      'INSERT INTO rate_counter(k,n,last,exp) VALUES(?,?,?,?) ON CONFLICT(k) DO UPDATE SET n=n+excluded.n,last=excluded.last WHERE rate_counter.n+excluded.n<=? RETURNING n'
+    ).bind(key,amount,Date.now(),exp,limit).first(),RL_TIMEOUT_MS);
+  } catch { throw new ResourceError(503, RL_BUSY.msg); }
+  if (!got) throw new ResourceError(429, '请求或流量额度已达上限，请稍后再试');
+}
+async function resourceRate(request, env, kind, id = '') {
+  const ip = clientIpKey(request);
+  if (!ip) throw new ResourceError(503, RL_BUSY.msg);
+  const minute = Math.floor(Date.now()/60000), day = rlDate(), exp = Date.now()+2*86400000;
+  const limits = kind === 'status' ? [MERGE_READ_POLICY.statusPerMinute,MERGE_READ_POLICY.statusGlobalMinute] : kind === 'feedback' ? [6,60] : [MERGE_READ_POLICY.filePerMinute,MERGE_READ_POLICY.fileGlobalMinute];
+  await resourceSpend(env,`res:${kind}:m:${minute}:ip:${ip}`,1,limits[0],exp);
+  await resourceSpend(env,`res:${kind}:m:${minute}:all`,1,limits[1],exp);
+  if (kind === 'file') {
+    await resourceSpend(env,`res:file:d:${day}:job:${id}`,1,MERGE_READ_POLICY.filePerJobDay,exp);
+    await resourceSpend(env,`res:file:d:${day}:ip:${ip}`,1,MERGE_READ_POLICY.filePerDay,exp);
+    await resourceSpend(env,`res:file:d:${day}:all`,1,MERGE_READ_POLICY.fileGlobalDay,exp);
+  }
+}
+// Leases cover the fetch, prefix probe and entire response, not just headers.
+// Cancellation is requested before a slot is released; a hard deadline bounds
+// clients that stop reading. Ownership prevents old cleanup deleting a new lease.
+export async function resourceLease(request, env, kind, perIp, globalMax, durationMs) {
+  const db=resourceDb(env), ip=clientIpKey(request);
+  if (!ip) throw new ResourceError(503, RL_BUSY.msg);
+  const now=Date.now(), expiry=now+durationMs+5000, owner=(()=>{const a=crypto.getRandomValues(new Uint32Array(2));return a[0]*65536+(a[1]&65535);})();
+  const keys=[];
+  const release=async()=>{
+    for(const key of keys.splice(0)) {
+      try { await rlWithTimeout(db.prepare('DELETE FROM rate_counter WHERE k=? AND n=?').bind(key,owner).run(),RL_TIMEOUT_MS); }
+      catch { /* Retain bounded lease on cleanup failure. */ }
+    }
+  };
+  try {
+    for(const [scope,max] of [[`ip:${ip}`,perIp],['all',globalMax]]) {
+      let found=false;
+      for(let i=0;i<max;i++) {
+        const key=`res:lease:${kind}:${scope}:${i}`;
+        const row=await rlWithTimeout(db.prepare(
+          'INSERT INTO rate_counter(k,n,last,exp) VALUES(?,?,?,?) ON CONFLICT(k) DO UPDATE SET n=excluded.n,last=excluded.last,exp=excluded.exp WHERE rate_counter.exp<=? RETURNING n'
+        ).bind(key,owner,now,expiry,now).first(),RL_TIMEOUT_MS);
+        if(row) { keys.push(key); found=true; break; }
+      }
+      if(!found) throw new ResourceError(429,'同时处理的请求过多，请稍后重试');
+    }
+    return {release};
+  } catch(e) { await release(); throw e instanceof ResourceError ? e : new ResourceError(503,RL_BUSY.msg); }
+}
+function resourceDeadline(request, ms) {
+  const ctrl=new AbortController();
+  const onAbort=()=>ctrl.abort(request.signal.reason);
+  request.signal.addEventListener('abort',onAbort,{once:true});
+  if(request.signal.aborted)onAbort();
+  const timer=setTimeout(()=>ctrl.abort(new Error('请求超时，请重试或继续下载')),ms);
+  return {signal:ctrl.signal,abort:()=>ctrl.abort(),close:()=>{clearTimeout(timer);request.signal.removeEventListener('abort',onAbort);}};
+}
+async function holdResourceResponse(resp, lease, deadline) {
+  if(!resp.body) { deadline.close(); await lease.release(); return resp; }
+  const reader=resp.body.getReader();let done=false,controller;
+  const finish=async()=>{if(done)return;done=true;deadline.signal.removeEventListener('abort',abort);deadline.close();await lease.release();};
+  const abort=()=>{
+    try { controller?.error(new Error('下载中断，请继续下载')); } catch {}
+    void reader.cancel('resource deadline').catch(()=>{}).then(finish);
+  };
+  const body=new ReadableStream({
+    start(c){controller=c;deadline.signal.addEventListener('abort',abort,{once:true});if(deadline.signal.aborted)abort();},
+    async pull(c){try{const r=await reader.read();if(done)return;if(r.done){await finish();c.close();}else c.enqueue(r.value);}catch(e){await finish();try{c.error(e);}catch{}}},
+    async cancel(reason){try{await reader.cancel(reason);}finally{await finish();}}
+  },{highWaterMark:0});
+  return new Response(body,resp);
+}
+async function mergeReadBytes(request,env,amount) {
+  const day=rlDate(),ip=clientIpKey(request),exp=Date.now()+2*86400000;
+  await resourceSpend(env,`res:file:bytes:${day}:ip:${ip}`,amount,MERGE_READ_POLICY.bytesPerIpDay,exp);
+  await resourceSpend(env,`res:file:bytes:${day}:all`,amount,MERGE_READ_POLICY.bytesGlobalDay,exp);
+}
+// Reserve declared bytes BEFORE any body read, including the extra prefix.
+// Missing length reserves the full bounded stream allowance. No refund on cancel:
+// this is an admission budget, not a billing counter attackers can race/refund.
+async function mergeFileFetch(request,env,url,init) {
+  const resp=await fetch(url,init);
+  if(!resp.ok || !resp.body || /json|html/i.test(resp.headers.get('Content-Type')||'')) return resp;
+  try {
+    // fetch exposes decoded bytes for encoded bodies: compressed length is not a byte budget.
+    const encoded=resp.headers.get('Content-Encoding') && resp.headers.get('Content-Encoding')!=='identity';
+    const len=encoded?null:resp.headers.get('Content-Length');
+    const amount=len===null?MERGE_READ_POLICY.maxFileBytes:Number(len);
+    if(!Number.isSafeInteger(amount)||amount<0||amount>MERGE_READ_POLICY.maxFileBytes)throw new ResourceError(413,'成品过大，请使用不超过1GiB的分段下载');
+    await mergeReadBytes(request,env,amount);
+    const reader=resp.body.getReader();let read=0;
+    return new Response(new ReadableStream({
+      async pull(c){try{const r=await reader.read();if(r.done){c.close();return;}read+=r.value.byteLength;if(read>amount){void reader.cancel('byte budget');c.error(new Error('成品长度超出预算'));return;}c.enqueue(r.value);}catch(e){c.error(e);}},
+      cancel(reason){return reader.cancel(reason);}
+    },{highWaterMark:0}),resp);
+  } catch(e) { try{await resp.body.cancel();}catch{} throw e; }
+}
+const mergeProofPending=new Map();
+async function mergeProofKey(env,id,resp,total) {
+  const etag=resp.headers.get('ETag')||'',modified=resp.headers.get('Last-Modified')||'';
+  // Cache only versioned responses; absent/weak-only validators must be probed.
+  if(!(etag && !/^W\//i.test(etag)) && !modified)return '';
+  const identity=JSON.stringify([mergeBase(env),id,etag,modified,total]);
+  const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(identity))),b=>b.toString(16).padStart(2,'0')).join('');
+  return 'res:proof:'+hash;
+}
+async function readMergeProof(env,key) {
+  if(!key)return null;
+  try {
+    const row=await rlWithTimeout(resourceDb(env).prepare('SELECT n,exp FROM rate_counter WHERE k=?').bind(key).first(),RL_TIMEOUT_MS);
+    if(row && row.exp>Date.now() && [1,2].includes(row.n))return row.n===2?{kind:'mp4'}:{kind:'unknown'};
+  } catch { throw new ResourceError(503,RL_BUSY.msg); }
+  return null;
+}
+async function saveMergeProof(env,key,sn) {
+  if(!key || sn.ok===false)return;
+  try { await rlWithTimeout(resourceDb(env).prepare('INSERT INTO rate_counter(k,n,last,exp) VALUES(?,?,?,?) ON CONFLICT(k) DO UPDATE SET n=excluded.n,last=excluded.last,exp=excluded.exp').bind(key,sn.kind==='mp4'?2:1,Date.now(),Date.now()+300000).run(),RL_TIMEOUT_MS); }
+  catch { throw new ResourceError(503,RL_BUSY.msg); }
+}
+function parseMergeRange(value) {
+  const m=/^bytes (\d+)-(\d+)\/(\d+)$/.exec(value||'');
+  if(!m)throw new Error('成品文件头范围不一致');
+  const [start,end,total]=m.slice(1).map(Number);
+  if(![start,end,total].every(Number.isSafeInteger)||start>end||end>=total)throw new Error('成品文件头范围不一致');
+  return {start,end,total};
+}
+async function mergePrefixProof(request,env,id,resp,total,fileUrl,baseHeaders) {
+  const key=await mergeProofKey(env,id,resp,total), cached=await readMergeProof(env,key);
+  if(cached)return cached;
+  if(key && mergeProofPending.has(key))return mergeProofPending.get(key);
+  const work=(async()=>{
+    const prefix=await mergeFileFetch(request,env,fileUrl,{headers:{...baseHeaders,Range:'bytes=0-524287'},signal:request.signal});
+    let probe;
+    try {
+      if(!prefix.ok||!prefix.body||/json|html/i.test(prefix.headers.get('Content-Type')||''))throw new Error('成品校验失败');
+      const part=prefix.status===206?parseMergeRange(prefix.headers.get('Content-Range')):null,needed=Math.min(524288,total);
+      if(prefix.status!==200&&prefix.status!==206)throw new Error('成品校验失败');
+      if(part&&(part.start!==0||part.end+1<needed))throw new Error('成品文件头不完整');
+      for(const k of ['ETag','Last-Modified']){const v=resp.headers.get(k);if(v&&prefix.headers.get(k)!==v)throw new Error('成品文件已变化');}
+      const prefixTotal=part?part.total:Number(prefix.headers.get('Content-Length'));
+      if(prefixTotal&&prefixTotal!==total)throw new Error('成品文件长度已变化');
+      probe=await peekStream(prefix.body,524288);
+      if(probe.head.length<needed)throw new Error('成品文件头不完整');
+      const sn=sniffMergedHead(probe.head);await saveMergeProof(env,key,sn);return sn;
+    } finally {try{await (probe?probe.stream:prefix.body)?.cancel();}catch{}}
+  })();
+  // Global stream leases bound this map as well. No unbounded id cache.
+  if(key)mergeProofPending.set(key,work);
+  try{return await work;}finally{if(key)mergeProofPending.delete(key);}
+}
+const mergeStatusCache=new Map(),mergeStatusPending=new Map();
+export function _resetMergeReadCaches(){mergeStatusCache.clear();mergeStatusPending.clear();mergeProofPending.clear();}
+async function handleYt1080Status(request,env) {
+  const id=new URL(request.url).searchParams.get('id')||'',bad=badJobId(id);if(bad)return bad;
+  if(request.method!=='GET')return json({ok:false,error:'方法不支持'},405);
+  if(!mergeToken(env))return json({ok:false,error:'未配置合并服务口令'},500);
+  try {
+    await resourceRate(request,env,'status');
+    const key=JSON.stringify([mergeBase(env),id]),cached=mergeStatusCache.get(key);
+    if(cached&&cached.exp>Date.now())return new Response(cached.text,{status:cached.status,headers:cached.headers});
+    if(mergeStatusPending.has(key))return (await mergeStatusPending.get(key)).clone();
+    const work=(async()=>{
+      let lease,deadline;
+      try {
+        lease=await resourceLease(request,env,'merge-status',4,12,5000);
+        deadline=resourceDeadline(request,5000);
+        const r=await handleYt1080StatusUnchecked(new Request(request,{signal:deadline.signal}),env);
+        const text=await r.text(),headers=Object.fromEntries(r.headers);
+        if(r.status===200||r.status===404){if(mergeStatusCache.size>=128)mergeStatusCache.delete(mergeStatusCache.keys().next().value);mergeStatusCache.set(key,{text,headers,status:r.status,exp:Date.now()+2000});}
+        return new Response(text,{status:r.status,headers});
+      } finally {deadline?.close();if(lease)await lease.release();}
+    })();
+    // Publish the flight before admission's first await can let peers race it.
+    mergeStatusPending.set(key,work);
+    try{return (await work).clone();}finally{mergeStatusPending.delete(key);}
+  } catch(e){return resourceResponse(e);}
+}
+async function handleYt1080File(request,env) {
+  const id=new URL(request.url).searchParams.get('id')||'',bad=badJobId(id);if(bad)return bad;
+  if(request.method!=='GET')return json({ok:false,error:'方法不支持'},405);
+  // Reject malformed ranges before spending quotas or allocating any lease.
+  const range=request.headers.get('Range');
+  if(range){const m=/^bytes=(\d+)-(\d*)$/.exec(range);if(!m||!Number.isSafeInteger(+m[1])||(m[2]&&(!Number.isSafeInteger(+m[2])||+m[2]<+m[1])))return json({ok:false,error:'下载范围无效'},400);}
+  if(!mergeToken(env))return json({ok:false,error:'未配置合并服务口令'},500);
+  let lease,deadline,held=false;
+  try{
+    await resourceRate(request,env,'file',id);
+    lease=await resourceLease(request,env,'merge-file',MERGE_READ_POLICY.streamsPerIp,MERGE_READ_POLICY.streamsGlobal,MERGE_READ_POLICY.streamMs);
+    deadline=resourceDeadline(request,MERGE_READ_POLICY.streamMs);
+    const resp=await handleYt1080FileUnchecked(new Request(request,{signal:deadline.signal}),env);
+    if(!resp.ok)return resp;
+    const result=await holdResourceResponse(resp,lease,deadline);held=true;return result;
+  }catch(e){return resourceResponse(e);}finally{if(!held){deadline?.close();if(lease)await lease.release();}}
+}
+
 // 合并任务 id 只允许 6–64 位字母数字 _ -：挡掉 '.'、'..'、%2e、斜杠等，非法 id 不转发给 EC2
 export const MERGE_JOB_ID_RE = /^[A-Za-z0-9_-]{6,64}$/;
 function badJobId(id) {
@@ -2548,7 +2807,7 @@ function badJobId(id) {
   if (!MERGE_JOB_ID_RE.test(id)) return json({ ok: false, code: 'BAD_JOB_ID', error: '任务编号无效' }, 400);
   return null;
 }
-async function handleYt1080Status(request, env) {
+async function handleYt1080StatusUnchecked(request, env) {
   const id = new URL(request.url).searchParams.get('id') || '';
   const bad = badJobId(id);
   if (bad) return bad;
@@ -2556,10 +2815,13 @@ async function handleYt1080Status(request, env) {
   if (!token) return json({ ok: false, error: '未配置合并服务口令' }, 500);
   try {
     const resp = await fetch(mergeBase(env) + '/yt1080-jobs/' + encodeURIComponent(id), {
+      signal: request.signal,
       headers: { 'X-Merge-Token': token, 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1', 'Accept': 'application/json' },
     });
     if (resp.ok) {
-      const text = await resp.text();
+      const body = await readBodyCapped(resp, 16 * 1024);
+      if(body.over)return json({ok:false,error:'合并服务响应过大'},502);
+      const text = body.text;
       let s = null;
       try { s = JSON.parse(text); } catch { /* 交给 mergePassthrough 处理非 JSON */ }
       if (s && s.status === 'done') {
@@ -2573,7 +2835,7 @@ async function handleYt1080Status(request, env) {
     return mergeConnectError(e);
   }
 }
-async function handleYt1080File(request, env) {
+async function handleYt1080FileUnchecked(request, env) {
   const id = new URL(request.url).searchParams.get('id') || '';
   const bad = badJobId(id);
   if (bad) return bad;
@@ -2591,54 +2853,33 @@ async function handleYt1080File(request, env) {
     if (range) upHeaders.Range = range;
     const ifRange = request.headers.get('If-Range');
     if (ifRange && ifRange.length <= 512) upHeaders['If-Range'] = ifRange;
-    const resp = await fetch(fileUrl, {headers:upHeaders,signal:request.signal});
+    const resp = await mergeFileFetch(request, env, fileUrl, {headers:upHeaders,signal:request.signal});
     if (!resp.ok) return mergePassthrough(resp);
     const upType = resp.headers.get('content-type') || '';
     // 上游 200 却是 JSON/HTML（错误页）：原样下发，前端 __hkSave 靠 blob.type 识别成错误。
     if (/json|html/i.test(upType) || !resp.body) return mergePassthrough(resp);
     // 不靠后缀名：看文件开头。webm 或 AV1/Opus 的 MP4 → 中文错误；avc1 或判断不了 → 放行。
     const probeLimit = 512 * 1024;
-    let head, stream = resp.body;
+    let head, stream = resp.body, sn;
     try {
       if (resp.status === 206) {
-        const parseRange = (value) => {
-          const m = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(value || '');
-          if (!m) throw new Error('成品文件头范围不一致');
-          const [start, end, total] = m.slice(1).map(Number);
-          if (![start,end,total].every(Number.isSafeInteger) || start > end || end >= total) throw new Error('成品文件头范围不一致');
-          return {start,end,total};
-        };
-        const part = parseRange(resp.headers.get('Content-Range'));
+        const part = parseMergeRange(resp.headers.get('Content-Range'));
         if (part.start !== offset) throw new Error('成品下载范围不一致');
         const needed = Math.min(probeLimit, part.total);
         if (part.start === 0) ({head,stream} = await peekStream(resp.body,probeLimit));
         if (part.start > 0 || head.length < needed) {
-          // 非零续传和短起始 Range 都可能看不到 moov/音轨，不能把截断的文件头当作通过。
-          const prefix = await fetch(fileUrl,{headers:{...baseHeaders,Range:'bytes=0-524287'},signal:request.signal});
-          let probe;
-          try {
-            if (!prefix.ok || !prefix.body || /json|html/i.test(prefix.headers.get('Content-Type') || '')) throw new Error('成品校验失败');
-            probe = await peekStream(prefix.body,probeLimit);
-            const prefixPart = prefix.status === 206 ? parseRange(prefix.headers.get('Content-Range')) : null;
-            if (prefix.status !== 200 && prefix.status !== 206) throw new Error('成品校验失败');
-            if (prefixPart && (prefixPart.start !== 0 || prefixPart.end + 1 < needed)) throw new Error('成品文件头不完整');
-            for (const key of ['ETag','Last-Modified']) {
-              const expected = resp.headers.get(key);
-              if (expected && prefix.headers.get(key) !== expected) throw new Error('成品文件已变化');
-            }
-            const prefixTotal = prefixPart ? prefixPart.total : Number(prefix.headers.get('Content-Length'));
-            if (prefixTotal && prefixTotal !== part.total) throw new Error('成品文件长度已变化');
-            if (probe.head.length < needed) throw new Error('成品文件头不完整');
-            head = probe.head;
-          } finally {
-            try { await (probe ? probe.stream : prefix.body)?.cancel(); } catch {}
-          }
+          sn = await mergePrefixProof(request,env,id,resp,part.total,fileUrl,baseHeaders);
+        } else {
+          sn = sniffMergedHead(head);
+          await saveMergeProof(env,await mergeProofKey(env,id,resp,part.total),sn);
         }
       } else {
         ({head,stream} = await peekStream(resp.body,probeLimit));
+        sn = sniffMergedHead(head);
+        const total=Number(resp.headers.get('Content-Length'));
+        if(Number.isSafeInteger(total)&&total>0)await saveMergeProof(env,await mergeProofKey(env,id,resp,total),sn);
       }
-    } catch (e) { try { await stream.cancel(); } catch {} throw e; }
-    const sn = sniffMergedHead(head);
+    } catch (e) { try{await stream.cancel();}catch{} throw e; }
     if (sn.ok === false) {
       try { await stream.cancel(); } catch { /* ignore */ }
       return json(notIphone(sn.fmt), 415);
@@ -2656,7 +2897,7 @@ async function handleYt1080File(request, env) {
     headers.set('Cache-Control', 'no-store');
     return new Response(withKnownLength(stream, resp.headers.get('content-length'), resp.headers.get('content-encoding')), { status: resp.status === 206 ? 206 : 200, headers });
   } catch (e) {
-    return mergeConnectError(e);
+    return e instanceof ResourceError ? resourceResponse(e) : mergeConnectError(e);
   }
 }
 

@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { webcrypto } from 'node:crypto';
 import worker, {
+  _resetMergeReadCaches,
   classifyPlayability,
   normalizeCookieHeader,
   ytSapiSidAuthorization,
@@ -994,6 +995,7 @@ function mergeEnvFetch(fileBody, fileHeaders, statusBody) {
 }
 const ENV = { TURNSTILE_DISABLED: '1', YT_MERGE_TOKEN: 'local-test-token' };
 async function withFetch(f, fn) {
+  _resetMergeReadCaches();
   const orig = globalThis.fetch; globalThis.fetch = f;
   try { return await fn(); } finally { globalThis.fetch = orig; }
 }
