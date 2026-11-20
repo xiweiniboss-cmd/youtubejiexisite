@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>YouTube 无水印解析下载</title>
 <meta name="description" content="粘贴 YouTube 分享链接，解析可下载的画质，支持手机里合成带声音的 MP4。">
-<meta name="theme-color" content="#141415">
+<meta name="theme-color" content="#f4eedc">
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23141415'/%3E%3Cpath d='M14 24V14h10M40 14h10v10M50 40v10H40M24 50H14V40' fill='none' stroke='%23FF0033' stroke-width='4'/%3E%3Cpath d='M27 22v20l16-10z' fill='%23FF0033'/%3E%3C/svg%3E">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="YouTube 无水印解析下载">
@@ -976,7 +976,7 @@ var deviceId = (function(){
       var current=function(){ return epoch === tsWidgetEpoch; };
       var ready = function(){ if(current()) tsSetState('ready'); };
       tsParseWidgetId = turnstile.render('#tsParseWidget', {
-        sitekey: siteKey, theme: 'dark', language: 'zh-cn',
+        sitekey: siteKey, theme: 'light', language: 'zh-cn',
         size: compact ? 'compact' : 'flexible',
         // 失败留在可恢复的暂停态，避免厂商后台自动重试十几分钟后突然恢复旧操作。
         retry: 'never', 'refresh-expired': 'manual', 'refresh-timeout': 'manual',
@@ -1087,7 +1087,7 @@ var deviceId = (function(){
             var fbWrapEl = document.getElementById('fbWrap');
             if (el && fbWrapEl && fbWrapEl.classList.contains('show') && getComputedStyle(fbWrapEl).display !== 'none') {
               el.style.display = 'block';
-              tsWidgetId = turnstile.render(el, { sitekey: siteKey, theme: 'dark', language: 'zh-cn' });
+              tsWidgetId = turnstile.render(el, { sitekey: siteKey, theme: 'light', language: 'zh-cn' });
             } else {
               showFbError('验证组件加载失败，请关闭重试。');
             }
