@@ -1,28 +1,4 @@
-/* ==========================================================================
-   解析站界面
-   --------------------------------------------------------------------------
-   抖音、快手、小红书、B站、微博、YouTube、TikTok 共用这一份。
-   换站时只改文案里的产品名，和下面三行颜色。其余间距、字号、圆角、
-   组件不要另起一套。
-
-   抖音   --jx-accent #d3123a   --jx-accent-hover #e21842   --jx-accent-text #ff9aab
-   快手   #c2410c               #ea580c                     #fdba74
-   小红书 #be123c               #e11d48                     #fda4af
-   B站    #0369a1               #0284c7                     #7dd3fc
-   微博   #be123c               #e11d48                     #fda4af
-   YouTube #b91c1c              #dc2626                     #fca5a5
-   TikTok 与抖音同一套红，不要红青渐变
-
-   白字叠在 --jx-accent 上需要至少 4.5:1。YouTube 这组已核过：
-   白 / #b91c1c = 6.47，白 / #dc2626 = 4.83，#fca5a5 / #141415 = 9.70。
-
-   签名：四角裁切线。只用在标志和成片画框上，表示这一帧没有水印。
-   竖幅胶片是抖音那一页的画面。这一页换成 16:9 横屏，齿孔改到上下，裁切线留着。
-
-   间距、字号阶梯和中性色的起点来自 unslop（Damir Sokolovsky，@heydamir），
-   CC BY 4.0。https://heydamir.design/unslop
-   ========================================================================== */
-
+/* 米黄纸面与陶土色按钮。原排版参考 unslop（Damir Sokolovsky），CC BY 4.0：https://heydamir.design/unslop */
 @font-face {
   font-family: "JX Serif";
   font-style: normal;
@@ -50,28 +26,28 @@
 }
 
 :root {
-  /* 石墨中性色。表面不带色相，颜色只出现在强调色和成片画框里。 */
-  --jx-bg: #141415;
-  --jx-bg-deep: #0f0f10;
+  /* 纸面、墨色与细边框。 */
+  --jx-bg: #f4eedc;
+  --jx-bg-deep: #e9dfc6;
   --jx-film: #101012;
-  --jx-surface: #19191b;
-  --jx-raised: #232325;
-  --jx-raised-hover: #2a2a2d;
-  --jx-text: #ededed;
-  --jx-secondary: #a1a1a6;
-  --jx-muted: #8d8d93;
-  --jx-hairline: rgba(237, 237, 237, 0.08);
-  --jx-hairline-strong: rgba(237, 237, 237, 0.12);
+  --jx-surface: #fbf7eb;
+  --jx-raised: #f1e9d5;
+  --jx-raised-hover: #e8dcc1;
+  --jx-text: #2a2118;
+  --jx-secondary: #564736;
+  --jx-muted: #705f49;
+  --jx-hairline: #dcd1b8;
+  --jx-hairline-strong: #c5b599;
 
   /* 每站只改这三行。 */
-  --jx-accent: #b91c1c;
-  --jx-accent-hover: #dc2626;
-  --jx-accent-text: #fca5a5;
+  --jx-accent: #9c4c26;
+  --jx-accent-hover: #823c1d;
+  --jx-accent-text: #88421f;
   --jx-on-accent: #ffffff;
 
-  --jx-positive: #4cc38a;
-  --jx-negative: #ee5d62;
-  --jx-warning: #e6b35a;
+  --jx-positive: #2e6e4d;
+  --jx-negative: #ab3027;
+  --jx-warning: #835011;
 
   --jx-font: "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei", "WenQuanYi Micro Hei", sans-serif;
   --jx-serif: "JX Serif", "Songti SC", "Noto Serif SC", "STSong", serif;
@@ -117,10 +93,10 @@
   --jx-fast: 160ms;
   --jx-enter: 420ms;
 
-  --jx-shadow-float: 0 8px 24px rgba(0, 0, 0, 0.28);
+  --jx-shadow-float: 0 2px 4px rgb(72 52 24 / 5%), 0 10px 24px -8px rgb(72 52 24 / 12%);
   --jx-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.16);
 
-  color-scheme: dark;
+  color-scheme: light;
 }
 
 *,
@@ -417,7 +393,7 @@ button {
   display: flex;
   flex-direction: column;
   width: 100%;
-  background: #2a2a2e;
+  background: #cdbf9e;
   border: 1px solid var(--jx-hairline-strong);
   border-radius: var(--jx-radius-card);
   box-shadow: var(--jx-highlight);
@@ -447,7 +423,7 @@ button {
   justify-content: center;
   aspect-ratio: 16 / 9;
   border-radius: var(--jx-radius-control);
-  background: linear-gradient(180deg, #232325 0%, #1c1c1e 100%);
+  background: linear-gradient(180deg, #f4ecd7 0%, #e7d9bb 100%);
   box-shadow: inset 0 0 0 1px var(--jx-hairline);
   color: var(--jx-secondary);
 }
@@ -615,7 +591,7 @@ button {
 .dlprog .track {
   height: 4px;
   border-radius: 2px;
-  background: rgba(237, 237, 237, 0.12);
+  background: var(--jx-hairline-strong);
   overflow: hidden;
 }
 
@@ -1378,7 +1354,7 @@ footer a:hover { color: var(--jx-secondary); }
   flex: 1;
   height: 4px;
   border-radius: 2px;
-  background: rgba(237, 237, 237, 0.12);
+  background: var(--jx-hairline-strong);
   overflow: hidden;
 }
 
@@ -1565,3 +1541,18 @@ footer a:hover { color: var(--jx-secondary); }
 }
 
 .jx-input-label { display: block; margin-bottom: 8px; color: var(--jx-secondary); font-size: 14px; font-weight: 600; }
+
+body {
+  background-image: radial-gradient(ellipse at 12% 0%, rgb(255 250 236 / 48%), transparent 58%),
+    radial-gradient(ellipse at 94% 100%, rgb(181 145 81 / 12%), transparent 65%);
+}
+
+.card, .jxh { box-shadow: 0 2px 4px rgb(72 52 24 / 5%), 0 10px 24px -8px rgb(72 52 24 / 12%); }
+.btn:not(.ghost):not(:disabled), .btn-ok { background-image: linear-gradient(180deg, #a5502a, #88401f); }
+.btn:not(.ghost):hover:not(:disabled), .btn-ok:hover { background: #843d1f; }
+.btn.ghost, .jx-field .btn.ghost { background: linear-gradient(180deg, #fdfaf0, #f1e7cf); }
+.btn.ghost:hover, .jx-field .btn.ghost:hover { background: var(--jx-raised-hover); }
+.btn:focus-visible { outline-color: var(--jx-accent); }
+
+.jx-copy h1 { font-style: oblique 8deg; }
+.jx-brand-sub { font-family: "Songti SC", "STSong", "Noto Serif SC", "Noto Serif CJK SC", Georgia, serif; font-style: italic; letter-spacing: .03em; }
