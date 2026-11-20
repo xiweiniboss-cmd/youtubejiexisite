@@ -1534,3 +1534,34 @@ footer a:hover { color: var(--jx-secondary); }
   from { opacity: 0; transform: translateX(-50%) translateY(8px); }
   to { opacity: 1; transform: translateX(-50%); }
 }
+
+/* 工作区：平台色用于输入焦点和操作区。 */
+.jx-top {
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--jx-hairline-strong);
+}
+.jx-quota {
+  padding: 5px 12px;
+  border: 1px solid var(--jx-hairline-strong);
+  border-radius: 99px;
+  background: var(--jx-surface);
+}
+.jx-hero { margin-top: clamp(24px, 5vw, 56px); }
+.jx-lead { gap: clamp(18px, 3vw, 32px); }
+.jx-work {
+  padding: clamp(16px, 2.5vw, 30px);
+  border-top: 3px solid var(--jx-accent);
+  box-shadow: 0 12px 36px rgb(0 0 0 / 12%);
+}
+.jx-work .jx-field { background: var(--jx-bg); }
+.jx-work .btn { min-height: 44px; }
+.jx-copy h1 { text-wrap: balance; }
+.jx-count { margin-top: 8px; }
+.jx-sub { line-height: 1.6; }
+@media (max-width: 600px) {
+  .jx-wrap { width: calc(100% - 32px); padding-top: 12px; }
+  .jx-hero { gap: 20px; }
+  .jx-work { width: 100%; }
+}
+
+.jx-input-label { display: block; margin-bottom: 8px; color: var(--jx-secondary); font-size: 14px; font-weight: 600; }
