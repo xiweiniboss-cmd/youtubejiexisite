@@ -106,7 +106,7 @@ function jxParseHeaders(h) {
         <p class="jx-count">本站已解析 <b id="parseCount">-</b> 次</p>
       </div>
 
-      <div class="card">
+      <div class="card jx-work">
         <!-- 服务器状态（合并服务器）：数据来自 /api/server-status（Worker 代问 EC2，口令不进前端）与 /api/ping。默认折叠成一行 -->
         <div class="srv-card" id="srvCard" title="合并服务器状态">
           <div class="srv-line" id="srvLine">
@@ -128,8 +128,9 @@ function jxParseHeaders(h) {
           </div>
         </div>
 
+        <label class="jx-input-label" for="urlInput">分享文字或链接</label>
         <div class="jx-field">
-          <textarea id="urlInput" aria-label="YouTube 分享链接" placeholder="粘贴 YouTube 分享链接，或整段分享文字"></textarea>
+          <textarea id="urlInput" placeholder="粘贴 YouTube 分享链接，或整段分享文字"></textarea>
           <div class="jx-field-tools">
             <button type="button" class="btn ghost" id="pasteBtn">粘贴</button>
           </div>
