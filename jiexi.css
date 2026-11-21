@@ -1556,3 +1556,18 @@ body {
 
 .jx-copy h1 { font-style: oblique 8deg; }
 .jx-brand-sub { font-family: "Songti SC", "STSong", "Noto Serif SC", "Noto Serif CJK SC", Georgia, serif; font-style: italic; letter-spacing: .03em; }
+
+/* 更轻的纸面层次，让输入区成为页面的视觉焦点。 */
+body { background-color: #f5f0e3; background-image: radial-gradient(ellipse at 50% -20%, #fffdf5, transparent 65%); }
+.jx-top { border-bottom-color: #ded4c1; }
+.jx-mark { color: #8d4d32; }
+.jx-copy h1 { font-style: normal; font-weight: 600; letter-spacing: -.035em; line-height: 1.16; }
+.jx-sub { max-width: 32em; line-height: 1.8; }
+.jx-work { border: 1px solid #ddd1bc; border-top: 1px solid #ddd1bc; border-radius: 20px; background: #fffcf5; box-shadow: 0 18px 45px -24px rgba(76, 51, 27, .3), 0 2px 8px rgba(76, 51, 27, .04); }
+.jx-work .jx-field { background: #f8f4ea; border-color: #e4dac9; border-radius: 12px; padding: 16px; }
+.jx-work .jx-input-label { color: #655443; letter-spacing: .03em; }
+.jx-work .btn:not(.ghost):not(:disabled) { background: #68422e; border-radius: 10px; box-shadow: none; font-weight: 600; }
+.jx-work .btn:not(.ghost):hover:not(:disabled) { background: #4e3021; }
+.jx-strip { background: #ded1b8; }
+.jx-still { background: linear-gradient(145deg, #f8f1df, #e6d7b9); }
+.jx-quota { background: transparent; }
