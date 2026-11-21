@@ -1,0 +1,9 @@
+本目录中的七个 JavaScript 模块与 @ffmpeg/ffmpeg 0.12.15 发布包 dist/esm 对应文件逐字节一致。
+版权声明和 MIT 许可全文见同目录 LICENSE.txt。
+上游：https://github.com/ffmpegwasm/ffmpeg.wasm/tree/v12.15
+发布包：https://www.npmjs.com/package/@ffmpeg/ffmpeg/v/0.12.15
+
+页面运行时另从 CDN 加载 @ffmpeg/core 0.12.10 的 JavaScript 和 WebAssembly。
+该 npm 包标注 GPL-2.0-or-later，不适用上述 JavaScript 包装层的 MIT 许可。
+发布包：https://www.npmjs.com/package/@ffmpeg/core/v/0.12.10
+许可：https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
