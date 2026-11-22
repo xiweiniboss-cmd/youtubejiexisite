@@ -111,7 +111,7 @@ function jxParseHeaders(h) {
         <div class="srv-card" id="srvCard" title="合并服务器状态">
           <div class="srv-line" id="srvLine">
             <span class="srv-dot" id="srvDot"></span>
-            <span class="srv-state" id="srvOnline">-</span>
+            <span class="srv-state" id="srvOnline" role="status">正在检测…</span>
             <span class="srv-lat srv-me">你→本站 <b id="srvPing">-</b></span>
             <span class="srv-lat">本站→服务器 <b id="srvLat">-</b></span>
             <button type="button" class="srv-toggle" id="srvToggle" aria-expanded="false" aria-controls="srvDetail">详情 ▾</button>
@@ -125,6 +125,7 @@ function jxParseHeaders(h) {
             </div>
             <div class="srv-note" id="srvNote" style="display:none"></div>
             <div class="srv-jobs" id="srvJobs">合并任务 运行 <b id="srvRun">-</b> / 排队 <b id="srvQueue">-</b></div>
+            <div class="srv-note" id="srvChecked" style="display:none"></div>
           </div>
         </div>
 
@@ -1581,7 +1582,7 @@ refreshQuota();
 </script>
 
 <script>
-/* 服务器状态卡片：默认折叠；状态每 5 秒刷新一次（延迟测量 30 秒一次），页面在后台时暂停；任何失败都静默显示 "-" */
+/* 服务器状态卡片：默认折叠；状态每 5 秒刷新一次（延迟测量 30 秒一次），页面在后台时暂停 */
 (function(){
   var $ = function(id){ return document.getElementById(id); };
   if (!$('srvCard')) return;
@@ -1640,17 +1641,38 @@ refreshQuota();
   function note(text){
     show('srvBars', !text); show('srvJobs', false); show('srvNote', !!text); setText('srvNote', text || '');
   }
+  function checkedAt(value){
+    var time = isNum(value) ? new Date(value) : null;
+    var valid = time && isNum(time.getTime());
+    show('srvChecked', valid);
+    setText('srvChecked', valid ? '最近检测（本地时间） ' + time.toLocaleTimeString('zh-CN', { hour12: false }) : '');
+  }
+  function statusUnavailable(){
+    setState('na', '状态未知'); ms('srvLat', null); clearStats();
+    note('暂时无法获取服务器状态'); checkedAt(null);
+  }
   function render(s){
-    if (!s || !s.online) {
-      setState('off', '离线'); ms('srvLat', null); clearStats(); note('');
+    if (!s || s.ok !== true || typeof s.online !== 'boolean') { statusUnavailable(); return; }
+    checkedAt(s.checkedAt);
+    if (!s.online) {
+      if (s.error === '未配置合并服务') setState('na', '合并服务未配置');
+      else setState('off', '离线');
+      ms('srvLat', null); clearStats(); note(s.error || '服务器暂时不可达');
       return;
     }
     ms('srvLat', s.latencyMs);
     if (s.authFailed) { setState('warn', '在线 · 状态鉴权失败'); clearStats(); note('服务器在线，但状态接口口令不匹配'); return; }
     if (s.degraded) { setState('warn', '在线 · 异常'); clearStats(); note(s.error || '服务器在线，但状态接口出错'); return; }
     if (s.statusSupported === false) { setState('na', '在线 · 无详情'); clearStats(); note('服务器暂未提供详细状态'); return; }
-    setState('on', '在线'); note('');
     var m = s.mem || {}, c = s.cpu || {}, d = s.disk || {}, j = s.jobs || {};
+    var highLoad = (isNum(c.percent) && c.percent >= 85) ||
+                   (isNum(m.percent) && m.percent >= 85) ||
+                   (isNum(d.percent) && d.percent >= 90);
+    if (highLoad) setState('warn', '在线 · 高负载');
+    else if (isNum(j.queued) && j.queued > 0) setState('warn', '在线 · 排队中');
+    else if ([c.percent, m.percent, d.percent, j.queued].every(isNum)) setState('on', '在线 · 正常');
+    else setState('na', '在线 · 数据不全');
+    note('');
     bar('srvMemBar', m.percent); bar('srvCpuBar', c.percent); bar('srvDiskBar', d.percent);
     $('srvMem').innerHTML = isNum(m.percent) ? '<b>' + pctText(m.percent) + '</b>' + (isNum(m.used) && isNum(m.total) ? ' · ' + gb(m.used) + '/' + gb(m.total) + ' GB' : '') : '-';
     $('srvCpu').innerHTML = isNum(c.percent) ? '<b>' + pctText(c.percent) + '</b>' + (isNum(c.load1) && isNum(c.cores) ? ' · ' + c.load1.toFixed(2) + '/' + c.cores + '核' : '') : '-';
@@ -1677,7 +1699,7 @@ refreshQuota();
       lastPingAt = Date.now();
       p1 = measurePing().then(function(v){ ms('srvPing', v); }, function(){ ms('srvPing', null); });
     }
-    var p2 = getJson('/api/server-status').then(render, function(){ setState('', '-'); ms('srvLat', null); clearStats(); note(''); });
+    var p2 = getJson('/api/server-status').then(render, statusUnavailable);
     Promise.all([p1, p2]).then(function(){ busy = false; fit(); }, function(){ busy = false; fit(); });
   }
   function start(){ if (!timer) timer = setInterval(refresh, 5000); }
@@ -1688,13 +1710,13 @@ refreshQuota();
   refresh(); start();
 })();
 
-// 合并队列徽章：初始「正在获取…」，每 5 秒拉一次 /api/queue，页签隐藏时暂停。失败显示「服务器状态未知」。
+// 合并队列徽章：初始「正在获取…」，每 5 秒拉一次 /api/queue，页签隐藏时暂停。失败显示「队列状态未知」。
 (function(){
   var el = document.getElementById('queueBadge');
   if (!el) return;
   var timer = null, busy = false;
   function unknown(){
-    el.textContent = '服务器状态未知';
+    el.textContent = '队列状态未知';
     el.classList.add('is-unknown');
   }
   function render(j){

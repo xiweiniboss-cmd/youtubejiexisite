@@ -293,7 +293,7 @@ test('index.html: card is collapsed by default; online / auth / 5xx / 404 / offl
   }
   const ONLINE = { ok: true, online: true, statusSupported: true, latencyMs: 42, mem: { total: 4 * GB, used: GB, percent: 25 }, cpu: { load1: 0.5, cores: 2, percent: 25 }, disk: { total: 40 * GB, used: 10 * GB, percent: 25 }, jobs: { running: 1, queued: 0 } };
   let e = await run(ONLINE);
-  assert.equal(e.srvOnline.textContent, '在线');
+  assert.equal(e.srvOnline.textContent, '在线 · 正常');
   assert.equal(e.srvDot.className, 'srv-dot on');
   assert.equal(e.srvLat.textContent, '42ms');
   assert.equal(e.srvPing.textContent, '30ms'); // 10/100/30 的中位数
@@ -315,6 +315,30 @@ test('index.html: card is collapsed by default; online / auth / 5xx / 404 / offl
   assert.equal(e.srvPing.textContent, '65ms');
   e = await run(ONLINE, 3);
   assert.equal(e.srvPing.textContent, '-');
+
+  e = await run({ ...ONLINE, jobs: { running: 3, queued: 2 }, checkedAt: Date.now() });
+  assert.equal(e.srvOnline.textContent, '在线 · 排队中');
+  assert.equal(e.srvQueue.textContent, '2');
+  assert.match(e.srvChecked.textContent, /最近检测（本地时间）/);
+
+  for (const [metric, cutoff] of [['cpu', 85], ['mem', 85], ['disk', 90]]) {
+    e = await run({ ...ONLINE, [metric]: { percent: cutoff - 1 }, jobs: { queued: 0 } });
+    assert.equal(e.srvOnline.textContent, '在线 · 正常');
+    e = await run({ ...ONLINE, [metric]: { percent: cutoff }, jobs: { queued: 2 } });
+    assert.equal(e.srvOnline.textContent, '在线 · 高负载');
+    assert.equal(e.srvDot.className, 'srv-dot warn');
+    assert.equal(e.srvBars.style.display, '');
+  }
+
+  e = await run({ ...ONLINE, disk: { percent: null } });
+  assert.equal(e.srvOnline.textContent, '在线 · 数据不全');
+
+  e = await run({ ok: false });
+  assert.equal(e.srvOnline.textContent, '状态未知');
+  assert.equal(e.srvChecked.style.display, 'none');
+
+  e = await run({ ok: true, online: false, error: '未配置合并服务' });
+  assert.equal(e.srvOnline.textContent, '合并服务未配置');
 
   e = await run({ ok: true, online: true, latencyMs: 41, authFailed: true, error: '状态鉴权失败（HTTP 403）' });
   assert.equal(e.srvOnline.textContent, '在线 · 状态鉴权失败');
@@ -340,6 +364,7 @@ test('index.html: card is collapsed by default; online / auth / 5xx / 404 / offl
   assert.equal(e.srvLat.textContent, '-');
   assert.equal(e.srvMem.textContent, '-');
   assert.equal(e.srvLine.className, 'srv-line');
+  assert.equal(e.srvNote.textContent, '连接超时');
 });
 
 test('sanitizeServerStatus: top-level running/queued when jobs is missing', () => {
@@ -431,7 +456,7 @@ test('index.html shows the queue badge and treats only QUEUE_FULL as 排队已�
   assert.match(html, /id="queueBadge"/);
   assert.match(html, /当前处理中 /);
   assert.match(html, />正在获取…</);
-  assert.match(html, /服务器状态未知/);
+  assert.match(html, /队列状态未知/);
   assert.match(html, /\/api\/queue/);
   assert.match(html, /j\.code === 'QUEUE_FULL'/);
   assert.doesNotMatch(html, /j\.code === 'QUEUE_FULL' \|\| res\.status === 503/);
