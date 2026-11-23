@@ -108,24 +108,37 @@ function jxParseHeaders(h) {
 
       <div class="card jx-work">
         <!-- 服务器状态（合并服务器）：数据来自 /api/server-status（Worker 代问 EC2，口令不进前端）与 /api/ping。默认折叠成一行 -->
+        <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+          <symbol id="srvIcUser" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c1.2-3.6 3.8-5.5 7-5.5s5.8 1.9 7 5.5"/></symbol>
+          <symbol id="srvIcSite" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.4 2.6 3.6 5.4 3.6 8.5s-1.2 5.9-3.6 8.5c-2.4-2.6-3.6-5.4-3.6-8.5s1.2-5.9 3.6-8.5z"/></symbol>
+          <symbol id="srvIcServer" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="7" rx="1.5"/><rect x="4" y="13" width="16" height="7" rx="1.5"/><path d="M8 7.5h.01M8 16.5h.01M12 7.5h4M12 16.5h4"/></symbol>
+        </svg>
         <div class="srv-card" id="srvCard" title="合并服务器状态">
           <div class="srv-line" id="srvLine">
             <span class="srv-dot" id="srvDot"></span>
             <span class="srv-state" id="srvOnline" role="status">正在检测…</span>
-            <span class="srv-lat srv-me">你→本站 <b id="srvPing">-</b></span>
-            <span class="srv-lat">本站→服务器 <b id="srvLat">-</b></span>
-            <button type="button" class="srv-toggle" id="srvToggle" aria-expanded="false" aria-controls="srvDetail">详情 ▾</button>
+            <span class="srv-lat srv-me" title="你→本站"><span class="srv-hop" role="img" aria-label="你到本站"><svg class="srv-mi" aria-hidden="true"><use href="#srvIcUser"/></svg><i class="srv-dash"></i><svg class="srv-mi" aria-hidden="true"><use href="#srvIcSite"/></svg></span><b id="srvPing">-</b></span>
+            <span class="srv-lat" title="本站→服务器"><span class="srv-hop" role="img" aria-label="本站到服务器"><svg class="srv-mi" aria-hidden="true"><use href="#srvIcSite"/></svg><i class="srv-dash"></i><svg class="srv-mi" aria-hidden="true"><use href="#srvIcServer"/></svg></span><b id="srvLat">-</b></span>
+            <button type="button" class="srv-toggle" id="srvToggle" aria-expanded="false" aria-controls="srvDetail">详情</button>
           </div>
           <div class="srv-detail" id="srvDetail" style="display:none">
-            <div class="srv-latd">延迟：你→本站 <b id="srvPing2">-</b> · 本站→服务器 <b id="srvLat2">-</b></div>
-            <div id="srvBars">
-              <div class="srv-row"><span class="srv-k">内存</span><span class="srv-bar"><i id="srvMemBar"></i></span><span class="srv-n" id="srvMem">-</span></div>
-              <div class="srv-row"><span class="srv-k">CPU 负载</span><span class="srv-bar"><i id="srvCpuBar"></i></span><span class="srv-n" id="srvCpu">-</span></div>
-              <div class="srv-row"><span class="srv-k">硬盘</span><span class="srv-bar"><i id="srvDiskBar"></i></span><span class="srv-n" id="srvDisk">-</span></div>
-            </div>
+            <dl class="srv-grid" id="srvBars">
+              <div class="srv-cell"><dt>内存</dt><dd><span class="srv-n" id="srvMem">-</span><span class="srv-bar"><i id="srvMemBar"></i></span></dd></div>
+              <div class="srv-cell"><dt>CPU 负载</dt><dd><span class="srv-n" id="srvCpu">-</span><span class="srv-bar"><i id="srvCpuBar"></i></span></dd></div>
+              <div class="srv-cell"><dt>硬盘</dt><dd><span class="srv-n" id="srvDisk">-</span><span class="srv-bar"><i id="srvDiskBar"></i></span></dd></div>
+            </dl>
             <div class="srv-note" id="srvNote" style="display:none"></div>
-            <div class="srv-jobs" id="srvJobs">合并任务 运行 <b id="srvRun">-</b> / 排队 <b id="srvQueue">-</b></div>
-            <div class="srv-note" id="srvChecked" style="display:none"></div>
+            <div class="srv-meta">
+              <div class="srv-route" aria-label="连接延迟">
+                <span class="srv-node"><span class="srv-badge"><svg class="srv-ic" aria-hidden="true"><use href="#srvIcUser"/></svg></span><span class="srv-cap">你</span></span>
+                <span class="srv-link" title="你→本站"><b id="srvPing2">-</b></span>
+                <span class="srv-node"><span class="srv-badge"><svg class="srv-ic" aria-hidden="true"><use href="#srvIcSite"/></svg></span><span class="srv-cap">本站</span></span>
+                <span class="srv-link" title="本站→服务器"><b id="srvLat2">-</b></span>
+                <span class="srv-node"><span class="srv-badge"><svg class="srv-ic" aria-hidden="true"><use href="#srvIcServer"/></svg></span><span class="srv-cap">服务器</span></span>
+              </div>
+              <div class="srv-jobs" id="srvJobs"><span>合并任务</span><span>运行 <b id="srvRun">-</b></span><span>排队 <b id="srvQueue">-</b></span></div>
+            </div>
+            <div class="srv-checked" id="srvChecked" style="display:none"></div>
           </div>
         </div>
 
@@ -1593,9 +1606,16 @@ refreshQuota();
   function setText(id, s){ var el = $(id); if (el) el.textContent = s; }
   function show(id, on){ var el = $(id); if (el) el.style.display = on ? '' : 'none'; }
   function gb(b){ return (b / 1073741824).toFixed(b >= 10737418240 ? 0 : 1); }
-  function bar(id, pct){ var el = $(id); if (el) el.style.width = isNum(pct) ? Math.max(0, Math.min(100, pct)) + '%' : '0'; }
+  function bar(id, pct){ var el = $(id); if (!el) return; el.style.width = isNum(pct) ? Math.max(0, Math.min(100, pct)) + '%' : '0'; var cell = el.closest ? el.closest('.srv-cell') : null; if (cell && cell.setAttribute) cell.setAttribute('data-level', !isNum(pct) ? 'na' : pct >= 85 ? 'high' : pct >= 70 ? 'mid' : 'ok'); }
   function pctText(p){ return isNum(p) ? (Math.round(p) + '%') : '-'; }
-  function ms(id, v){ var t = isNum(v) ? Math.round(v) + 'ms' : '-'; setText(id, t); setText(id + '2', t); }
+  function ms(id, v){
+    var t = isNum(v) ? Math.round(v) + 'ms' : '-';
+    var lv = !isNum(v) ? 'na' : v < 150 ? 'ok' : v < 400 ? 'mid' : 'high';
+    setText(id, t); setText(id + '2', t);
+    var a = $(id), b = $(id + '2');
+    if (a) a.setAttribute('data-level', lv);
+    if (b && b.parentNode) b.parentNode.setAttribute('data-level', lv);
+  }
   function getJson(url){
     return fetch(url, { cache: 'no-store', credentials: 'same-origin' }).then(function(r){
       if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -1675,9 +1695,9 @@ refreshQuota();
     else setState('na', '在线 · 数据不全');
     note('');
     bar('srvMemBar', m.percent); bar('srvCpuBar', c.percent); bar('srvDiskBar', d.percent);
-    $('srvMem').innerHTML = isNum(m.percent) ? '<b>' + pctText(m.percent) + '</b>' + (isNum(m.used) && isNum(m.total) ? ' · ' + gb(m.used) + '/' + gb(m.total) + ' GB' : '') : '-';
-    $('srvCpu').innerHTML = isNum(c.percent) ? '<b>' + pctText(c.percent) + '</b>' + (isNum(c.load1) && isNum(c.cores) ? ' · ' + c.load1.toFixed(2) + '/' + c.cores + '核' : '') : '-';
-    $('srvDisk').innerHTML = isNum(d.percent) ? '<b>' + pctText(d.percent) + '</b>' + (isNum(d.used) && isNum(d.total) ? ' · ' + gb(d.used) + '/' + gb(d.total) + ' GB' : '') : '-';
+    $('srvMem').innerHTML = isNum(m.percent) ? '<b>' + pctText(m.percent) + '</b>' + (isNum(m.used) && isNum(m.total) ? gb(m.used) + '/' + gb(m.total) + ' GB' : '') : '-';
+    $('srvCpu').innerHTML = isNum(c.percent) ? '<b>' + pctText(c.percent) + '</b>' + (isNum(c.load1) && isNum(c.cores) ? c.load1.toFixed(2) + '/' + c.cores + '核' : '') : '-';
+    $('srvDisk').innerHTML = isNum(d.percent) ? '<b>' + pctText(d.percent) + '</b>' + (isNum(d.used) && isNum(d.total) ? gb(d.used) + '/' + gb(d.total) + ' GB' : '') : '-';
     setText('srvRun', isNum(j.running) ? String(j.running) : '-');
     setText('srvQueue', isNum(j.queued) ? String(j.queued) : '-');
     show('srvJobs', isNum(j.running) || isNum(j.queued));
@@ -1687,8 +1707,9 @@ refreshQuota();
   if (toggle) toggle.onclick = function(){
     var open = $('srvDetail').style.display === 'none';
     show('srvDetail', open);
-    toggle.textContent = open ? '收起 ▴' : '详情 ▾';
+    toggle.textContent = open ? '收起' : '详情';
     toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    var card = $('srvCard'); if (card && card.classList) card.classList.toggle('is-open', open);
   };
   var lastPingAt = 0;
   function refresh(){
