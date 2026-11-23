@@ -1571,3 +1571,212 @@ body { background-color: #f5f0e3; background-image: radial-gradient(ellipse at 5
 .jx-strip { background: #ded1b8; }
 .jx-still { background: linear-gradient(145deg, #f8f1df, #e6d7b9); }
 .jx-quota { background: transparent; }
+
+/* ==========================================================================
+   解析预览卡重设计（2026-11-23）
+   去掉胶片齿孔；播放钮改为居中大圆，悬停放大并带光晕；
+   「16:9 / 9:16」「无水印」改为卡片内小标签；空状态一行引导。
+   追加在各站 jiexi.css 末尾，覆盖旧的 .jx-holes / .jx-strip-cap / .jx-play。
+   ========================================================================== */
+
+.jx-holes,
+.ks-lens,
+.jx-strip-cap {
+  display: none;
+}
+
+.jx-strip,
+.ks-cam {
+  display: block;
+  background: var(--jx-surface);
+  border: 1px solid var(--jx-hairline-strong);
+  border-radius: var(--jx-radius-card);
+  box-shadow: var(--jx-shadow-float);
+  overflow: hidden;
+}
+
+/* 不再需要胶片边框留白，画面铺满卡片。 */
+.jx-strip .jx-frame,
+.ks-cam .jx-frame {
+  padding: 0;
+}
+
+.jx-still {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  width: 100%;
+  border-radius: 0;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.28), transparent 42%),
+    linear-gradient(180deg, #f4ecd7 0%, #e7d9bb 100%);
+  box-shadow: inset 0 0 0 1px rgb(197 181 153 / 35%);
+  color: var(--jx-secondary);
+}
+
+.jx-strip.is-land .jx-still,
+.jx-still.is-land {
+  aspect-ratio: 16 / 9;
+}
+
+.jx-still-core {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 20px 16px 48px;
+  text-align: center;
+}
+
+/* 居中大圆播放钮。装饰用，整张卡片悬停即可反馈。 */
+.jx-play {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 80px;
+  height: 80px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: var(--jx-on-accent);
+  background: var(--jx-accent);
+  box-shadow:
+    0 1px 2px rgb(72 52 24 / 12%),
+    0 8px 20px rgb(156 76 38 / 22%),
+    inset 0 1px 0 rgb(255 255 255 / 28%);
+  transform: scale(1);
+  transition:
+    transform var(--jx-fast) var(--jx-ease),
+    box-shadow var(--jx-fast) var(--jx-ease),
+    background-color var(--jx-fast) var(--jx-ease);
+  pointer-events: none;
+}
+
+.jx-play svg {
+  display: block;
+  width: 32px;
+  height: 32px;
+  margin-left: 3px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .jx-still:hover .jx-play,
+  .jx-still.is-hover .jx-play {
+    background: var(--jx-accent-hover);
+    transform: scale(1.08);
+    box-shadow:
+      0 0 0 10px rgb(156 76 38 / 16%),
+      0 12px 32px rgb(156 76 38 / 32%),
+      inset 0 1px 0 rgb(255 255 255 / 30%);
+  }
+}
+
+/* 无悬停设备（手机预览截图用 is-hover 强制展示）。 */
+.jx-still.is-hover .jx-play {
+  background: var(--jx-accent-hover);
+  transform: scale(1.08);
+  box-shadow:
+    0 0 0 10px rgb(156 76 38 / 16%),
+    0 12px 32px rgb(156 76 38 / 32%),
+    inset 0 1px 0 rgb(255 255 255 / 30%);
+}
+
+.jx-guide {
+  margin: 0;
+  max-width: 16em;
+  font-family: var(--jx-font);
+  font-size: var(--jx-text-sm);
+  line-height: var(--jx-leading-sm);
+  color: var(--jx-muted);
+  letter-spacing: 0.02em;
+}
+
+.jx-pills {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.jx-pills span {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 9px;
+  border-radius: 999px;
+  border: 1px solid rgb(197 181 153 / 70%);
+  background: rgb(251 247 235 / 88%);
+  box-shadow: 0 1px 2px rgb(72 52 24 / 6%);
+  font-family: var(--jx-mono);
+  font-size: 11px;
+  line-height: 1;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--jx-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.jx-pills span:last-child {
+  color: var(--jx-accent-text);
+}
+
+/* 解析出视频后隐藏引导（预留，目前首屏卡片是装饰）。 */
+.jx-still.is-ready .jx-guide {
+  display: none;
+}
+
+.jx-still.is-ready .jx-still-core {
+  padding-bottom: 20px;
+}
+
+@media (max-width: 959px) {
+  /* 去掉齿孔后，竖屏卡不必再维持胶片条的窄宽度，居中稍放大。 */
+  .jx-moment {
+    width: 100%;
+    display: flex;
+    justify-content: center;
+  }
+
+  .jx-strip:not(.is-land) {
+    width: min(100%, 240px);
+  }
+
+  .jx-play {
+    width: 68px;
+    height: 68px;
+  }
+
+  .jx-play svg {
+    width: 26px;
+    height: 26px;
+  }
+
+  .jx-still-core {
+    gap: 12px;
+    padding: 16px 12px 44px;
+  }
+}
+
+@media (min-width: 960px) {
+  .jx-frame {
+    padding: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .jx-play {
+    transition: none;
+  }
+}
+
