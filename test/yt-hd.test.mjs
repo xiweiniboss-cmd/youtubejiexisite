@@ -1072,7 +1072,10 @@ test('index.html shows MERGE_NOT_IPHONE, forces .mp4 on merged saves, and keeps 
   // 成品改为浏览器原生下载（不读进内存）：仍强制 .mp4 文件名，且先用 1 字节探测确认不是错误页
   assert.match(html, /var name = mergedName\(filename, ct\);/);
   assert.match(html, /a\.href = href; a\.download = name;/);
-  assert.doesNotMatch(html, /fetchBlobProgress\('\/api\/yt1080-file/);
+  // 单次下载有 10 分钟上限：100 MB 以上或大小未知保留页面内可续传的老路
+  assert.match(html, /var MERGED_NATIVE_MAX = 100 \* 1048576;/);
+  assert.match(html, /if \(!size \|\| size > MERGED_NATIVE_MAX\) return downloadMergedInPage\(jobId, filename, report\);/);
+  assert.match(html, /function downloadMergedInPage[\s\S]*?beginDownload\(\)[\s\S]*?fetchBlobProgress\('\/api\/yt1080-file/);
   assert.doesNotMatch(html, /:not\(:first-child\)/);
   const at = html.indexOf("dlHint = $('dlHint');");
   assert.ok(html.indexOf("setAttribute('data-default'", at) - at < 300);

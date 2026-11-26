@@ -1430,6 +1430,25 @@ var deviceId = (function(){
     var cl = Number(res.headers.get('Content-Length'));
     return (res.status === 200 && cl > 0) ? cl : null;
   }
+  var MERGED_NATIVE_MAX = 100 * 1048576;
+  function downloadMergedInPage(jobId, filename, report){
+    var control=beginDownload(); if(!control){ resetMergeBtn(); return; }
+    setMergeBtn('正在下载成品…', true);
+    resetDlProg();
+    control.guard(Promise.resolve()).then(function(){ return fetchBlobProgress('/api/yt1080-file?id=' + encodeURIComponent(jobId), setDlProg, control); }).then(function(blob){
+      finishDownload(control);
+      hideDlProg();
+      resetMergeBtn();
+      report('合并完成，文件 ' + fmtMB(blob.size) + '，正在弹出保存…');
+      __hkSave(blob, mergedName(filename, blob.type));
+    }).catch(function(e){
+      control.fail(e); finishDownload(control);
+      resetMergeBtn();
+      hideDlProg();
+      if (e && e.code === 'MERGE_NOT_IPHONE') { report(e.message); return; }
+      report('下载失败：' + (e.message || '网络错误') + '，成品在服务器上保留 1 小时，稍后可重新提交（若服务器空闲会重新合一份）。');
+    });
+  }
   function downloadMerged(jobId, filename, onStatus){
     if(activeDownload){ showError('已有下载任务，请先继续或取消当前任务'); return; }
     var report = function(html){ setMergeStatus(html); if (typeof onStatus === 'function') onStatus(html); };
@@ -1443,6 +1462,8 @@ var deviceId = (function(){
       if (!(res.status === 200 || res.status === 206) || /json|html/i.test(ct)) return readProxyError(res);
       var size = mergedSizeOf(res);
       try { if (res.body && res.body.cancel) res.body.cancel(); } catch(e){}
+      // 单次下载服务器最多放 10 分钟（MERGE_READ_POLICY.streamMs）：100 MB 以上或大小未知，走页面内可「继续下载」的老路
+      if (!size || size > MERGED_NATIVE_MAX) return downloadMergedInPage(jobId, filename, report);
       var name = mergedName(filename, ct);
       var a = document.createElement('a');
       a.href = href; a.download = name; a.rel = 'noopener';
