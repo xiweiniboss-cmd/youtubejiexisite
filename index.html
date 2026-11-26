@@ -600,8 +600,16 @@ var deviceId = (function(){
     return c[0] || null;
   }
   var _merging = false;
+  // 手机里合并（ytmerge.js）要把画面和声音都读进内存再合成，文件太大容易把页面撑崩：合并前按 clen 估大小提醒
+  var MERGE_WARN = 100 * 1048576, MERGE_HUGE = 500 * 1048576;
+  function streamBytes(r){
+    var n = Number((r && (r.contentLength || r.clen || r.size)) || urlParam(r && r.url, 'clen'));
+    return (isFinite(n) && n > 0) ? n : 0;
+  }
   function mergeDownload(v, a, title, btn, ua, vid){
     if (_merging) return;
+    var est = streamBytes(v) + streamBytes(a);
+    if (est > MERGE_HUGE && !window.confirm('这个视频合并前约 ' + fmtMB(est) + '，在手机里合并要全部读进内存，可能卡死或失败。\n建议改用「服务器合并」。仍要在手机里合并吗？')) return;
     var control=beginDownload(); if(!control) return; _merging = true;
     var old = btn.textContent; btn.disabled = true; __hkHideBtn(); hideError();
     var bar = document.getElementById('dlProgBar'), txt = document.getElementById('dlProgTxt');
@@ -612,7 +620,7 @@ var deviceId = (function(){
       var tot = vt + at, g = vg + ag;
       stage('下载画面和声音 ' + (tot ? Math.round(g / tot * 100) + '%（' + fmtMB(g) + ' / ' + fmtMB(tot) + '）' : fmtMB(g)), tot ? Math.round(g / tot * 90) : 5);
     }
-    stage('准备下载…', 0);
+    stage(est > MERGE_WARN ? '准备下载…（约 ' + fmtMB(est) + '，较大，合并时请不要切走页面）' : '准备下载…', 0);
     var vSpec = streamSpec(v, vid, ua), aSpec = streamSpec(a, vid, ua);
     control.guard(ensureHumanPass()).then(function(){ return Promise.all([
       window.YTFetch.get(v.url, 'video/mp4', function(g, t){ vg = g; vt = t; prog(); }, ua, vSpec, control),
@@ -1414,22 +1422,39 @@ var deviceId = (function(){
     if (/webm|matroska/i.test(blobType || '')) return n;
     return /\.mp4$/i.test(n) ? n : n.replace(/\.(webm|mkv|m4v|mov)$/i, '') + '.mp4';
   }
+  // 服务器合并的成品（常常几百 MB）：不再读进内存。先经同源 /api/yt1080-file 取 1 字节确认能下（拿到大小；
+  // 服务器判出 iPhone 存不了的编码会回 415 中文错误），再用普通 <a> 交给浏览器下载（接口带 attachment + Range）。
+  function mergedSizeOf(res){
+    var m = /\/(\d+)\s*$/.exec(res.headers.get('Content-Range') || '');
+    if (res.status === 206 && m) return Number(m[1]);
+    var cl = Number(res.headers.get('Content-Length'));
+    return (res.status === 200 && cl > 0) ? cl : null;
+  }
   function downloadMerged(jobId, filename, onStatus){
-    var control=beginDownload(); if(!control) return;
+    if(activeDownload){ showError('已有下载任务，请先继续或取消当前任务'); return; }
     var report = function(html){ setMergeStatus(html); if (typeof onStatus === 'function') onStatus(html); };
-    setMergeBtn('正在下载成品…', true);
-    resetDlProg();
-    control.guard(ensureHumanPass()).then(function(){ return fetchBlobProgress('/api/yt1080-file?id=' + encodeURIComponent(jobId), setDlProg, control); }).then(function(blob){
-      finishDownload(control);
-      hideDlProg();
+    var href = '/api/yt1080-file?id=' + encodeURIComponent(jobId);
+    setMergeBtn('正在检查成品…', true);
+    __hkHideBtn(); hideDlProg();
+    ensureHumanPass().then(function(){
+      return fetch(href, { headers: { Range: 'bytes=0-0' }, credentials: 'same-origin' });
+    }).then(function(res){
+      var ct = res.headers.get('Content-Type') || '';
+      if (!(res.status === 200 || res.status === 206) || /json|html/i.test(ct)) return readProxyError(res);
+      var size = mergedSizeOf(res);
+      try { if (res.body && res.body.cancel) res.body.cancel(); } catch(e){}
+      var name = mergedName(filename, ct);
+      var a = document.createElement('a');
+      a.href = href; a.download = name; a.rel = 'noopener';
+      document.body.appendChild(a); a.click();
+      setTimeout(function(){ document.body.removeChild(a); }, 2000);
       resetMergeBtn();
-      report('合并完成，文件 ' + fmtMB(blob.size) + '，正在弹出保存…');
-      __hkSave(blob, mergedName(filename, blob.type));
+      dlHint.style.display = 'none';
+      report('合并完成' + (size ? '，文件约 ' + fmtMB(size) : '') + '。已交给浏览器下载，请在浏览器的下载列表里查看进度（iPhone 在「文件」App →「下载」里）。');
     }).catch(function(e){
-      control.fail(e); finishDownload(control);
       resetMergeBtn();
-      hideDlProg();
       if (e && e.code === 'MERGE_NOT_IPHONE') { report(e.message); return; }
+      if (humanDone('', e)) { report('下载失败：' + humanMsg(e)); return; }
       report('下载失败：' + (e.message || '网络错误') + '，成品在服务器上保留 1 小时，稍后可重新提交（若服务器空闲会重新合一份）。');
     });
   }

@@ -1069,7 +1069,10 @@ test('index.html shows MERGE_NOT_IPHONE, forces .mp4 on merged saves, and keeps 
   const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
   assert.match(html, /s\.code === 'MERGE_NOT_IPHONE'/);
   assert.match(html, /e\.code === 'MERGE_NOT_IPHONE'/);
-  assert.match(html, /__hkSave\(blob, mergedName\(filename, blob\.type\)\)/);
+  // 成品改为浏览器原生下载（不读进内存）：仍强制 .mp4 文件名，且先用 1 字节探测确认不是错误页
+  assert.match(html, /var name = mergedName\(filename, ct\);/);
+  assert.match(html, /a\.href = href; a\.download = name;/);
+  assert.doesNotMatch(html, /fetchBlobProgress\('\/api\/yt1080-file/);
   assert.doesNotMatch(html, /:not\(:first-child\)/);
   const at = html.indexOf("dlHint = $('dlHint');");
   assert.ok(html.indexOf("setAttribute('data-default'", at) - at < 300);
