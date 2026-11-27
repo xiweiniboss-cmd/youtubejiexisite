@@ -150,7 +150,7 @@ function jxParseHeaders(h) {
           </div>
         </div>
         <button type="button" class="btn" id="parseBtn">开始解析</button>
-        <!-- 人机验证：配了 TURNSTILE_SITE_KEY 才显示；验证一次后 5 分钟内解析 / 合并不用再点 -->
+        <!-- 人机验证：配了 TURNSTILE_SITE_KEY 才显示；每次解析单独验证，下载和合并可复用短期通行证 -->
         <div id="tsParseWidget" class="ts-parse"></div>
         <div id="tsParseState" class="hint ts-state" style="display:none" aria-live="polite"></div>
         <!-- 服务器合并：清晰度 + 提交。地址和口令只在 Pages 环境变量 YT_MERGE_BASE / YT_MERGE_TOKEN，不进前端 -->
@@ -1306,6 +1306,7 @@ var deviceId = (function(){
     var apiUrl = '/api/parse?url=' + encodeURIComponent(text);
     if (deviceId) apiUrl += '&deviceId=' + encodeURIComponent(deviceId);
     apiUrl += hq;
+    retireParseTs();
     var hUsed = false;
     fetch(apiUrl, { headers: jxParseHeaders() })
       .then(function(r){ hUsed = r.headers.get('X-Human-Token') === 'used'; return r.text().then(function(t){
@@ -1342,7 +1343,10 @@ var deviceId = (function(){
     var parseCore = parseBtn.onclick;
     parseBtn.onclick = function(){
       if(activeDownload){ showError('请先完成或取消当前下载任务'); return; }
-      if (!urlInput.value.trim() || parseBtn.disabled) return parseCore();
+      if (parseBtn.disabled) return;
+      if (!urlInput.value.trim()) return parseCore();
+      tsPassUntil = 0;
+      retireParseTs();
       hideError();
       setParseBtn('人机验证中…', true);
       humanReady().then(function(){ resetParseBtn(); parseCore(); }, function(e){ resetParseBtn(); showError(String((e && e.message) || tsNeedMsg())); });

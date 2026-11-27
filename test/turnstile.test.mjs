@@ -92,15 +92,13 @@ test('turnstile: siteverify success -> allowed, signed pass cookie issued, remot
   });
 });
 
-test('turnstile: pass reuse -> second parse, yt-hd, ytdl, yt1080-start all allowed without a new token or siteverify', async () => {
+test('turnstile: second parse needs a fresh token while download and merge reuse the pass', async () => {
   const f = fakeFetch(['tok-1']);
   await withFetch(f.fn, async () => {
     const first = await call(PARSE + '&turnstile=tok-1');
     const cookie = HUMAN_PASS_COOKIE + '=' + passOf(first.setCookie);
-    // 第二次解析：token 已经用过（单次有效），但凭通行证放行
-    const second = await call(PARSE, ENV, { cookie: 'other=1; ' + cookie });
-    assert.ok(reachedParse(second), second.text);
-    assert.equal(second.setCookie, '', 'fresh pass is not re-issued on every call');
+    const second = await call(PARSE, ENV, { cookie });
+    assert.equal(second.body.code, 'HUMAN_REQUIRED');
     // 后续接口：都过了门禁（报的是各自的参数 / 配置错误，不是 403）
     const dl = await call('/api/ytdl?url=notaurl', ENV, { cookie });
     assert.equal(dl.resp.status, 400);
@@ -420,8 +418,8 @@ test('turnstile: valid pass + token, far from cap -> siteverify NOT called, toke
   const pass = await signHumanPass(SECRET, now, now - 60 * 60); // 首次验证 1 小时前，离封顶还有 1 小时
   const f = fakeFetch(['tok-keep']);
   await withFetch(f.fn, async () => {
-    const r = await call(PARSE + '&turnstile=tok-keep', ENV, { cookie: HUMAN_PASS_COOKIE + '=' + pass.value });
-    assert.ok(reachedParse(r), r.text);
+    const r = await call('/api/human-pass?turnstile=tok-keep', ENV, { cookie: HUMAN_PASS_COOKIE + '=' + pass.value });
+    assert.equal(r.resp.status, 200, r.text);
     assert.equal(f.calls.siteverify.length, 0);
     assert.equal(r.setCookie, '');
     assert.equal(r.resp.headers.get('x-human-token'), null);
@@ -442,12 +440,12 @@ test('turnstile: valid pass near 2h cap + fresh token -> siteverify once, brand-
   const f = fakeFetch(['tok-new']);
   await withFetch(f.fn, async () => {
     // 没 token：照常凭旧通行证放行，不调 siteverify
-    const plain = await call(PARSE, ENV, { cookie: HUMAN_PASS_COOKIE + '=' + pass.value });
-    assert.ok(reachedParse(plain));
+    const plain = await call('/api/human-pass', ENV, { cookie: HUMAN_PASS_COOKIE + '=' + pass.value });
+    assert.equal(plain.resp.status, 200);
     assert.equal(f.calls.siteverify.length, 0);
     // 带 token：真验一次，换全新通行证
-    const r = await call(PARSE + '&turnstile=tok-new', ENV, { cookie: HUMAN_PASS_COOKIE + '=' + pass.value });
-    assert.ok(reachedParse(r), r.text);
+    const r = await call('/api/human-pass?turnstile=tok-new', ENV, { cookie: HUMAN_PASS_COOKIE + '=' + pass.value });
+    assert.equal(r.resp.status, 200, r.text);
     assert.equal(f.calls.siteverify.length, 1);
     assert.equal(r.resp.headers.get('x-human-token'), 'used');
     const fresh = await verifyHumanPass(passOf(r.setCookie), SECRET);
@@ -465,8 +463,8 @@ test('turnstile: near cap with a bad token or siteverify down -> old pass still 
   for (const opts of [{}, { throwOnVerify: true }]) {
     const f = fakeFetch([], opts);
     await withFetch(f.fn, async () => {
-      const r = await call(PARSE + '&turnstile=bad', ENV, { cookie: HUMAN_PASS_COOKIE + '=' + pass.value });
-      assert.ok(reachedParse(r), r.text);
+      const r = await call('/api/human-pass?turnstile=bad', ENV, { cookie: HUMAN_PASS_COOKIE + '=' + pass.value });
+      assert.equal(r.resp.status, 200, r.text);
       assert.equal(f.calls.siteverify.length, 1);
       assert.equal(r.resp.headers.get('x-human-token'), 'used');
       const renewed = await verifyHumanPass(passOf(r.setCookie), SECRET);

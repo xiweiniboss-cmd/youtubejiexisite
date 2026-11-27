@@ -533,7 +533,9 @@ export async function checkHuman(request, env) {
   const reqUrl = new URL(request.url);
   warnMissingSiteKey(env, reqUrl.pathname);
   const now = Math.floor(Date.now() / 1000);
-  const pass = await verifyHumanPass(readCookie(request, HUMAN_PASS_COOKIE), secret, now);
+  // 每次解析都验证新 token；下载和续传仍可复用通行证。
+  const pass = reqUrl.pathname === '/api/parse' ? null :
+    await verifyHumanPass(readCookie(request, HUMAN_PASS_COOKIE), secret, now);
   const token = reqUrl.searchParams.get('turnstile') || '';
   const ip = request.headers.get('cf-connecting-ip');
   if (pass) {
