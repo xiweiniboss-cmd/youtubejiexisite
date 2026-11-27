@@ -1306,7 +1306,6 @@ var deviceId = (function(){
     var apiUrl = '/api/parse?url=' + encodeURIComponent(text);
     if (deviceId) apiUrl += '&deviceId=' + encodeURIComponent(deviceId);
     apiUrl += hq;
-    retireParseTs();
     var hUsed = false;
     fetch(apiUrl, { headers: jxParseHeaders() })
       .then(function(r){ hUsed = r.headers.get('X-Human-Token') === 'used'; return r.text().then(function(t){
@@ -1317,6 +1316,7 @@ var deviceId = (function(){
       .then(function(data){
         loading.style.display = 'none';
         resetParseBtn();
+        retireParseTs();
         var hRejected = humanDone(hq, data, hUsed); hq = '';
         if(!data.ok) throw new Error(hRejected ? humanMsg(data) : (data.error || '解析失败'));
         renderResult(data);
@@ -1332,7 +1332,7 @@ var deviceId = (function(){
       .catch(function(e){
         loading.style.display = 'none';
         resetParseBtn();
-        if (hq) { resetParseTs(); hq = ''; }
+        retireParseTs();
         var msg = String(e.message || '解析失败');
         if(/did not match the expected pattern|Unexpected token/i.test(msg))
           msg = '服务暂时不可用，请稍后重试';
