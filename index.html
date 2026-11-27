@@ -383,7 +383,8 @@ var deviceId = (function(){
   // 自动改用服务器合并：在解析结果最上面放一条状态，进度也写在这里。没有视频 ID 时返回 false，由调用方显示原错误。
   function autoServerMerge(vid, height){
     if (!vid || typeof startServerMerge !== 'function') return false;
-    var q = (+height || 0) >= 1080 ? 1080 : 720;
+    // height 仅保留原调用签名；清晰度、有声/无声改由用户下拉框 mergeChoice() 决定，不再按浏览器已解析到的高度降级。
+    var choice = mergeChoice();
     var box = document.getElementById('autoMergeNote');
     if (!box) {
       box = document.createElement('div');
@@ -391,11 +392,11 @@ var deviceId = (function(){
       box.className = 'hint jx-note-warn';
       resList.insertBefore(box, resList.firstChild);
     }
-    var head = DIRECT_LIMITED_NOTE + '（' + q + 'P 含声音，大约几分钟，页面不要关）。';
+    var head = DIRECT_LIMITED_NOTE + '（' + choice.label + '，大约几分钟，页面不要关）。';
     box.style.whiteSpace = 'pre-line';
     box.textContent = head;
     hideError();
-    startServerMerge('https://youtu.be/' + vid, String(q), 'merged', q + 'P 含声音', function(text){ box.textContent = head + '\n' + text; });
+    startServerMerge('https://youtu.be/' + vid, String(choice.quality), choice.mode, choice.label, function(text){ box.textContent = head + '\n' + text; });
     return true;
   }
   function streamSpec(stream, vid, client){
@@ -651,24 +652,21 @@ var deviceId = (function(){
     return msg;
   }
 
-  function serverMergeQuality(best){
-    var h = best ? resHeight(best) : 0;
-    if (h >= 1080) return 1080;
-    return 720;
-  }
   function offerServerMerge(slot, d, best, note){
     slot.innerHTML = '';
-    var q = serverMergeQuality(best);
+    var choice = mergeChoice();
     var hb = document.createElement('button');
     hb.className = 'btn';
-    hb.textContent = '服务器合并 ' + q + 'P（含声音）';
+    hb.textContent = '服务器合并 ' + choice.label;
     var ht = document.createElement('div');
     ht.className = 'hint';
     ht.textContent = note || '这部视频触发了机器人校验，手机里一键合并经常返回 403。改为服务器下载并合并，大约几分钟。';
     hb.onclick = function(){
       if (hb.disabled) return;
       hb.disabled = true;
-      startServerMerge('https://youtu.be/' + (d.videoId || ''), String(q), 'merged', q + 'P 含声音', function(html){
+      choice = mergeChoice();
+      hb.textContent = '服务器合并 ' + choice.label;
+      startServerMerge('https://youtu.be/' + (d.videoId || ''), String(choice.quality), choice.mode, choice.label, function(html){
         ht.style.whiteSpace = 'pre-line';
         ht.textContent = String(html);
         if (/失败|连不上|超时|不可用|存不了/.test(String(html))) hb.disabled = false;

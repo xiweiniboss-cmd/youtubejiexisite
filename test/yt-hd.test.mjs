@@ -542,7 +542,9 @@ test('index.html failure copy follows the real code and 720 is a real button', (
   assert.match(html, /function offerServerMerge/);
   assert.match(html, /e\.serverMerge && \(code === 'BOT_CHECK' \|\| code === 'UNAVAILABLE'\)/);
   assert.match(html, /function startServerMerge/);
-  assert.match(html, /服务器合并 ' \+ q \+ 'P/);
+  assert.match(html, /服务器合并 ' \+ choice\.label/);
+  assert.match(html, /var choice = mergeChoice\(\)/);
+  assert.doesNotMatch(html, /function serverMergeQuality/);
   assert.match(html, /复制直链/);
   assert.match(html, /function formatDlError/);
   assert.match(html, /直链失效/);
@@ -1320,8 +1322,20 @@ function frontendFns() {
   };
   const started = [];
   const nodes = {};
+  nodes.mergeQuality = {
+    value: '1080|merged',
+    selectedIndex: 0,
+    options: [
+      { text: '1080P（含声音）' },
+      { text: '720P（含声音）' },
+      { text: '1080P 无声' },
+      { text: '720P 无声' },
+      { text: '360P（含声音）' },
+    ],
+  };
   const ctx = {
     started, nodes, hidden: 0,
+    $(id) { return ctx.document.getElementById(id); },
     resList: { firstChild: null, insertBefore(n) { this.firstChild = n; nodes[n.id] = n; } },
     document: {
       getElementById: (id) => nodes[id] || null,
@@ -1332,7 +1346,7 @@ function frontendFns() {
   };
   vm.createContext(ctx);
   const constLine = /  var DIRECT_LIMITED_NOTE = [^\n]+\n/.exec(html)[0];
-  vm.runInContext(grab('isDirectLimited') + constLine + grab('autoServerMerge'), ctx);
+  vm.runInContext(grab('isDirectLimited') + constLine + grab('mergeChoice') + grab('autoServerMerge'), ctx);
   return { html, ctx };
 }
 
@@ -1349,12 +1363,29 @@ test('index.html: isDirectLimited recognises 403 / DIRECT_LIMITED, autoServerMer
   assert.equal(vm.runInContext("autoServerMerge('', 1080)", ctx), false);
   assert.equal(ctx.started.length, 0);
   assert.equal(vm.runInContext("autoServerMerge('WeiM_vffWAw', 1080)", ctx), true);
-  assert.deepEqual(ctx.started[0], { url: 'https://youtu.be/WeiM_vffWAw', q: '1080', mode: 'merged', label: '1080P 含声音' });
+  assert.deepEqual(ctx.started[0], { url: 'https://youtu.be/WeiM_vffWAw', q: '1080', mode: 'merged', label: '1080P（含声音）' });
   assert.match(ctx.nodes.autoMergeNote.textContent, /直链受限，已自动改用服务器合并/);
+  assert.match(ctx.nodes.autoMergeNote.textContent, /1080P（含声音）/);
   assert.match(ctx.nodes.autoMergeNote.textContent, /合并中/);
   assert.equal(ctx.nodes.autoMergeNote.innerHTML, '', '提示走 textContent，不拼 HTML');
+  // 解析高度不到 1080 时，不再把服务器合并降成 720；改走下拉框当前选项（默认 1080）。
   vm.runInContext("autoServerMerge('abc', 360)", ctx);
-  assert.equal(ctx.started[1].q, '720');
+  assert.equal(ctx.started[1].q, '1080');
+  assert.equal(ctx.started[1].mode, 'merged');
+  assert.equal(ctx.started[1].label, '1080P（含声音）');
+  // 用户改选 720 时，即使传入高度是 1080，也按下来的选项走。
+  ctx.nodes.mergeQuality.value = '720|merged';
+  ctx.nodes.mergeQuality.selectedIndex = 1;
+  vm.runInContext("autoServerMerge('abc', 1080)", ctx);
+  assert.equal(ctx.started[2].q, '720');
+  assert.equal(ctx.started[2].mode, 'merged');
+  assert.equal(ctx.started[2].label, '720P（含声音）');
+  ctx.nodes.mergeQuality.value = '1080|silent';
+  ctx.nodes.mergeQuality.selectedIndex = 2;
+  vm.runInContext("autoServerMerge('abc', 360)", ctx);
+  assert.equal(ctx.started[3].q, '1080');
+  assert.equal(ctx.started[3].mode, 'silent');
+  assert.equal(ctx.started[3].label, '1080P 无声');
 });
 
 test('index.html wires DIRECT_LIMITED and phone-merge 403 to server merge and drops the copy-link-to-Safari hints', () => {
